@@ -519,9 +519,12 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
             "start_date": payload.start_date.isoformat(),
             "end_date": payload.end_date.isoformat(),
             "initial_capital": payload.initial_capital,
+            "final_assets": float(result.metrics["final_assets"]),
+            "total_profit": float(result.metrics["total_profit"]),
+            "overall_return": float(result.metrics["overall_return"]),
             "strategy_name": strategy.name,
             "metrics": result.metrics,
-            "equity": _records(result.equity),
+            "equity": _backtest_equity_records(result.equity, payload.initial_capital),
             "trades": _records(result.trades),
             "trade_markers": _chart_trade_markers(result.equity, result.trades),
             "annual_returns": _annual_returns(result.equity),
@@ -571,6 +574,16 @@ def _annual_returns(equity: pd.DataFrame) -> List[Dict[str, Any]]:
     return results
 
 
+def _backtest_equity_records(equity: pd.DataFrame, initial_capital: float) -> List[Dict[str, Any]]:
+    """Expose the compounded total-assets fields without changing the DB schema."""
+    if equity.empty:
+        return []
+    frame = equity.copy()
+    frame["total_assets"] = frame["equity"].astype(float)
+    frame["cumulative_return"] = frame["total_assets"] / float(initial_capital) - 1
+    return _records(frame)
+
+
 def _chart_trade_markers(equity: pd.DataFrame, trades: pd.DataFrame) -> List[Dict[str, Any]]:
     """Attach each execution to the strategy equity value on that date."""
     if equity.empty or trades.empty:
@@ -602,6 +615,10 @@ def get_backtest(run_id: int, db: Session = Depends(get_db)) -> Dict[str, Any]:
     if not run:
         raise HTTPException(404, "回测不存在")
     metrics = db.scalars(select(BacktestMetric).where(BacktestMetric.backtest_run_id == run_id)).all()
+    metric_values = {m.name: m.value for m in metrics}
+    initial_capital = float(run.initial_capital)
+    final_assets = float(metric_values.get("final_assets", initial_capital * (1 + metric_values.get("total_return", 0))))
+    overall_return = float(metric_values.get("overall_return", metric_values.get("total_return", final_assets / initial_capital - 1)))
     config = run.config or {}
     saved_strategy_config = config.get("strategy_config", {})
     if not saved_strategy_config:
@@ -627,7 +644,11 @@ def get_backtest(run_id: int, db: Session = Depends(get_db)) -> Dict[str, Any]:
         "status": run.status,
         "start_date": run.start_date,
         "end_date": run.end_date,
-        "metrics": {m.name: m.value for m in metrics},
+        "initial_capital": initial_capital,
+        "final_assets": final_assets,
+        "total_profit": float(metric_values.get("total_profit", final_assets - initial_capital)),
+        "overall_return": overall_return,
+        "metrics": metric_values,
         "risk_summary": config.get("risk_summary", {}),
         "strategy_config": saved_strategy_config,
         "trade_markers": _trade_markers(run_id, db),
@@ -638,8 +659,17 @@ def get_backtest(run_id: int, db: Session = Depends(get_db)) -> Dict[str, Any]:
 
 @router.get("/backtests/{run_id}/equity")
 def get_backtest_equity(run_id: int, db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
+    run = db.get(BacktestRun, run_id)
+    if not run:
+        raise HTTPException(404, "回测不存在")
     rows = db.scalars(select(BacktestEquity).where(BacktestEquity.backtest_run_id == run_id).order_by(BacktestEquity.trade_date)).all()
-    return [{"trade_date": row.trade_date.isoformat(), "equity": row.equity, "benchmark": row.benchmark, "drawdown": row.drawdown} for row in rows]
+    frame = pd.DataFrame(
+        [
+            {"trade_date": row.trade_date, "equity": row.equity, "benchmark": row.benchmark, "drawdown": row.drawdown}
+            for row in rows
+        ]
+    )
+    return _backtest_equity_records(frame, run.initial_capital)
 
 
 def _trade_markers(run_id: int, db: Session) -> List[Dict[str, Any]]:

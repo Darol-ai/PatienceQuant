@@ -265,9 +265,18 @@ export function BacktestCenter() {
     }
   }
 
-  const finalEquity =
-    result?.equity?.[result.equity.length - 1]?.equity ??
-    Number(result?.initial_capital || form.initial_capital) * (1 + Number(result?.metrics?.total_return || 0))
+  const initialCapital = Number(result?.initial_capital ?? form.initial_capital)
+  const finalAssets = Number(
+    result?.final_assets ??
+      result?.metrics?.final_assets ??
+      result?.equity?.[result.equity.length - 1]?.total_assets ??
+      result?.equity?.[result.equity.length - 1]?.equity ??
+      initialCapital * (1 + Number(result?.metrics?.total_return || 0)),
+  )
+  const totalProfit = Number(result?.total_profit ?? result?.metrics?.total_profit ?? finalAssets - initialCapital)
+  const overallReturn = Number(
+    result?.overall_return ?? result?.metrics?.overall_return ?? result?.metrics?.total_return ?? finalAssets / initialCapital - 1,
+  )
 
   return (
     <>
@@ -603,15 +612,17 @@ export function BacktestCenter() {
         <>
           <div className="backtest-result-callout">
             <b>
-              {result.start_date} — {result.end_date}，当前策略累计收益 {formatPercent(result.metrics.total_return)}
+              {result.start_date} — {result.end_date}，总体收益率 {formatPercent(overallReturn)}
             </b>
             <span>
-              初始资金 {formatMoney(result.initial_capital || form.initial_capital)} → 期末 {formatMoney(finalEquity)}；候选池{' '}
-              {result.universe_size || result.custom_symbols?.length || '—'} 只，已计入手续费和滑点。
+              初始资金 {formatMoney(initialCapital)} → 期末总资产 {formatMoney(finalAssets)}，总收益 {formatMoney(totalProfit)}；候选池{' '}
+              {result.universe_size || result.custom_symbols?.length || '—'} 只，买卖费用已计入复利资产曲线。
             </span>
           </div>
           <div className="metric-grid compact">
-            <Metric label="累计收益" value={formatPercent(result.metrics.total_return)} />
+            <Metric label="期末总资产" value={formatMoney(finalAssets)} />
+            <Metric label="总体收益率" value={formatPercent(overallReturn)} />
+            <Metric label="总收益额" value={formatMoney(totalProfit)} />
             <Metric label="年化收益" value={formatPercent(result.metrics.annual_return)} />
             <Metric label="最大回撤" value={formatPercent(result.metrics.max_drawdown)} />
             <Metric label="Sharpe" value={Number(result.metrics.sharpe || 0).toFixed(2)} />

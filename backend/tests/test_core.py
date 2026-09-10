@@ -1,11 +1,13 @@
-from datetime import date
 import sys
 import types
+from datetime import date
 
 import pandas as pd
+import pytest
 
+from app.backtest.engine import BacktestEngine
 from app.data.akshare_provider import AKShareDataProvider
-from app.data.demo import DemoDataProvider, STOCK_SPECS
+from app.data.demo import STOCK_SPECS, DemoDataProvider
 from app.strategies.multifactor import MultiFactorStrategy
 
 
@@ -30,6 +32,19 @@ def test_capped_weights_sum_to_one_and_respect_cap():
     weights = MultiFactorStrategy.capped_weights({"A": .4, "B": .3, "C": .2, "D": .1}, .3)
     assert abs(sum(weights.values()) - 1) < 1e-8
     assert max(weights.values()) <= .3 + 1e-8
+
+
+def test_backtest_metrics_use_compounded_total_assets():
+    equity = pd.Series([100.0, 110.0, 99.0, 120.0])
+    benchmark = pd.Series([100.0, 101.0, 102.0, 103.0])
+
+    metrics = BacktestEngine._metrics(equity, benchmark, pd.DataFrame(), 100.0)
+
+    assert metrics["final_assets"] == pytest.approx(120.0)
+    assert metrics["total_profit"] == pytest.approx(20.0)
+    assert metrics["overall_return"] == pytest.approx(.20)
+    assert metrics["total_return"] == pytest.approx(.20)
+    assert metrics["compounded_return"] == pytest.approx(.20)
 
 
 def test_akshare_search_normalizes_chinese_names(monkeypatch):

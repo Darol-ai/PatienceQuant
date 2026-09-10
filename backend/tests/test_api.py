@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
-from app.main import app
 from app.data.akshare_provider import _normalise_query
+from app.main import app
 
 
 def test_stock_search_normalises_common_chinese_vendor_input():
@@ -123,6 +123,12 @@ def test_backtest_returns_top_n_and_stock_trade_chart():
         assert len(result["selected_stocks"]) == 10
         assert result["metrics"]["trade_count"] > 0
         assert result["trade_markers"]
+        assert result["final_assets"] == result["equity"][-1]["total_assets"]
+        assert result["metrics"]["overall_return"] == result["overall_return"]
+        assert result["total_profit"] == result["final_assets"] - result["initial_capital"]
+        assert result["overall_return"] == result["final_assets"] / result["initial_capital"] - 1
+        assert result["equity"][0]["total_assets"] == result["initial_capital"]
+        assert result["equity"][-1]["cumulative_return"] == result["overall_return"]
 
         symbol = result["selected_stocks"][0]["symbol"]
         chart = client.get(f"/api/backtests/{result['id']}/stocks/{symbol}/chart")

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
-from typing import Dict, List, Optional, Tuple
+from datetime import date
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -52,11 +52,32 @@ class BacktestEngine:
         return [stamp.date() for _, group in frame.groupby(periods) for stamp in [group.index[-1]]]
 
     @staticmethod
+    def _portfolio_value(cash: float, quantities: Dict[str, int], price_row: pd.Series) -> float:
+        """Mark cash and every holding to the current close price."""
+        market_value = 0.0
+        for symbol, quantity in quantities.items():
+            raw_price = price_row.get(symbol)
+            try:
+                price = float(raw_price)
+            except (TypeError, ValueError):
+                price = 0.0
+            if not np.isfinite(price):
+                price = 0.0
+            market_value += quantity * price
+        return float(cash + market_value)
+
+    @staticmethod
     def _metrics(equity: pd.Series, benchmark: pd.Series, trades: pd.DataFrame, initial: float) -> Dict[str, float]:
-        daily = equity.pct_change().dropna()
+        equity = pd.to_numeric(equity, errors="coerce").dropna()
+        daily = equity.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
         years = max(len(equity) / 252, 1 / 252)
-        total_return = float(equity.iloc[-1] / initial - 1)
-        annual_return = float((equity.iloc[-1] / initial) ** (1 / years) - 1)
+        final_assets = float(equity.iloc[-1]) if len(equity) else float(initial)
+        # There are no external cash flows in a backtest.  Therefore the
+        # compounded daily return and the final-assets / initial-capital
+        # return must agree, while making the compounding rule explicit.
+        compounded_return = float((1 + daily).prod() - 1) if len(daily) else final_assets / initial - 1
+        total_return = float(final_assets / initial - 1)
+        annual_return = float((final_assets / initial) ** (1 / years) - 1)
         volatility = float(daily.std() * np.sqrt(252)) if len(daily) > 1 else 0.0
         sharpe = float((daily.mean() / daily.std()) * np.sqrt(252)) if daily.std() > 0 else 0.0
         running_max = equity.cummax()
@@ -67,6 +88,10 @@ class BacktestEngine:
         benchmark_return = float(benchmark.iloc[-1] / benchmark.iloc[0] - 1) if len(benchmark) else 0.0
         return {
             "total_return": total_return,
+            "overall_return": total_return,
+            "compounded_return": compounded_return,
+            "final_assets": final_assets,
+            "total_profit": final_assets - float(initial),
             "annual_return": annual_return,
             "max_drawdown": max_drawdown,
             "sharpe": sharpe,
@@ -146,7 +171,9 @@ class BacktestEngine:
         for current_date in dates:
             current_day = current_date.date()
             price_row = prices_by_date.loc[current_date]
-            portfolio_value = cash + sum(qty * float(price_row.get(symbol, np.nan) or 0) for symbol, qty in quantities.items())
+            # This is the compounding capital base: all realized and
+            # unrealized gains remain in total assets and fund later trades.
+            portfolio_value = self._portfolio_value(cash, quantities, price_row)
             if current_day in target_by_execution:
                 target = target_by_execution[current_day]
                 context = execution_context.get(current_day, {})
@@ -273,7 +300,10 @@ class BacktestEngine:
                         reason_suffix.append("波动率缩放")
                     reason_suffix_text = (" · " + " / ".join(reason_suffix)) if reason_suffix else ""
                     trades.append({"trade_date": current_day, "symbol": symbol, "side": "BUY", "quantity": buy_qty, "price": price, "amount": amount, "fee": fee, "reason": "综合评分进入 Top %s · %s · 股票暴露 %.0f%%%s" % (strategy_config.holdings_count, regime, target_exposure * 100, reason_suffix_text)})
-                    portfolio_value = cash + sum(qty * float(price_row.get(symbol, np.nan) or 0) for symbol, qty in quantities.items())
+                # Always re-mark after the complete rebalance.  This matters
+                # when a rebalance only sells: fees and adverse slippage must
+                # reduce the compounded total assets as well.
+                portfolio_value = self._portfolio_value(cash, quantities, price_row)
             equity_values.append({"trade_date": current_day, "equity": portfolio_value, "benchmark": float(benchmark_series.loc[current_date] / initial_benchmark * config.initial_capital)})
             equity_history.append(float(portfolio_value))
             equity_peak = max(equity_peak, float(portfolio_value))
