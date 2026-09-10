@@ -66,6 +66,69 @@ DATA_MODE=real docker compose up --build
 10. 在模拟盘查看策略净值、BUY/SELL 成交点、持仓、现金、浮动盈亏和订单账本。
 11. 在 AI 投研解释一笔 BUY/SELL/HOLD 信号。
 
+## 前端界面预览
+
+以下截图来自本地运行的 Demo Mode，统一使用 `1440×900` 短视口（未使用整页长截图），每张图只保留一个功能的首屏关键信息：
+
+<table>
+  <tr>
+    <td valign="top" width="50%">
+      <strong>Dashboard · 收益与风险总览</strong><br>
+      总资产、年化收益、最大回撤、Sharpe、策略/沪深300净值和买卖点。
+      <br><br>
+      <img src="docs/screenshots/dashboard.png" alt="Dashboard：收益与风险总览" width="520">
+    </td>
+    <td valign="top" width="50%">
+      <strong>股票池 · 搜索、评分与行业分布</strong><br>
+      1,000+ 示例股票、研究组、行业、综合评分和 BUY/HOLD/SELL 信号。
+      <br><br>
+      <img src="docs/screenshots/stock-pool.png" alt="股票池：搜索、评分与行业分布" width="520">
+    </td>
+  </tr>
+  <tr>
+    <td valign="top">
+      <strong>策略中心 · 因子权重与风险预算</strong><br>
+      配置多因子权重、持仓数量、单股上限、调仓周期和研究区间。
+      <br><br>
+      <img src="docs/screenshots/strategy-center.png" alt="策略中心：因子权重与风险预算" width="520">
+    </td>
+    <td valign="top">
+      <strong>回测结果 · 收益、回撤与交易记录</strong><br>
+      实际计算累计/年化收益、Sharpe、最大回撤、沪深300对比和交易账本。
+      <br><br>
+      <img src="docs/screenshots/backtest-result.png" alt="回测结果：收益、回撤与交易记录" width="520">
+    </td>
+  </tr>
+  <tr>
+    <td valign="top">
+      <strong>自动交易 · 调仓订单与触发原因</strong><br>
+      从策略评分到目标权重、风险控制、BUY/SELL/HOLD 和 Paper Broker 执行。
+      <br><br>
+      <img src="docs/screenshots/auto-trading.png" alt="自动交易：调仓订单与触发原因" width="520">
+    </td>
+    <td valign="top">
+      <strong>模拟盘 · 资产、现金与持仓收益</strong><br>
+      展示策略净值、资金变化、持仓市值、浮动盈亏和成交点。
+      <br><br>
+      <img src="docs/screenshots/paper-trading.png" alt="模拟盘：资产、现金与持仓收益" width="520">
+    </td>
+  </tr>
+  <tr>
+    <td valign="top">
+      <strong>股票详情 · 多年份价格曲线</strong><br>
+      支持 1/3/5 年及全部历史、日/周/月粒度切换，并保留关键价格区间。
+      <br><br>
+      <img src="docs/screenshots/stock-detail.png" alt="股票详情：多年份价格曲线" width="520">
+    </td>
+    <td valign="top">
+      <strong>AI 投研 · 可审计的交易解释</strong><br>
+      基于评分、因子、行业权重和风险指标生成解释；AI 只解释，不直接下单。
+      <br><br>
+      <img src="docs/screenshots/ai-research.png" alt="AI 投研：可审计的交易解释" width="520">
+    </td>
+  </tr>
+</table>
+
 策略风险预算
 
 默认 V3 不是“保证收益”模型，而是把收益目标和风险约束同时纳入可验证规则：
