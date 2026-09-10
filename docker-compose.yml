@@ -1,0 +1,32 @@
+services:
+  backend:
+    build: ./backend
+    environment:
+      DATA_MODE: ${DATA_MODE:-demo}
+      DEMO_AS_OF: "${DEMO_AS_OF:-}"
+      DEMO_UNIVERSE_SIZE: "${DEMO_UNIVERSE_SIZE:-1000}"
+      AUTO_REBALANCE_POLL_SECONDS: "${AUTO_REBALANCE_POLL_SECONDS:-60}"
+      DATABASE_URL: sqlite:///./data/patience_quant.db
+      CORS_ORIGINS: http://localhost:5173,http://localhost:8080
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+    volumes:
+      - quant_data:/app/data
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+  frontend:
+    build: ./frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "8080:80"
+
+volumes:
+  quant_data:

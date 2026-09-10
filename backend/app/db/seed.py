@@ -1,0 +1,219 @@
+from __future__ import annotations
+
+from datetime import date
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.backtest.engine import BacktestConfig, BacktestEngine
+from app.data.service import MarketDataService
+from app.db.models import BacktestEquity, BacktestMetric, BacktestRun, Portfolio, ResearchAnnotation, Strategy, StrategyFactor, Trade, Watchlist
+from app.strategies.base import StrategyConfig
+
+
+DEFAULT_WEIGHTS = {
+    # The V3 default is an index-enhancement profile: stronger momentum and
+    # relative-strength exposure to pursue excess return versus 沪深300, while
+    # fundamental/valuation/quality/risk still keep it investable.
+    "fundamental": .12,
+    "valuation": .12,
+    "quality": .16,
+    "momentum": .40,
+    "risk": .20,
+}
+
+
+FACTOR_GROUPS = {
+    "fundamental": ["roe", "roa", "revenue_growth", "profit_growth", "operating_cashflow"],
+    "valuation": ["pe", "pb", "ps", "dividend_yield"],
+    "quality": ["roe_stability", "gross_margin", "net_margin", "cashflow_profit_ratio"],
+    "momentum": ["return_3m", "return_6m", "return_12m"],
+    "risk": ["volatility", "max_drawdown", "beta"],
+}
+
+
+def seed_database(db: Session) -> None:
+    MarketDataService(db).seed_if_empty()
+    strategy = db.scalar(select(Strategy).where(Strategy.is_default.is_(True)).limit(1))
+    if not strategy:
+        strategy = Strategy(
+            name="沪深300增强趋势价值成长策略 V3",
+            version=1,
+            description="以跑赢或贴近沪深300为目标：月度低频调仓，动量和相对强度优先，叠加估值低吸、过热高抛、趋势风险闸门和基础质量约束",
+            weights=DEFAULT_WEIGHTS,
+            holdings_count=10,
+            max_weight=.15,
+            rebalance_frequency="monthly",
+            universe="large_cap",
+            research_start_date=date(2018, 1, 1),
+            research_end_date=date(2025, 12, 31),
+            cash_buffer=.02,
+            trend_filter=True,
+            risk_off_exposure=.75,
+            turnover_band=.03,
+            stop_loss=.18,
+            benchmark_enhancement=True,
+            dip_buy_strength=.06,
+            profit_take_strength=.05,
+            target_volatility=.22,
+            max_drawdown_budget=.15,
+            drawdown_brake_exposure=.50,
+            is_default=True,
+        )
+        db.add(strategy)
+        db.flush()
+        for group, factors in FACTOR_GROUPS.items():
+            for factor in factors:
+                db.add(StrategyFactor(strategy_id=strategy.id, group_name=group, factor_name=factor,
+                                      weight=1 / len(factors), direction="negative" if factor in {"pe", "pb", "ps", "volatility", "max_drawdown", "beta"} else "positive"))
+    if not db.scalar(select(Portfolio.id).limit(1)):
+        db.add(Portfolio(name="默认模拟组合", initial_capital=1_000_000, cash=1_000_000, strategy_id=strategy.id if strategy else None,
+                         auto_rebalance_enabled=False, auto_rebalance_frequency="monthly"))
+    if not db.scalar(select(Watchlist).where(Watchlist.name == "我的低频研究清单")):
+        db.add(Watchlist(name="我的低频研究清单", symbols=[
+            "600519", "000333", "600036", "300750", "002594", "601318",
+            "688981", "601088", "600900", "601006", "PINK003", "PINK005",
+            "PINK009", "PINK014",
+        ]))
+    from app.api.routes import RESEARCH_ANNOTATIONS
+    for symbol, annotation in RESEARCH_ANNOTATIONS.items():
+        if not db.scalar(select(ResearchAnnotation).where(ResearchAnnotation.symbol == symbol)):
+            db.add(ResearchAnnotation(symbol=symbol, **annotation))
+    _ensure_group_research_annotations(db)
+    db.commit()
+    # Upgrade the original MVP default in place so existing test/demo
+    # databases receive the same risk-aware execution rules without losing
+    # their historical runs. A fresh calculated baseline is then created for
+    # the upgraded strategy.
+    if strategy.name in {"低频价值成长多因子策略 V1", "稳健低频价值成长策略 V2", "沪深300增强低频价值成长策略 V3"}:
+        strategy.name = "沪深300增强趋势价值成长策略 V3"
+        strategy.description = "以跑赢或贴近沪深300为目标：月度低频调仓，动量和相对强度优先，叠加估值低吸、过热高抛、趋势风险闸门和基础质量约束"
+        strategy.weights = DEFAULT_WEIGHTS
+        strategy.cash_buffer = .02
+        strategy.trend_filter = True
+        strategy.risk_off_exposure = .75
+        strategy.turnover_band = .03
+        strategy.stop_loss = .18
+        strategy.benchmark_enhancement = True
+        strategy.dip_buy_strength = .06
+        strategy.profit_take_strength = .05
+        strategy.target_volatility = .22
+        strategy.max_drawdown_budget = .15
+        strategy.drawdown_brake_exposure = .50
+        db.commit()
+    if strategy.is_default and strategy.name == "沪深300增强趋势价值成长策略 V3" and strategy.weights != DEFAULT_WEIGHTS:
+        strategy.weights = DEFAULT_WEIGHTS
+        strategy.cash_buffer = .02
+        strategy.risk_off_exposure = .75
+        strategy.benchmark_enhancement = True
+        strategy.dip_buy_strength = .06
+        strategy.profit_take_strength = .05
+        strategy.target_volatility = .22
+        strategy.max_drawdown_budget = .15
+        strategy.drawdown_brake_exposure = .50
+        strategy.description = "以跑赢或贴近沪深300为目标：月度低频调仓，动量和相对强度优先，叠加估值低吸、过热高抛、趋势风险闸门和基础质量约束"
+        db.commit()
+    _ensure_demo_backtest(db, strategy)
+
+
+def _ensure_group_research_annotations(db: Session) -> None:
+    """Keep the visible research board at ten clearly labelled names per group."""
+    catalog = MarketDataService(db).stocks()
+    if catalog.empty:
+        return
+    existing = {row.symbol: row for row in db.scalars(select(ResearchAnnotation)).all()}
+    for group, group_frame in catalog.groupby("group", sort=False):
+        covered = [symbol for symbol in group_frame.symbol.tolist() if symbol in existing]
+        if len(covered) >= 10:
+            continue
+        candidates = group_frame.copy()
+        candidates["market_priority"] = candidates["exchange"].map(
+            lambda value: 0 if value == "A股" else 1
+        )
+        candidates = candidates.sort_values(["market_priority", "symbol"])
+        for row in candidates.itertuples(index=False):
+            if row.symbol in existing:
+                continue
+            bucket = "Pink Sheets" if row.exchange == "OTC/Pink Sheets" else "大盘核心"
+            annotation = ResearchAnnotation(
+                symbol=row.symbol,
+                bucket=bucket,
+                thesis="%s研究组 · %s / %s，作为长期低频观察样本，重点跟踪基本面、估值与动量变化"
+                % (group, row.sector, row.industry),
+                risk="关注%s行业景气、估值回撤和流动性；当前为%s数据"
+                % (row.industry, "Demo" if bucket == "Pink Sheets" else "离线 Demo"),
+            )
+            db.add(annotation)
+            existing[row.symbol] = annotation
+            covered.append(row.symbol)
+            if len(covered) >= 10:
+                break
+
+
+def _ensure_demo_backtest(db: Session, strategy: Strategy) -> None:
+    """Create one calculated baseline so the first Dashboard visit is useful."""
+    latest = db.scalar(
+        select(BacktestRun)
+        .where(BacktestRun.strategy_id == strategy.id, BacktestRun.status == "completed")
+        .order_by(BacktestRun.id.desc())
+        .limit(1)
+    )
+    if latest and (latest.config or {}).get("risk_controls_version") == 5:
+        return
+    try:
+        config = StrategyConfig(
+            name=strategy.name,
+            weights=strategy.weights,
+            holdings_count=strategy.holdings_count,
+            max_weight=strategy.max_weight,
+            rebalance_frequency=strategy.rebalance_frequency,
+            cash_buffer=strategy.cash_buffer or .02,
+            trend_filter=True if strategy.trend_filter is None else strategy.trend_filter,
+            risk_off_exposure=strategy.risk_off_exposure or .75,
+            turnover_band=strategy.turnover_band or .03,
+            stop_loss=strategy.stop_loss or .18,
+            benchmark_enhancement=True if strategy.benchmark_enhancement is None else strategy.benchmark_enhancement,
+            dip_buy_strength=strategy.dip_buy_strength or .06,
+            profit_take_strength=strategy.profit_take_strength or .05,
+            target_volatility=strategy.target_volatility or .22,
+            max_drawdown_budget=strategy.max_drawdown_budget or .15,
+            drawdown_brake_exposure=strategy.drawdown_brake_exposure or .50,
+        )
+        market_data = MarketDataService(db)
+        symbols = market_data.universe_symbols(strategy.universe or "large_cap")
+        result = BacktestEngine(market_data).run(
+            BacktestConfig(start_date=date(2018, 1, 1), end_date=date(2025, 12, 31), initial_capital=1_000_000,
+                           rebalance_frequency=config.rebalance_frequency, holdings_count=config.holdings_count,
+                           max_weight=config.max_weight), config, symbols
+        )
+        run = BacktestRun(strategy_id=strategy.id, status="completed", start_date=date(2018, 1, 1), end_date=date(2025, 12, 31),
+                          initial_capital=1_000_000,
+                          config={
+                              "seeded": True,
+                              "risk_controls_version": 5,
+                              "universe": strategy.universe or "large_cap",
+                              "holdings_count": strategy.holdings_count,
+                              "max_weight": strategy.max_weight,
+                              "rebalance_frequency": strategy.rebalance_frequency,
+                              "cash_buffer": config.cash_buffer,
+                              "trend_filter": config.trend_filter,
+                              "risk_off_exposure": config.risk_off_exposure,
+                              "turnover_band": config.turnover_band,
+                              "stop_loss": config.stop_loss,
+                              "benchmark_enhancement": config.benchmark_enhancement,
+                              "dip_buy_strength": config.dip_buy_strength,
+                              "profit_take_strength": config.profit_take_strength,
+                              "target_volatility": config.target_volatility,
+                              "max_drawdown_budget": config.max_drawdown_budget,
+                              "drawdown_brake_exposure": config.drawdown_brake_exposure,
+                              "risk_summary": result.risk_summary or {},
+                          },
+                          data_mode=result.data_mode)
+        db.add(run)
+        db.flush()
+        db.add_all([BacktestMetric(backtest_run_id=run.id, name=name, value=value) for name, value in result.metrics.items()])
+        db.bulk_insert_mappings(BacktestEquity, [{"backtest_run_id": run.id, **row} for row in result.equity.to_dict(orient="records")])
+        db.bulk_insert_mappings(Trade, [{"backtest_run_id": run.id, "portfolio_id": None, **row} for row in result.trades.to_dict(orient="records")])
+        db.commit()
+    except Exception:
+        db.rollback()
