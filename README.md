@@ -87,7 +87,7 @@ uv pip install --python .venv/bin/python -e './backend'
 
 ## 前端界面预览
 
-以下截图来自本地运行的 Demo Mode，统一使用 `1440×900` 短视口（未使用整页长截图），每张图只保留一个功能的首屏关键信息：
+以下截图来自本地运行的 Demo Mode，统一使用 `1440×900` 短视口（未使用整页长截图），每张图只保留一个功能的首屏或结果视图：
 
 <table>
   <tr>
@@ -106,39 +106,47 @@ uv pip install --python .venv/bin/python -e './backend'
   </tr>
   <tr>
     <td valign="top">
-      <strong>策略中心 · 因子权重与风险预算</strong><br>
-      配置多因子权重、持仓数量、单股上限、调仓周期和研究区间。
+      <strong>策略中心 · 快速制定策略与 LightGBM</strong><br>
+      先设置策略名称、股票池、调仓频率和持仓数量；LightGBM 信号层与风险控制默认开启，高级参数按需展开。
       <br><br>
-      <img src="docs/screenshots/strategy-center.png" alt="策略中心：因子权重与风险预算" width="520">
+      <img src="docs/screenshots/strategy-center.png" alt="策略中心：快速制定策略与 LightGBM 默认开启" width="520">
     </td>
     <td valign="top">
-      <strong>回测结果 · 收益、回撤与交易记录</strong><br>
-      实际计算累计/年化收益、Sharpe、最大回撤、沪深300对比和交易账本。
+      <strong>回测中心 · 搜索并勾选股票</strong><br>
+      切换到手动股票池，搜索或筛选股票并勾选至少 10 只；研究区间可直接选择 `2018-01-01` 至 `2025-12-31`。
       <br><br>
-      <img src="docs/screenshots/backtest-result.png" alt="回测结果：收益、回撤与交易记录" width="520">
+      <img src="docs/screenshots/backtest-center.png" alt="回测中心：手动搜索并勾选至少 10 只股票" width="520">
     </td>
   </tr>
   <tr>
+    <td valign="top">
+      <strong>回测结果 · Top N、收益与风险指标</strong><br>
+      展示候选池与最终 Top N、累计/年化收益、Sharpe、最大回撤、沪深300对比、年度收益和完整成交记录。
+      <br><br>
+      <img src="docs/screenshots/backtest-result.png" alt="回测结果：最终 Top N、收益指标与风险闸门" width="520">
+    </td>
     <td valign="top">
       <strong>自动交易 · 调仓订单与触发原因</strong><br>
       从策略评分到目标权重、风险控制、BUY/SELL/HOLD 和 Paper Broker 执行。
       <br><br>
       <img src="docs/screenshots/auto-trading.png" alt="自动交易：调仓订单与触发原因" width="520">
     </td>
+  </tr>
+  <tr>
     <td valign="top">
       <strong>模拟盘 · 资产、现金与持仓收益</strong><br>
       展示策略净值、资金变化、持仓市值、浮动盈亏和成交点。
       <br><br>
       <img src="docs/screenshots/paper-trading.png" alt="模拟盘：资产、现金与持仓收益" width="520">
     </td>
-  </tr>
-  <tr>
     <td valign="top">
       <strong>股票详情 · 多年份价格曲线</strong><br>
       支持 1/3/5 年及全部历史、日/周/月粒度切换，并保留关键价格区间。
       <br><br>
       <img src="docs/screenshots/stock-detail.png" alt="股票详情：多年份价格曲线" width="520">
     </td>
+  </tr>
+  <tr>
     <td valign="top">
       <strong>AI 投研 · 可审计的交易解释</strong><br>
       基于评分、因子、行业权重和风险指标生成解释；AI 只解释，不直接下单。
