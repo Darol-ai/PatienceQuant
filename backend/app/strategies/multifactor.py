@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from app.factors.engine import FactorEngine
+from app.strategies.lightgbm_signal import LightGBMSignal
 from app.strategies.base import BaseStrategy, StrategyConfig, StrategyResult
 
 
@@ -14,6 +15,7 @@ class MultiFactorStrategy(BaseStrategy):
     def __init__(self, factor_engine: FactorEngine, config: StrategyConfig):
         self.factor_engine = factor_engine
         self.config = config
+        self.signal_model = LightGBMSignal()
 
     @staticmethod
     def capped_weights(raw: Dict[str, float], max_weight: float) -> Dict[str, float]:
@@ -51,6 +53,19 @@ class MultiFactorStrategy(BaseStrategy):
     def generate_weights(self, as_of: date, symbols: List[str]) -> StrategyResult:
         ranking, notes = self.factor_engine.score(as_of, symbols, self.config.weights)
         ranking = self._apply_benchmark_low_buy_high_sell_overlay(ranking)
+        if self.config.model_enabled and not ranking.empty:
+            feature_cols = [c for c in ranking.columns if c.startswith("score_") or c.startswith("factor_")]
+            probs, backend = self.signal_model.probabilities(ranking[feature_cols])
+            for col in probs.columns:
+                ranking[col] = probs[col].to_numpy()
+            ranking["model_signal"] = np.where(
+                (ranking.p_up >= self.config.model_buy_threshold) &
+                (ranking.p_down <= self.config.model_down_threshold), "BUY", "WATCH"
+            )
+            ranking["score"] = (ranking["score"] * (.75 + .5 * ranking.p_up)).clip(0, 100)
+            notes.append(f"LightGBM信号层：{backend}；p_up≥{self.config.model_buy_threshold:.2f}且p_down≤{self.config.model_down_threshold:.2f}用于入场")
+            ranking = ranking.sort_values(["score", "score_base"], ascending=[False, False]).reset_index(drop=True)
+            ranking["rank"] = np.arange(1, len(ranking) + 1)
         top = ranking.head(self.config.holdings_count).copy()
         weight_source = top["score"].to_numpy(dtype=float)
         if {"dip_buy_score", "overheat_score"}.issubset(top.columns):

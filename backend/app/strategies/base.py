@@ -29,6 +29,9 @@ class StrategyConfig:
     target_volatility: float = .22
     max_drawdown_budget: float = .15
     drawdown_brake_exposure: float = .50
+    model_enabled: bool = True
+    model_buy_threshold: float = .60
+    model_down_threshold: float = .25
 
 
 @dataclass

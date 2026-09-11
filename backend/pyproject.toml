@@ -13,6 +13,7 @@ dependencies = [
   "numpy>=1.24,<3",
   "httpx>=0.27,<1",
   "openai>=1.52,<2",
+  "lightgbm>=4.5,<5",
 ]
 
 [project.optional-dependencies]

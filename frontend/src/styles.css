@@ -79,3 +79,10 @@ nav { display: grid; gap: 5px; }.nav-item { display: flex; align-items: center; 
 @media (max-width: 900px) { .stock-chart-grid { grid-template-columns: 1fr; } }
 @media (max-width: 700px) { .risk-summary-grid { grid-template-columns: repeat(2, 1fr); } }
 .data-badge.mixed { color: #6c8cff; border-color: rgba(108,140,255,.35); }
+.quick-start-card { border-color: rgba(49,208,170,.28); background: linear-gradient(135deg, rgba(49,208,170,.06), rgba(14,32,51,.7)); }
+.quick-start-grid { display:grid; grid-template-columns: 1.5fr 1fr 1fr 1fr; gap:12px; }
+.quick-start-grid label { display:grid; gap:7px; color:#8299ad; font-size:10px; }
+.quick-start-actions { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:15px; color:#7f99ad; font-size:10px; }
+.quick-start-actions span { display:flex; align-items:center; gap:6px; color:#48c9aa; }
+@media (max-width:900px) { .quick-start-grid { grid-template-columns: repeat(2,1fr); } }
+@media (max-width:580px) { .quick-start-grid { grid-template-columns:1fr; } .quick-start-actions { align-items:flex-start; flex-direction:column; } }

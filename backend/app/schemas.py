@@ -30,6 +30,9 @@ class StrategyPayload(BaseModel):
     target_volatility: float = Field(.22, gt=0, le=1)
     max_drawdown_budget: float = Field(.15, gt=0, le=.95)
     drawdown_brake_exposure: float = Field(.50, gt=0, le=1)
+    model_enabled: bool = True
+    model_buy_threshold: float = Field(.60, ge=0, le=1)
+    model_down_threshold: float = Field(.25, ge=0, le=1)
 
     @field_validator("weights")
     @classmethod
@@ -79,6 +82,9 @@ class BacktestRequest(BaseModel):
     max_weight: Optional[float] = Field(None, gt=0, le=1)
     commission: float = Field(.001, ge=0, le=.05)
     slippage: float = Field(.0005, ge=0, le=.05)
+    model_enabled: bool = True
+    model_buy_threshold: float = Field(.60, ge=0, le=1)
+    model_down_threshold: float = Field(.25, ge=0, le=1)
 
     @field_validator("universe")
     @classmethod

@@ -90,6 +90,10 @@ def _latest_selection(ranking: pd.DataFrame, limit: int) -> List[Dict[str, Any]]
             "signal_date",
             "market_regime",
             "target_exposure",
+            "p_up",
+            "p_down",
+            "p_neutral",
+            "model_signal",
         ]
         if column in frame.columns
     ]
@@ -114,6 +118,9 @@ def _strategy_config(strategy: Strategy, request: Optional[BacktestRequest] = No
         target_volatility=float(strategy.target_volatility if strategy.target_volatility is not None else .22),
         max_drawdown_budget=float(strategy.max_drawdown_budget if strategy.max_drawdown_budget is not None else .15),
         drawdown_brake_exposure=float(strategy.drawdown_brake_exposure if strategy.drawdown_brake_exposure is not None else .50),
+        model_enabled=bool(request.model_enabled if request else True),
+        model_buy_threshold=float(request.model_buy_threshold if request else .60),
+        model_down_threshold=float(request.model_down_threshold if request else .25),
     )
 
 
@@ -382,6 +389,9 @@ def list_strategies(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
                        "target_volatility": float(row.target_volatility if row.target_volatility is not None else .22),
                        "max_drawdown_budget": float(row.max_drawdown_budget if row.max_drawdown_budget is not None else .15),
                        "drawdown_brake_exposure": float(row.drawdown_brake_exposure if row.drawdown_brake_exposure is not None else .50),
+                       "model_enabled": bool(getattr(row, "model_enabled", True)),
+                       "model_buy_threshold": float(getattr(row, "model_buy_threshold", .60)),
+                       "model_down_threshold": float(getattr(row, "model_down_threshold", .25)),
                        "is_default": row.is_default, "created_at": row.created_at.isoformat(),
                        "study_period": {"start": latest.start_date.isoformat(), "end": latest.end_date.isoformat()} if latest else {"start": research_start.isoformat(), "end": research_end.isoformat()},
                        "backtest_run_id": latest.id if latest else None, "backtest_metrics": metrics})
@@ -502,6 +512,9 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
                 "target_volatility": sc.target_volatility,
                 "max_drawdown_budget": sc.max_drawdown_budget,
                 "drawdown_brake_exposure": sc.drawdown_brake_exposure,
+                "model_enabled": sc.model_enabled,
+                "model_buy_threshold": sc.model_buy_threshold,
+                "model_down_threshold": sc.model_down_threshold,
             },
         }
         db.add_all([BacktestMetric(backtest_run_id=run.id, name=name, value=value) for name, value in result.metrics.items()])
@@ -549,6 +562,9 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
                        "target_volatility": sc.target_volatility,
                        "max_drawdown_budget": sc.max_drawdown_budget,
                        "drawdown_brake_exposure": sc.drawdown_brake_exposure,
+                       "model_enabled": sc.model_enabled,
+                       "model_buy_threshold": sc.model_buy_threshold,
+                       "model_down_threshold": sc.model_down_threshold,
             },
             "data_mode": run.data_mode,
             "universe": payload.universe,
