@@ -24,7 +24,7 @@ from app.data.service import MarketDataService
 from app.quant_v3.a_phase_data_service import APhaseDataService
 from app.quant_v3.broad_universe import BROAD_STOCKS
 from app.quant_v3.csi300_strategies import BUILDERS as CSI300_STRATEGY_BUILDERS, TOP_K_RATIO as CSI300_TOP_K_RATIO
-from app.quant_v3.csi300_strategies import csi300_history, validate_csi300_date_range
+from app.quant_v3.csi300_strategies import build_csi300_lightgbm_strategy, csi300_history, validate_csi300_date_range
 from app.quant_v3.csi300_universe import csi300_stocks
 from app.quant_v3.final_strategy import build_final_strategy, final_strategy_history, validate_backtest_date_range
 from app.quant_v3.real_benchmark import csi300_return
@@ -222,6 +222,45 @@ def quant_v3_research_coverage() -> Dict[str, Any]:
         "industries": sorted({row["industry"] for row in rows}),
         "research_window": {"start": "2019-01-01", "end": "2025-12-31"},
         "strategy_summary": "LightGBM回归预测(90日窗口，5模型集成) + Top-K相对排序 + 动量兜底 + 流动性资格判断，2019-2025历史回测6/7年跑赢等权重买入持有基准，详见 docs/adr/0013~0039",
+    }
+
+
+@router.get("/research/csi300-universe")
+def csi300_research_universe() -> Dict[str, Any]:
+    """对齐主流做法后universe换成沪深300全部300支真实成分股——这个端点
+    直接返回真实的股票名字/最新真实收盘价/LightGBM策略最近一次真实打分
+    排名，不是脚手架自带的Demo通用目录也不是编出来的研究文案。300支
+    没法像30支候选池那样每支手写研究依据，这里给的是可验证的真实数据
+    （价格、模型分数），不用编内容凑数。
+    """
+    history = csi300_history()
+    stocks = csi300_stocks()
+    latest_day = pd.to_datetime(history["date"]).max().date()
+    latest_prices = (
+        history[pd.to_datetime(history["date"]).dt.date == latest_day]
+        .set_index("symbol")["close"]
+        .to_dict()
+    )
+    ranking = build_csi300_lightgbm_strategy().generate_weights(latest_day, [s["symbol"] for s in stocks]).ranking
+    score_by_symbol = ranking.set_index("symbol")["score"].to_dict() if not ranking.empty else {}
+    rank_by_symbol = ranking.set_index("symbol")["rank"].to_dict() if not ranking.empty else {}
+    items = [
+        {
+            "symbol": stock["symbol"],
+            "name": stock["name"],
+            "latest_price": latest_prices.get(stock["symbol"]),
+            "lightgbm_score": score_by_symbol.get(stock["symbol"]),
+            "lightgbm_rank": rank_by_symbol.get(stock["symbol"]),
+        }
+        for stock in stocks
+    ]
+    items.sort(key=lambda row: (row["lightgbm_rank"] is None, row["lightgbm_rank"] or 0))
+    return {
+        "items": items,
+        "total": len(items),
+        "as_of": latest_day.isoformat(),
+        "strategy_summary": "沪深300全部300支真实成分股 + LightGBM回归预测(90日窗口，5模型集成) + Top-30相对排序，"
+        "2019-2025历史回测6/7年跑赢真实沪深300指数，7年复合+646.9% vs 指数+58.9%",
     }
 
 

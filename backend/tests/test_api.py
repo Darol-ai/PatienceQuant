@@ -477,6 +477,23 @@ def test_csi300_strategies_run_through_the_shared_backtest_endpoint(kind):
         assert out_of_range.status_code == 422
 
 
+def test_csi300_research_universe_endpoint_shows_real_data_not_demo():
+    """股票池对齐沪深300：这个端点返回全部300支真实成分股的真实名字/
+    真实收盘价/LightGBM真实打分排名，不是脚手架自带的Demo通用目录。"""
+    with TestClient(app) as client:
+        response = client.get("/api/research/csi300-universe")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total"] == 300
+        assert len(data["items"]) == 300
+        ranks = [item["lightgbm_rank"] for item in data["items"]]
+        assert sorted(ranks) == list(range(1, 301)), "全部300支都应该有真实排名，不能有编造/缺失"
+        for item in data["items"]:
+            assert item["symbol"].endswith((".SH", ".SZ"))
+            assert item["name"]
+            assert item["latest_price"] and item["latest_price"] > 0
+
+
 def test_csi300_strategy_drives_paper_trading_rebalance():
     with TestClient(app) as client:
         strategies = client.get("/api/strategies").json()

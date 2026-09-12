@@ -20,6 +20,7 @@ export function Stocks() {
   const [message, setMessage] = useState('')
   const { data, isLoading, isError } = useQuery({ queryKey: ['stocks', search, group, exchange, universe, signal], queryFn: async () => (await api.get('/stocks', { params: { search, group, exchange, universe, signal, sort: 'score' } })).data })
   const { data: ownResearch } = useQuery({ queryKey: ['quant-v3-research'], queryFn: async () => (await api.get('/research/quant-v3-universe')).data })
+  const { data: csi300Research } = useQuery({ queryKey: ['csi300-research'], queryFn: async () => (await api.get('/research/csi300-universe')).data })
   const { data: analytics } = useQuery({ queryKey: ['universe-analytics'], queryFn: async () => (await api.get('/analytics/universe')).data })
   const groups = useMemo<string[]>(() => [...new Set<string>((data?.items || []).map((item: any) => String(item.group)))], [data])
   const pageSize = 50
@@ -52,6 +53,31 @@ export function Stocks() {
                   <td><span className="group-tag">{row.industry}</span></td>
                   <td>{row.thesis}</td>
                   <td>{row.risk}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+    )}
+    {csi300Research && (
+      <Card>
+        <PanelHeader
+          title={`沪深300候选池 · 全部 ${csi300Research.total} 支真实成分股`}
+          subtitle={`真实价格与LightGBM策略最新真实打分排名 · 截至 ${csi300Research.as_of} · 下表展示当前排名前30(策略实际持仓)`}
+        />
+        <p className="factor-copy" style={{ margin: '0 0 14px' }}>{csi300Research.strategy_summary}</p>
+        <div className="table-wrap">
+          <table className="wide-table">
+            <thead><tr><th>排名</th><th>代码</th><th>名称</th><th>最新收盘价</th><th>LightGBM分数</th></tr></thead>
+            <tbody>
+              {csi300Research.items.slice(0, 30).map((row: any) => (
+                <tr key={row.symbol}>
+                  <td className="rank">{String(row.lightgbm_rank).padStart(3, '0')}</td>
+                  <td>{row.symbol}</td>
+                  <td><b>{row.name}</b></td>
+                  <td>{row.latest_price != null ? `¥${row.latest_price.toFixed(2)}` : '—'}</td>
+                  <td>{row.lightgbm_score != null ? row.lightgbm_score.toFixed(4) : '—'}</td>
                 </tr>
               ))}
             </tbody>
