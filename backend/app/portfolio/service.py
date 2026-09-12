@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session
 
 from app.data.service import MarketDataService
 from app.db.models import DailyAccount, DailyProfit, Order, Portfolio, Position, Signal, Strategy, Trade
+from app.quant_v3.csi300_strategies import BUILDERS as CSI300_STRATEGY_BUILDERS
+from app.quant_v3.csi300_universe import csi300_stocks
 from app.factors.engine import FactorEngine
 from app.strategies.base import StrategyConfig
 from app.strategies.multifactor import MultiFactorStrategy
@@ -109,16 +111,23 @@ class PaperTradingService:
 
     def _resolve_paper_data(self, strategy: Optional[Strategy]):
         """自由探索阶段最终确定的LightGBM策略(kind="quant_v3_regression")
-        走独立的parquet数据管道(见 app/quant_v3/final_strategy.py)，不是
-        SQLite/MarketDataService那套通用股票目录——它的持仓symbol是
-        "600519.SH"这种带交易所后缀的格式，SQLite目录里存的是不带后缀
-        的"600519"，两边对不上，模拟盘查当前价格/公司名必须按持仓所属的
-        策略切到对应的数据源，不能一直用构造函数传进来的那个。
+        和沪深300 universe版本的三个策略(kind="csi300_*")都走独立的
+        parquet数据管道，不是SQLite/MarketDataService那套通用股票目录——
+        它们的持仓symbol是"600519.SH"这种带交易所后缀的格式，SQLite目录
+        里存的是不带后缀的"600519"，两边对不上，模拟盘查当前价格/公司名
+        必须按持仓所属的策略切到对应的数据源，不能一直用构造函数传进来
+        的那个。
         """
-        if strategy is not None and strategy.kind == "quant_v3_regression":
+        if strategy is None:
+            return self.data
+        if strategy.kind == "quant_v3_regression":
             from app.quant_v3.a_phase_data_service import APhaseDataService
             from app.quant_v3.final_strategy import final_strategy_history
             return APhaseDataService(final_strategy_history())
+        if strategy.kind in CSI300_STRATEGY_BUILDERS:
+            from app.quant_v3.a_phase_data_service import APhaseDataService
+            from app.quant_v3.csi300_strategies import csi300_history
+            return APhaseDataService(csi300_history())
         return self.data
 
     def snapshot(self, as_of: Optional[date] = None) -> Dict[str, object]:
@@ -201,14 +210,17 @@ class PaperTradingService:
         data = self._resolve_paper_data(strategy)
         is_quant_v3 = data is not self.data
         if is_quant_v3:
-            # 自由探索阶段最终确定的LightGBM策略固定用它自己的30支候选池
-            # (docs/adr/0013~0039)，不接受universe/自定义股票池这些通用
-            # 参数——和 /api/backtests 的分流逻辑保持一致。
-            from app.quant_v3.broad_universe import BROAD_STOCKS
+            # 我们自己的策略(30支候选池的LightGBM，或沪深300 universe的
+            # 三个策略)都固定用各自的universe，不接受universe/自定义股票
+            # 池这些通用参数——和 /api/backtests 的分流逻辑保持一致。
+            from app.quant_v3.csi300_strategies import validate_csi300_date_range
             from app.quant_v3.final_strategy import latest_trading_day_on_or_before, validate_backtest_date_range
             as_of = as_of or date.today()
             try:
-                validate_backtest_date_range(as_of, as_of)
+                if strategy.kind in CSI300_STRATEGY_BUILDERS:
+                    validate_csi300_date_range(as_of, as_of)
+                else:
+                    validate_backtest_date_range(as_of, as_of)
             except ValueError as exc:
                 raise ValueError(str(exc)) from exc
             # `as_of` (today's wall-clock date by default) isn't necessarily
@@ -217,7 +229,11 @@ class PaperTradingService:
             # zero scores for every symbol instead of an error. Snap to the
             # most recent real trading day first.
             as_of = latest_trading_day_on_or_before(as_of)
-            symbols = [stock["symbol"] for stock in BROAD_STOCKS]
+            if strategy.kind in CSI300_STRATEGY_BUILDERS:
+                symbols = [stock["symbol"] for stock in csi300_stocks()]
+            else:
+                from app.quant_v3.broad_universe import BROAD_STOCKS
+                symbols = [stock["symbol"] for stock in BROAD_STOCKS]
             portfolio.execution_symbols = []
             portfolio.source_backtest_run_id = None
             portfolio.execution_universe = "custom"
@@ -292,8 +308,11 @@ class PaperTradingService:
         )
         config.holdings_count = strategy_holdings
         if is_quant_v3:
-            from app.quant_v3.final_strategy import build_final_strategy
-            strategy_result = build_final_strategy().generate_weights(as_of, symbols)
+            if strategy.kind in CSI300_STRATEGY_BUILDERS:
+                strategy_result = CSI300_STRATEGY_BUILDERS[strategy.kind]().generate_weights(as_of, symbols)
+            else:
+                from app.quant_v3.final_strategy import build_final_strategy
+                strategy_result = build_final_strategy().generate_weights(as_of, symbols)
         else:
             strategy_result = MultiFactorStrategy(FactorEngine(self.data), config).generate_weights(as_of, symbols)
         snapshot = self.snapshot(as_of)

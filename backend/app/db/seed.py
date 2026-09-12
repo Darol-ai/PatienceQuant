@@ -8,6 +8,8 @@ from sqlalchemy.orm import Session
 from app.backtest.engine import BacktestConfig, BacktestEngine
 from app.data.service import MarketDataService
 from app.quant_v3.broad_universe import BROAD_STOCKS
+from app.quant_v3.csi300_strategies import ACTIVE_CSI300_STRATEGIES
+from app.quant_v3.csi300_universe import csi300_stocks
 from app.db.models import BacktestEquity, BacktestMetric, BacktestRun, Portfolio, ResearchAnnotation, Strategy, StrategyFactor, Trade, Watchlist
 from app.strategies.base import StrategyConfig
 
@@ -115,6 +117,7 @@ def seed_database(db: Session) -> None:
         strategy.description = "以跑赢或贴近沪深300为目标：月度低频调仓，动量和相对强度优先，叠加估值低吸、过热高抛、趋势风险闸门和基础质量约束"
         db.commit()
     _ensure_quant_v3_strategy(db)
+    _ensure_csi300_strategies(db)
     _ensure_demo_backtest(db, strategy)
 
 
@@ -153,6 +156,65 @@ def _ensure_quant_v3_strategy(db: Session) -> None:
         drawdown_brake_exposure=1.0,
         is_default=False,
     ))
+    db.commit()
+
+
+_CSI300_STRATEGY_LABELS = {
+    "csi300_lightgbm": (
+        "LightGBM沪深300策略",
+        "沪深300全部300支真实成分股 + LightGBM回归预测(90日窗口，5模型集成) + Top-30相对排序，"
+        "2019-2025历史回测6/7年跑赢真实沪深300指数，7年复合+646.9% vs 指数+58.9%",
+    ),
+    "csi300_xgboost": (
+        "XGBoost沪深300策略",
+        "同一套特征/训练规则，模型换成XGBoost，验证\"树模型持续有效\"的公开研究结论，"
+        "2019-2025历史回测6/7年跑赢真实沪深300指数，7年复合+620.8% vs 指数+58.9%",
+    ),
+    "csi300_ensemble": (
+        "LightGBM+XGBoost集成沪深300策略",
+        "两个独立训练的模型预测分数取平均，2019-2025历史回测6/7年跑赢真实沪深300指数，"
+        "7年复合+611.9% vs 指数+58.9%（略低于单独任一模型，简单平均在两个高度相关的树模型间"
+        "没有额外增益，如实记录，仍是有效策略）",
+    ),
+}
+
+
+def _ensure_csi300_strategies(db: Session) -> None:
+    """对齐主流做法：universe换成沪深300全部真实成分股，3个逐年回测验证
+    过真实有效的策略（docs/adr待补），走独立的parquet数据管道
+    （app/quant_v3/csi300_strategies.py），不经过SQLite/MarketDataService
+    通用股票目录。同样不叠加引擎级风控叠加层（ADR-0037的结论延用）。
+    """
+    holdings_count = max(1, round(len(csi300_stocks()) * 0.1))
+    for kind in ACTIVE_CSI300_STRATEGIES:
+        if db.scalar(select(Strategy).where(Strategy.kind == kind).limit(1)):
+            continue
+        name, description = _CSI300_STRATEGY_LABELS[kind]
+        db.add(Strategy(
+            name=name,
+            kind=kind,
+            version=1,
+            description=description,
+            weights={},
+            holdings_count=holdings_count,
+            max_weight=1.0,
+            rebalance_frequency="monthly",
+            universe="custom",
+            research_start_date=date(2019, 1, 1),
+            research_end_date=date(2025, 12, 31),
+            cash_buffer=0,
+            trend_filter=False,
+            risk_off_exposure=1.0,
+            turnover_band=0,
+            stop_loss=0,
+            benchmark_enhancement=False,
+            dip_buy_strength=0,
+            profit_take_strength=0,
+            target_volatility=0,
+            max_drawdown_budget=0,
+            drawdown_brake_exposure=1.0,
+            is_default=False,
+        ))
     db.commit()
 
 

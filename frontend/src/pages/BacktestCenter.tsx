@@ -95,7 +95,7 @@ export function BacktestCenter() {
   }, [strategies])
 
   const selectedStrategy = strategies?.find((item: any) => item.id === form.strategy_id)
-  const isQuantV3Strategy = selectedStrategy?.kind === 'quant_v3_regression'
+  const isQuantV3Strategy = selectedStrategy?.kind === 'quant_v3_regression' || Boolean(selectedStrategy?.kind?.startsWith('csi300_'))
   const selectedSymbols = form.custom_symbols
   const manualUniverse = !isQuantV3Strategy && form.universe === 'custom'
   const { data: stockSearchData, isFetching: stocksLoading } = useQuery({
@@ -327,8 +327,12 @@ export function BacktestCenter() {
               {isQuantV3Strategy && (
                 <div className="strategy-note full">
                   <div>
-                    <b>固定30支跨行业候选池 · 月度调仓</b>
-                    <p>由策略自动管理股票池和调仓周期，无需手动选择。只支持 2019-01-01 至 2025-12-31 之间的回测区间（逐年滚动训练的模型覆盖范围）。</p>
+                    <b>{selectedStrategy?.kind?.startsWith('csi300_') ? '固定沪深300全部300支真实成分股 · 月度调仓' : '固定30支跨行业候选池 · 月度调仓'}</b>
+                    <p>
+                      由策略自动管理股票池和调仓周期，无需手动选择。只支持{' '}
+                      {selectedStrategy?.kind?.startsWith('csi300_') ? '2019-01-01 至 2026-12-31' : '2019-01-01 至 2025-12-31'}
+                      {' '}之间的回测区间（逐年滚动训练的模型覆盖范围）。
+                    </p>
                   </div>
                 </div>
               )}

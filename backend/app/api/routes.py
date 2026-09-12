@@ -23,6 +23,9 @@ from app.config import get_settings
 from app.data.service import MarketDataService
 from app.quant_v3.a_phase_data_service import APhaseDataService
 from app.quant_v3.broad_universe import BROAD_STOCKS
+from app.quant_v3.csi300_strategies import BUILDERS as CSI300_STRATEGY_BUILDERS, TOP_K_RATIO as CSI300_TOP_K_RATIO
+from app.quant_v3.csi300_strategies import csi300_history, validate_csi300_date_range
+from app.quant_v3.csi300_universe import csi300_stocks
 from app.quant_v3.final_strategy import build_final_strategy, final_strategy_history, validate_backtest_date_range
 from app.quant_v3.real_benchmark import csi300_return
 from app.quant_v3.research_notes import quant_v3_research_universe
@@ -538,6 +541,39 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
             if real_csi300 is not None:
                 result.metrics["csi300_index_return"] = real_csi300
                 result.metrics["excess_return_vs_csi300_index"] = result.metrics["total_return"] - real_csi300
+        elif strategy.kind in CSI300_STRATEGY_BUILDERS:
+            # 对齐主流做法：universe换成沪深300全部300支真实成分股（不是
+            # 自选30支候选池），逐年回测验证过真实有效才纳入
+            # ACTIVE_CSI300_STRATEGIES（app/quant_v3/csi300_strategies.py）。
+            # 固定universe，不接受universe/custom_symbols这类通用参数。
+            try:
+                validate_csi300_date_range(payload.start_date, payload.end_date)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+            history = csi300_history()
+            symbols = [stock["symbol"] for stock in csi300_stocks()]
+            sc.holdings_count = round(len(symbols) * CSI300_TOP_K_RATIO)
+            result = BacktestEngine(APhaseDataService(history)).run(
+                BacktestConfig(
+                    start_date=payload.start_date,
+                    end_date=payload.end_date,
+                    initial_capital=payload.initial_capital,
+                    rebalance_frequency="monthly",
+                    holdings_count=sc.holdings_count,
+                    max_weight=1.0,
+                    commission=payload.commission,
+                    slippage=payload.slippage,
+                ),
+                sc,
+                symbols,
+                strategy=CSI300_STRATEGY_BUILDERS[strategy.kind](),
+                allow_network=False,
+            )
+            run.data_mode = result.data_mode
+            real_csi300 = csi300_return(payload.start_date, payload.end_date)
+            if real_csi300 is not None:
+                result.metrics["csi300_index_return"] = real_csi300
+                result.metrics["excess_return_vs_csi300_index"] = result.metrics["total_return"] - real_csi300
         else:
             market_data = MarketDataService(db)
             run.data_mode = market_data.mode
@@ -909,22 +945,45 @@ def _quant_v3_stock_prices(symbol: str, start: date, end: date) -> pd.DataFrame:
     return frame[(frame.trade_date >= start) & (frame.trade_date <= end)].sort_values("trade_date")
 
 
+def _csi300_stock_prices(symbol: str, start: date, end: date) -> pd.DataFrame:
+    """沪深300 universe版本，和 `_quant_v3_stock_prices` 同样的理由——
+    读原始history保留volume列，不走 `APhaseDataService.prices()` 那个
+    为回测引擎砍掉了volume的窄接口。"""
+    history = csi300_history()
+    frame = history[history.symbol == symbol].copy()
+    frame["trade_date"] = pd.to_datetime(frame["date"]).dt.date
+    frame["adj_close"] = frame["close"]
+    return frame[(frame.trade_date >= start) & (frame.trade_date <= end)].sort_values("trade_date")
+
+
+def _parquet_pipeline_lookup(kind: Optional[str]):
+    """返回(name_by_symbol, prices_fn)给走独立parquet数据管道的策略kind
+    （symbol带交易所后缀，和SQLite通用目录的裸代码天生不兼容）；通用
+    SQLite策略(含默认的multifactor)返回None，走原来的`Stock`表查询。"""
+    if kind == "quant_v3_regression":
+        return {stock["symbol"]: stock["name"] for stock in BROAD_STOCKS}, _quant_v3_stock_prices
+    if kind in CSI300_STRATEGY_BUILDERS:
+        return {stock["symbol"]: stock["name"] for stock in csi300_stocks()}, _csi300_stock_prices
+    return None
+
+
 @router.get("/backtests/{run_id}/stocks/{symbol}/chart")
 def get_backtest_stock_chart(run_id: int, symbol: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
     run = db.get(BacktestRun, run_id)
     if not run:
         raise HTTPException(404, "回测不存在")
     strategy = db.get(Strategy, run.strategy_id)
-    if strategy and strategy.kind == "quant_v3_regression":
-        # 我们自己的30支候选池走独立的parquet数据管道，symbol格式("
-        # 600519.SH"带交易所后缀)和SQLite通用目录("600519"裸代码)本来
-        # 就对不上——用通用`Stock`表查这些symbol必然查不到，是两套数据
-        # 源天生不兼容，不是这支股票真的不存在。
-        name_by_symbol = {stock["symbol"]: stock["name"] for stock in BROAD_STOCKS}
+    parquet_lookup = _parquet_pipeline_lookup(strategy.kind if strategy else None)
+    if parquet_lookup is not None:
+        # 我们自己的策略走独立的parquet数据管道，symbol格式("600519.SH"
+        # 带交易所后缀)和SQLite通用目录("600519"裸代码)本来就对不上——
+        # 用通用`Stock`表查这些symbol必然查不到，是两套数据源天生不
+        # 兼容，不是这支股票真的不存在。
+        name_by_symbol, prices_fn = parquet_lookup
         if symbol not in name_by_symbol:
             raise HTTPException(404, "股票不存在")
-        prices = _quant_v3_stock_prices(symbol, run.start_date, run.end_date)
-        price_data_mode = "quant_v3"
+        prices = prices_fn(symbol, run.start_date, run.end_date)
+        price_data_mode = "real"
         name = name_by_symbol[symbol]
     else:
         stock = db.scalar(select(Stock).where(Stock.symbol == symbol, Stock.active.is_(True)))
@@ -958,22 +1017,23 @@ def get_backtest_stock_charts(run_id: int, db: Session = Depends(get_db)) -> Dic
     if not run:
         raise HTTPException(404, "回测不存在")
     strategy = db.get(Strategy, run.strategy_id)
-    is_quant_v3 = bool(strategy and strategy.kind == "quant_v3_regression")
+    parquet_lookup = _parquet_pipeline_lookup(strategy.kind if strategy else None)
+    is_parquet_pipeline = parquet_lookup is not None
     stored = (run.config or {}).get("selected_stocks", [])
     symbols = [str(item.get("symbol")) for item in stored if item.get("symbol")]
     if not symbols:
         symbols = [str(item.get("symbol")) for item in get_backtest_stocks(run_id, db) if item.get("symbol")]
     data = MarketDataService(db)
-    name_by_symbol = {stock["symbol"]: stock["name"] for stock in BROAD_STOCKS} if is_quant_v3 else {}
+    name_by_symbol, prices_fn = parquet_lookup if parquet_lookup is not None else ({}, None)
     result: List[Dict[str, Any]] = []
     for symbol in symbols[:100]:
-        if is_quant_v3:
+        if is_parquet_pipeline:
             # 同一套symbol格式不兼容问题（600519.SH vs 通用目录的裸代码），
             # 见上面单支股票接口的说明——这里也不能用`Stock`表查名字/价格。
             name = name_by_symbol.get(symbol)
             if name is None:
                 continue
-            prices = _quant_v3_stock_prices(symbol, run.start_date, run.end_date)
+            prices = prices_fn(symbol, run.start_date, run.end_date)
         else:
             stock = db.scalar(select(Stock).where(Stock.symbol == symbol, Stock.active.is_(True)))
             if not stock:
@@ -1019,7 +1079,7 @@ def get_backtest_stock_charts(run_id: int, db: Session = Depends(get_db)) -> Dic
             "end_date": run.end_date.isoformat(),
             "prices": _records(prices[["trade_date", "adj_close", "volume"]]),
             "trade_markers": markers,
-            "data_mode": "quant_v3" if is_quant_v3 else data.frame_data_mode(prices),
+            "data_mode": "real" if is_parquet_pipeline else data.frame_data_mode(prices),
             "return": last_price / first_price - 1 if first_price else 0,
             "trade_count": len(markers),
         })

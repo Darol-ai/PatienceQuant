@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from app.data.akshare_provider import _normalise_query
@@ -437,3 +438,63 @@ def test_quant_v3_research_universe_endpoint_shows_our_own_labelled_stocks():
             assert item["symbol"].endswith((".SH", ".SZ"))
         assert len(data["groups"]) >= 1
         assert len(data["industries"]) >= 10
+
+
+@pytest.mark.parametrize("kind", ["csi300_lightgbm", "csi300_xgboost", "csi300_ensemble"])
+def test_csi300_strategies_run_through_the_shared_backtest_endpoint(kind):
+    """对齐主流做法：universe换成沪深300全部300支真实成分股，逐年回测
+    验证过真实有效的三个策略(LightGBM/XGBoost/两者集成)都通过同一个
+    /api/backtests端点跑通，用kind字段分流（不是自选30支候选池）。"""
+    with TestClient(app) as client:
+        strategies = client.get("/api/strategies")
+        assert strategies.status_code == 200
+        strategy = next(row for row in strategies.json() if row["kind"] == kind)
+
+        response = client.post(
+            "/api/backtests",
+            json={
+                "strategy_id": strategy["id"],
+                "start_date": "2025-01-01",
+                "end_date": "2025-12-31",
+                "initial_capital": 1_000_000,
+                "commission": 0.0003,
+                "slippage": 0.0005,
+            },
+        )
+        assert response.status_code == 200
+        result = response.json()
+        assert result["status"] == "completed"
+        assert result["metrics"]["trade_count"] > 0
+        assert result["universe_size"] == 300
+        assert result["selected_stocks"]
+        # 真实沪深300指数对照必须存在(不是候选池自己的等权对照)。
+        assert "csi300_index_return" in result["metrics"]
+
+        out_of_range = client.post(
+            "/api/backtests",
+            json={"strategy_id": strategy["id"], "start_date": "2016-01-01", "end_date": "2017-12-31"},
+        )
+        assert out_of_range.status_code == 422
+
+
+def test_csi300_strategy_drives_paper_trading_rebalance():
+    with TestClient(app) as client:
+        strategies = client.get("/api/strategies").json()
+        csi300_strategy = next(row for row in strategies if row["kind"] == "csi300_lightgbm")
+
+        client.post("/api/paper/reset", json={"initial_capital": 1_000_000})
+        response = client.post(
+            "/api/paper/rebalance",
+            json={"strategy_id": csi300_strategy["id"], "as_of": "2025-06-02"},
+        )
+        assert response.status_code == 200
+        result = response.json()
+        assert result["orders"], "调仓当天必须真的下单，不能悄悄跑出空结果"
+        assert all(symbol.endswith((".SH", ".SZ")) for symbol in result["execution_scope"]["symbols"])
+        assert len(result["execution_scope"]["symbols"]) == 300
+
+        snapshot = client.get("/api/paper/account")
+        assert snapshot.status_code == 200
+        account = snapshot.json()
+        assert account["positions"], "调仓下单成功后持仓不能是空的"
+        client.post("/api/paper/reset", json={"initial_capital": 1_000_000})
