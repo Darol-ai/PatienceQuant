@@ -656,8 +656,17 @@ export function BacktestCenter() {
             <Metric label="年化收益" value={formatPercent(result.metrics.annual_return)} />
             <Metric label="最大回撤" value={formatPercent(result.metrics.max_drawdown)} />
             <Metric label="Sharpe" value={Number(result.metrics.sharpe || 0).toFixed(2)} />
-            <Metric label="沪深300" value={formatPercent(result.metrics.benchmark_return)} />
-            <Metric label="超额收益" value={formatPercent(result.metrics.excess_return)} />
+            <Metric
+              label={result.metrics.csi300_index_return != null ? '候选池等权基准' : '沪深300'}
+              value={formatPercent(result.metrics.benchmark_return)}
+            />
+            <Metric label="超额收益(等权基准)" value={formatPercent(result.metrics.excess_return)} />
+            {result.metrics.csi300_index_return != null && (
+              <>
+                <Metric label="沪深300(真实指数)" value={formatPercent(result.metrics.csi300_index_return)} />
+                <Metric label="超额收益(真实指数)" value={formatPercent(result.metrics.excess_return_vs_csi300_index)} />
+              </>
+            )}
             <Metric label="胜率" value={formatPercent(result.metrics.win_rate)} />
             <Metric label="成交次数" value={Number(result.metrics.trade_count || 0).toFixed(0)} />
             <Metric label="换手率" value={formatPercent(result.metrics.turnover)} />

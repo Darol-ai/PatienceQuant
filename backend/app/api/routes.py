@@ -24,6 +24,7 @@ from app.data.service import MarketDataService
 from app.quant_v3.a_phase_data_service import APhaseDataService
 from app.quant_v3.broad_universe import BROAD_STOCKS
 from app.quant_v3.final_strategy import build_final_strategy, final_strategy_history, validate_backtest_date_range
+from app.quant_v3.real_benchmark import csi300_return
 from app.quant_v3.research_notes import quant_v3_research_universe
 from app.db.models import AIExplanation, BacktestEquity, BacktestMetric, BacktestRun, DailyAccount, Order, Portfolio, Position, ResearchAnnotation, ResearchGroup, Stock, Strategy, StrategyFactor, Trade, Watchlist
 from app.db.session import get_db
@@ -528,6 +529,15 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
                 allow_network=False,
             )
             run.data_mode = result.data_mode
+            # `result.metrics["benchmark_return"]` 是候选池自己的等权买入
+            # 持有对照（隔离"选股/择时"本身的增量），不是真实沪深300指数
+            # 点位——额外附上一条真实指数的收益率，回答"整体有没有跑赢
+            # 大盘"这个不同的问题。指数历史范围之外/查不到时诚实返回
+            # None，不编数字。
+            real_csi300 = csi300_return(payload.start_date, payload.end_date)
+            if real_csi300 is not None:
+                result.metrics["csi300_index_return"] = real_csi300
+                result.metrics["excess_return_vs_csi300_index"] = result.metrics["total_return"] - real_csi300
         else:
             market_data = MarketDataService(db)
             run.data_mode = market_data.mode

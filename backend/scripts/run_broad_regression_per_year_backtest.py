@@ -23,6 +23,7 @@ from app.quant_v3.broad_universe import BROAD_GROUP_BUDGETS, BROAD_STOCKS
 from app.quant_v3.ensemble_regression_signal import EnsembleRegressionWalkForwardSignalSource
 from app.quant_v3.momentum_signal import MomentumSignalSource
 from app.quant_v3.qualification_signal import QualificationSignalSource
+from app.quant_v3.real_benchmark import csi300_return
 from app.strategies.base import StrategyConfig
 from app.strategies.regression_rotation_strategy import RegressionRotationStrategy
 
@@ -102,12 +103,18 @@ def run_one_year(history: pd.DataFrame, year: int) -> dict:
         config, PURE_STRATEGY_CONFIG, symbols=list(history["symbol"].unique()), strategy=strategy,
     )
     metrics = result.metrics
+    # `benchmark_return`是候选池自己的等权买入持有对照(隔离"选股/择时"本身
+    # 的增量)，不是真实沪深300指数点位——额外查一次真实指数，回答"整体
+    # 有没有跑赢大盘"这个不同的问题，见 app/quant_v3/real_benchmark.py。
+    real_csi300 = csi300_return(date(year, 1, 1), date(year, 12, 31))
     return {
         "year": year,
         "trades": len(result.trades),
         "strategy_return": metrics.get("overall_return"),
         "benchmark_return": metrics.get("benchmark_return"),
         "excess_return": metrics.get("excess_return"),
+        "csi300_index_return": real_csi300,
+        "excess_return_vs_csi300": (metrics.get("overall_return") - real_csi300) if real_csi300 is not None else None,
         "max_drawdown": metrics.get("max_drawdown"),
         "sharpe": metrics.get("sharpe"),
     }
@@ -122,10 +129,14 @@ def main() -> None:
     print(f"\n{beat}/{len(YEARS)} 个年份策略跑赢了基准")
     strat_compound = 1.0
     bench_compound = 1.0
+    csi300_compound = 1.0
     for row in rows:
         strat_compound *= 1 + row["strategy_return"]
         bench_compound *= 1 + row["benchmark_return"]
-    print(f"7年复合收益：策略 {strat_compound - 1:.4f}，基准 {bench_compound - 1:.4f}")
+        csi300_compound *= 1 + (row["csi300_index_return"] or 0)
+    print(f"7年复合收益：策略 {strat_compound - 1:.4f}，候选池等权基准 {bench_compound - 1:.4f}，真实沪深300指数 {csi300_compound - 1:.4f}")
+    beat_csi300 = sum(1 for row in rows if row["csi300_index_return"] is not None and row["strategy_return"] > row["csi300_index_return"])
+    print(f"{beat_csi300}/{len(YEARS)} 个年份策略跑赢了真实沪深300指数")
 
 
 if __name__ == "__main__":
