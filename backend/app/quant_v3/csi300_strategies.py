@@ -34,6 +34,21 @@ TOP_K_RATIO = 0.1
 SUPPORTED_YEAR_RANGE: Tuple[int, int] = (2019, 2026)
 
 
+def latest_csi300_trading_day_on_or_before(as_of):
+    """和 `final_strategy.latest_trading_day_on_or_before` 同样的理由——
+    信号源按精确日期索引，周末/节假日/数据还没到账的"今天"需要先落到
+    最近一个真实交易日，否则每支股票都会诚实但无意义地返回None。这里
+    单独实现是因为CSI300和30支候选池用的是两份不同的history parquet，
+    不能共用对方的"最近交易日"。
+    """
+    history = _history()
+    all_dates = pd.to_datetime(history["date"]).dt.date
+    available = all_dates[all_dates <= as_of]
+    if available.empty:
+        raise ValueError(f"没有 {as_of} 或更早的行情数据（最早 {all_dates.min()}）")
+    return available.max()
+
+
 def validate_csi300_date_range(start, end) -> None:
     min_year, max_year = SUPPORTED_YEAR_RANGE
     if start.year < min_year or end.year > max_year:

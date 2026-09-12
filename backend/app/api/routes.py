@@ -25,8 +25,9 @@ from app.quant_v3.a_phase_data_service import APhaseDataService
 from app.quant_v3.broad_universe import BROAD_STOCKS
 from app.quant_v3.csi300_strategies import BUILDERS as CSI300_STRATEGY_BUILDERS, TOP_K_RATIO as CSI300_TOP_K_RATIO
 from app.quant_v3.csi300_strategies import build_csi300_lightgbm_strategy, csi300_history, validate_csi300_date_range
+from app.quant_v3.csi300_strategies import latest_csi300_trading_day_on_or_before
 from app.quant_v3.csi300_universe import csi300_stocks
-from app.quant_v3.final_strategy import build_final_strategy, final_strategy_history, validate_backtest_date_range
+from app.quant_v3.final_strategy import build_final_strategy, final_strategy_history, latest_trading_day_on_or_before, validate_backtest_date_range
 from app.quant_v3.real_benchmark import csi300_return
 from app.quant_v3.research_notes import quant_v3_research_universe
 from app.db.models import AIExplanation, BacktestEquity, BacktestMetric, BacktestRun, DailyAccount, Order, Portfolio, Position, ResearchAnnotation, ResearchGroup, Stock, Strategy, StrategyFactor, Trade, Watchlist
@@ -1612,8 +1613,49 @@ def dashboard(db: Session = Depends(get_db)) -> Dict[str, Any]:
     paper = PaperTradingService(db, data)
     account = paper.snapshot()
     catalog = data.stocks()
-    strategy_row = db.scalar(select(Strategy).where(Strategy.is_default.is_(True)).limit(1))
-    strategy_result = MultiFactorStrategy(FactorEngine(data), _strategy_config(strategy_row)).generate_weights(get_settings().demo_as_of, data.universe_symbols("large_cap"))
+    # "最新交易信号"应该跟着模拟盘账户当前真正绑定的策略走——之前这里
+    # 一直写死用默认的通用多因子策略打分，如果账户实际绑定的是我们自己
+    # 验证过的真实策略(quant_v3_regression/csi300_*)，会出现"账户持仓是
+    # 真实策略选出来的，但信号列表却是另一个策略(且是Demo数据)算出来的"
+    # 这种自相矛盾的真假数据混杂展示。
+    account_strategy = db.get(Strategy, account.get("strategy_id")) if account.get("strategy_id") else None
+    signals: List[Dict[str, Any]] = []
+    if account_strategy and (account_strategy.kind in CSI300_STRATEGY_BUILDERS or account_strategy.kind == "quant_v3_regression"):
+        if account_strategy.kind in CSI300_STRATEGY_BUILDERS:
+            as_of = latest_csi300_trading_day_on_or_before(date.today())
+            universe = csi300_stocks()
+            ranking = CSI300_STRATEGY_BUILDERS[account_strategy.kind]().generate_weights(as_of, [s["symbol"] for s in universe]).ranking
+        else:
+            as_of = latest_trading_day_on_or_before(date.today())
+            universe = BROAD_STOCKS
+            ranking = build_final_strategy().generate_weights(as_of, [s["symbol"] for s in universe]).ranking
+        # 我们自己策略的ranking只有symbol/score/target_weight这些，没有
+        # Demo通用多因子那套name/industry/return_12m/action字段——按我们
+        # 自己真实的股票元数据补上name，其余字段前端不需要就不硬凑一个
+        # 假的12M动量数字。
+        name_by_symbol = {s["symbol"]: s["name"] for s in universe}
+        total_ranked = len(ranking) or 1
+        top_ranking = ranking.sort_values("rank").head(8) if not ranking.empty else ranking
+        signals = [
+            {
+                "symbol": row.symbol,
+                "name": name_by_symbol.get(row.symbol, row.symbol),
+                "industry": "沪深300" if account_strategy.kind in CSI300_STRATEGY_BUILDERS else "候选池",
+                # 模型原始预测分数是"未来90日收益率"这种量级很小的连续值
+                # (比如0.05)，直接当百分比宽度画进度条会看起来几乎是空的
+                # ——这里换算成"在真实排名中的百分位"用于展示条形长度，是
+                # 对真实排名的诚实换算，不是编一个假分数。
+                "score": round(100 * (1 - (row.rank - 1) / total_ranked), 1),
+                "return_12m": None,
+                "target_weight": float(row.target_weight),
+                "action": "BUY" if row.target_weight > 0 else "WATCH",
+            }
+            for row in top_ranking.itertuples()
+        ]
+    else:
+        strategy_row = account_strategy or db.scalar(select(Strategy).where(Strategy.is_default.is_(True)).limit(1))
+        strategy_result = MultiFactorStrategy(FactorEngine(data), _strategy_config(strategy_row)).generate_weights(get_settings().demo_as_of, data.universe_symbols("large_cap"))
+        signals = _records(strategy_result.ranking.head(8))
     orders = paper_orders(db)
     latest_run = db.scalar(select(BacktestRun).where(BacktestRun.status == "completed").order_by(BacktestRun.id.desc()).limit(1))
     metrics = {}
@@ -1624,4 +1666,4 @@ def dashboard(db: Session = Depends(get_db)) -> Dict[str, Any]:
         metrics = {row.name: row.value for row in metric_rows}
         equity = get_backtest_equity(latest_run.id, db)
         trade_markers = _trade_markers(latest_run.id, db)
-    return {"account": _clean(account), "backtest_metrics": metrics, "equity": equity, "trade_markers": trade_markers, "positions": _clean(account["positions"]), "recent_orders": orders[:8], "signals": _records(strategy_result.ranking.head(8)), "analytics": universe_analytics(db), "data_mode": data.mode, "as_of": get_settings().demo_as_of.isoformat(), "study_period": {"research": ["2018-01-01", "2024-12-31"], "validation": ["2025-01-01", "2025-12-31"], "paper": ["2026-01-01", get_settings().demo_as_of.isoformat()]}}
+    return {"account": _clean(account), "backtest_metrics": metrics, "equity": equity, "trade_markers": trade_markers, "positions": _clean(account["positions"]), "recent_orders": orders[:8], "signals": signals, "analytics": universe_analytics(db), "data_mode": data.mode, "as_of": get_settings().demo_as_of.isoformat(), "study_period": {"research": ["2018-01-01", "2024-12-31"], "validation": ["2025-01-01", "2025-12-31"], "paper": ["2026-01-01", get_settings().demo_as_of.isoformat()]}}

@@ -514,4 +514,17 @@ def test_csi300_strategy_drives_paper_trading_rebalance():
         assert snapshot.status_code == 200
         account = snapshot.json()
         assert account["positions"], "调仓下单成功后持仓不能是空的"
+
+        # Dashboard的"最新交易信号"必须跟着账户当前真正绑定的策略走，不能
+        # 一直写死用默认的通用多因子策略打分——那样会出现"持仓是真实策略
+        # 选出来的，但信号列表却是另一个策略且是Demo数据"这种自相矛盾的
+        # 展示。
+        dashboard = client.get("/api/dashboard")
+        assert dashboard.status_code == 200
+        dashboard_data = dashboard.json()
+        assert dashboard_data["signals"], "绑定了真实策略后信号列表不能是空的"
+        for signal in dashboard_data["signals"]:
+            assert signal["symbol"].endswith((".SH", ".SZ"))
+            assert signal["name"] != signal["symbol"], "必须查到真实股票名字，不能退化成显示代码本身"
+
         client.post("/api/paper/reset", json={"initial_capital": 1_000_000})
