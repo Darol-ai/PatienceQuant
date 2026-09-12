@@ -274,3 +274,166 @@ def test_completed_custom_backtest_can_apply_same_scope_to_paper():
         assert csv.status_code == 200
         assert csv.content.decode("utf-8-sig").splitlines()[0].startswith("order_id,time,symbol")
         client.post("/api/paper/reset", json={"initial_capital": 1_000_000})
+
+
+def test_quant_v3_strategy_runs_through_the_shared_backtest_endpoint():
+    """自由探索阶段最终确定的LightGBM策略（docs/adr/0013~0037）走独立的
+    parquet数据管道，不经过SQLite股票目录——用kind字段在共享的
+    /api/backtests端点里分流，结果仍然写入通用的BacktestRun/Trade/
+    BacktestEquity表，前端复用现有回测详情页面。"""
+    with TestClient(app) as client:
+        strategies = client.get("/api/strategies")
+        assert strategies.status_code == 200
+        quant_v3 = next(row for row in strategies.json() if row["kind"] == "quant_v3_regression")
+
+        response = client.post(
+            "/api/backtests",
+            json={
+                "strategy_id": quant_v3["id"],
+                "start_date": "2024-01-01",
+                "end_date": "2025-12-31",
+                "initial_capital": 1_000_000,
+                "commission": 0.0003,
+                "slippage": 0.0005,
+            },
+        )
+        assert response.status_code == 200
+        result = response.json()
+        assert result["status"] == "completed"
+        assert result["metrics"]["trade_count"] > 0
+        assert result["universe_size"] == 30
+        assert result["selected_stocks"]
+
+        # 超出2019-2025训练范围的年份应该被明确拒绝，不能悄悄跑出没有
+        # 意义的占位信号结果。
+        out_of_range = client.post(
+            "/api/backtests",
+            json={"strategy_id": quant_v3["id"], "start_date": "2016-01-01", "end_date": "2017-12-31"},
+        )
+        assert out_of_range.status_code == 422
+
+
+def test_quant_v3_backtest_stock_charts_use_the_parquet_data_pipeline():
+    """真实用浏览器点开回测中心页面时发现的bug：个股买卖曲线和"全部入选
+    股票买卖点审计"网格都对着通用的`Stock`表按symbol查名字/行情，我们的
+    股票是"600519.SH"这种带交易所后缀的格式，通用目录里都是不带后缀的
+    裸代码，查不到——静默404/静默跳过，图表区域看起来像是空的，没有任何
+    报错提示这是个bug。"""
+    with TestClient(app) as client:
+        strategies = client.get("/api/strategies")
+        quant_v3 = next(row for row in strategies.json() if row["kind"] == "quant_v3_regression")
+
+        run_response = client.post(
+            "/api/backtests",
+            json={
+                "strategy_id": quant_v3["id"],
+                "start_date": "2024-01-01",
+                "end_date": "2025-12-31",
+                "initial_capital": 1_000_000,
+                "commission": 0.0003,
+                "slippage": 0.0005,
+            },
+        )
+        assert run_response.status_code == 200
+        run_id = run_response.json()["id"]
+        a_selected_symbol = run_response.json()["selected_stocks"][0]["symbol"]
+        assert a_selected_symbol.endswith((".SH", ".SZ"))
+
+        chart = client.get(f"/api/backtests/{run_id}/stocks/{a_selected_symbol}/chart")
+        assert chart.status_code == 200
+        chart_body = chart.json()
+        assert chart_body["prices"], "个股行情必须真的查到数据，不能因为symbol格式不兼容悄悄返回空列表"
+        assert chart_body["name"] and chart_body["name"] != a_selected_symbol
+
+        bundle = client.get(f"/api/backtests/{run_id}/stocks/charts")
+        assert bundle.status_code == 200
+        items = bundle.json()["items"]
+        assert items, "全部入选股票的审计网格不能因为同样的symbol格式问题被悄悄清空"
+        assert all(item["prices"] for item in items)
+
+
+def test_quant_v3_strategy_params_are_protected_from_generic_edit_endpoint():
+    """LightGBM策略(kind=quant_v3_regression)的stop_loss/target_volatility/
+    max_drawdown_budget特意存0(ADR-0037：关闭引擎级风控叠加层)——通用的
+    PUT /strategies/{id}是给MultiFactorStrategy设计的无条件全量覆盖，
+    不能允许它把这些字段悄悄填回schema默认值。"""
+    with TestClient(app) as client:
+        strategies = client.get("/api/strategies").json()
+        quant_v3 = next(row for row in strategies if row["kind"] == "quant_v3_regression")
+
+        response = client.put(f"/api/strategies/{quant_v3['id']}", json={"name": "改个名字试试"})
+
+        assert response.status_code == 422
+
+
+def test_quant_v3_strategy_drives_paper_trading_rebalance():
+    """任务书要求"要能智能化交易，做个模拟盘"——模拟盘必须真的能跑我们
+    自己的LightGBM策略(kind=quant_v3_regression)，不能一直只驱动脚手架
+    自带的通用多因子策略(见 docs/adr/0040)。"""
+    with TestClient(app) as client:
+        strategies = client.get("/api/strategies").json()
+        quant_v3 = next(row for row in strategies if row["kind"] == "quant_v3_regression")
+
+        client.post("/api/paper/reset", json={"initial_capital": 1_000_000})
+        # 用一个训练范围内、明确早于"今天"的历史交易日调仓——这样默认
+        # （不传as_of）的account快照会按"今天"对应的最新收盘价估值，和
+        # 建仓当天不是同一天，下面"current_price != avg_cost"这条断言
+        # 才是真的在验证查到了独立的当前价，而不是因为两者巧合取自同
+        # 一天的收盘价而必然相等。
+        response = client.post(
+            "/api/paper/rebalance",
+            json={"strategy_id": quant_v3["id"], "as_of": "2025-06-02"},
+        )
+        assert response.status_code == 200
+        result = response.json()
+        # 之前这里曾经因为一个真实bug悄悄跑出空结果：模拟盘默认按字面
+        # `date.today()`调仓，遇到非交易日（周末/节假日）时，信号源按
+        # 精确日期索引查不到那天的行情，会对每支股票都返回None——不报
+        # 错，只是安静地生成一个全零权重的"调仓"。必须显式断言真的下了
+        # 单，不能让这种情况又被"如果有持仓才检查"的写法悄悄放过去。
+        assert result["orders"], "调仓当天必须真的下单，不能悄悄跑出空结果"
+        assert result["execution_scope"]["symbols"]
+        # 我们的股票是"600519.SH"这种带交易所后缀的格式，不是SQLite通用
+        # 目录里的裸代码——确认真的用了我们自己的股票池，不是误落回默认
+        # 策略的large_cap通用池。
+        assert all(symbol.endswith((".SH", ".SZ")) for symbol in result["execution_scope"]["symbols"])
+
+        snapshot = client.get("/api/paper/account")
+        assert snapshot.status_code == 200
+        account = snapshot.json()
+        assert account["strategy_id"] == quant_v3["id"]
+        assert account["positions"], "调仓下单成功后持仓不能是空的"
+        # 持仓要能用我们自己的数据源查到真实当前价，不能因为symbol格式
+        # 对不上SQLite目录就悄悄退化成用avg_cost充当current_price。
+        assert any(p["current_price"] != p["avg_cost"] for p in account["positions"])
+        client.post("/api/paper/reset", json={"initial_capital": 1_000_000})
+
+
+def test_quant_v3_paper_rebalance_rejects_out_of_range_date():
+    with TestClient(app) as client:
+        strategies = client.get("/api/strategies").json()
+        quant_v3 = next(row for row in strategies if row["kind"] == "quant_v3_regression")
+
+        response = client.post(
+            "/api/paper/rebalance",
+            json={"strategy_id": quant_v3["id"], "as_of": "2017-01-01"},
+        )
+        assert response.status_code == 422
+
+
+def test_quant_v3_research_universe_endpoint_shows_our_own_labelled_stocks():
+    """课题要求"把自己研究的股票和板块都标注出来，最起码十个，要标注
+    清楚"——这个端点必须直接返回本组自己的30支候选池标注，不是脚手架
+    自带的demo研究看板文案。"""
+    with TestClient(app) as client:
+        response = client.get("/api/research/quant-v3-universe")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total"] >= 10
+        assert len(data["items"]) == data["total"]
+        for item in data["items"]:
+            assert item["thesis"]
+            assert item["risk"]
+            assert item["symbol"].endswith((".SH", ".SZ"))
+        assert len(data["groups"]) >= 1
+        assert len(data["industries"]) >= 10

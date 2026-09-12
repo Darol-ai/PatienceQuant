@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from app.data.service import MarketDataService
-from app.strategies.base import StrategyConfig
+from app.strategies.base import BaseStrategy, StrategyConfig
 from app.strategies.multifactor import MultiFactorStrategy
 from app.factors.engine import FactorEngine
 
@@ -67,6 +67,46 @@ class BacktestEngine:
         return float(cash + market_value)
 
     @staticmethod
+    def _round_trip_trades(trades: pd.DataFrame) -> pd.DataFrame:
+        """Reconstruct closed round-trip trades via FIFO lot matching.
+
+        The engine only logs individual fills (one row per BUY/SELL
+        execution), so a trade's holding period and realized P&L don't
+        exist as a single row anywhere — they have to be rebuilt by
+        matching each SELL against the oldest still-open BUY lots for the
+        same symbol.
+        """
+        columns = ["symbol", "entry_date", "exit_date", "quantity", "pnl", "holding_days"]
+        if trades.empty:
+            return pd.DataFrame(columns=columns)
+        records: List[Dict[str, object]] = []
+        open_lots: Dict[str, List[Dict[str, object]]] = {}
+        for row in trades.sort_values("trade_date").itertuples():
+            lots = open_lots.setdefault(row.symbol, [])
+            if row.side == "BUY":
+                cost_per_share = (row.amount + row.fee) / row.quantity if row.quantity else 0.0
+                lots.append({"date": row.trade_date, "quantity": row.quantity, "cost_per_share": cost_per_share})
+            elif row.side == "SELL":
+                remaining = row.quantity
+                proceeds_per_share = (row.amount - row.fee) / row.quantity if row.quantity else 0.0
+                while remaining > 0 and lots:
+                    lot = lots[0]
+                    matched = min(lot["quantity"], remaining)
+                    records.append({
+                        "symbol": row.symbol,
+                        "entry_date": lot["date"],
+                        "exit_date": row.trade_date,
+                        "quantity": matched,
+                        "pnl": matched * (proceeds_per_share - lot["cost_per_share"]),
+                        "holding_days": (row.trade_date - lot["date"]).days,
+                    })
+                    lot["quantity"] -= matched
+                    remaining -= matched
+                    if lot["quantity"] <= 0:
+                        lots.pop(0)
+        return pd.DataFrame(records, columns=columns)
+
+    @staticmethod
     def _metrics(equity: pd.Series, benchmark: pd.Series, trades: pd.DataFrame, initial: float) -> Dict[str, float]:
         equity = pd.to_numeric(equity, errors="coerce").dropna()
         daily = equity.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
@@ -80,12 +120,33 @@ class BacktestEngine:
         annual_return = float((final_assets / initial) ** (1 / years) - 1)
         volatility = float(daily.std() * np.sqrt(252)) if len(daily) > 1 else 0.0
         sharpe = float((daily.mean() / daily.std()) * np.sqrt(252)) if daily.std() > 0 else 0.0
+        downside = daily[daily < 0]
+        downside_deviation = float(downside.std(ddof=0)) if len(downside) else 0.0
+        sortino = float(daily.mean() / downside_deviation * np.sqrt(252)) if downside_deviation > 0 else 0.0
         running_max = equity.cummax()
         drawdown = equity / running_max - 1
         max_drawdown = float(drawdown.min())
+        calmar = float(annual_return / abs(max_drawdown)) if max_drawdown != 0 else 0.0
         win_rate = float((daily > 0).mean()) if len(daily) else 0.0
         turnover = float(trades.amount.abs().sum() / (initial * 2)) if not trades.empty else 0.0
         benchmark_return = float(benchmark.iloc[-1] / benchmark.iloc[0] - 1) if len(benchmark) else 0.0
+        bench_numeric = pd.to_numeric(benchmark, errors="coerce")
+        bench_daily = bench_numeric.pct_change().replace([np.inf, -np.inf], np.nan)
+        aligned = pd.concat([daily, bench_daily], axis=1, join="inner").dropna()
+        information_ratio = 0.0
+        if len(aligned) > 1:
+            excess_daily = aligned.iloc[:, 0] - aligned.iloc[:, 1]
+            if excess_daily.std() > 0:
+                information_ratio = float(excess_daily.mean() / excess_daily.std() * np.sqrt(252))
+        round_trips = BacktestEngine._round_trip_trades(trades)
+        wins = round_trips.loc[round_trips.pnl > 0, "pnl"] if not round_trips.empty else pd.Series(dtype=float)
+        losses = round_trips.loc[round_trips.pnl < 0, "pnl"].abs() if not round_trips.empty else pd.Series(dtype=float)
+        avg_win = float(wins.mean()) if len(wins) else 0.0
+        avg_loss = float(losses.mean()) if len(losses) else 0.0
+        # Undefined (no losing trades yet) is reported as 0.0 rather than
+        # infinity, since this dict is serialized straight to JSON.
+        profit_loss_ratio = avg_win / avg_loss if avg_loss > 0 else 0.0
+        avg_holding_days = float(round_trips.holding_days.mean()) if not round_trips.empty else 0.0
         return {
             "total_return": total_return,
             "overall_return": total_return,
@@ -95,8 +156,13 @@ class BacktestEngine:
             "annual_return": annual_return,
             "max_drawdown": max_drawdown,
             "sharpe": sharpe,
+            "sortino": sortino,
+            "calmar": calmar,
+            "information_ratio": information_ratio,
             "win_rate": win_rate,
             "trade_count": float(len(trades)),
+            "profit_loss_ratio": profit_loss_ratio,
+            "avg_holding_days": avg_holding_days,
             "turnover": turnover,
             "benchmark_return": benchmark_return,
             "excess_return": total_return - benchmark_return,
@@ -109,6 +175,7 @@ class BacktestEngine:
         strategy_config: StrategyConfig,
         symbols: Optional[List[str]] = None,
         allow_network: bool = False,
+        strategy: Optional[BaseStrategy] = None,
     ) -> BacktestResult:
         catalog = self.data.stocks()
         symbols = symbols or catalog.symbol.tolist()
@@ -127,35 +194,36 @@ class BacktestEngine:
         wide = prices.pivot_table(index="trade_date", columns="symbol", values="adj_close", aggfunc="last").ffill().dropna(how="all")
         dates = wide.index
         rebalance_dates = self._rebalance_dates(dates, config.rebalance_frequency)
-        factor_engine = FactorEngine(self.data)
-        factor_engine.prime(
-            factor_prices,
-            self.data.fundamentals(symbols, config.end_date),
-            self.data.benchmark(date(2018, 1, 1), config.end_date),
-        )
-        strategy = MultiFactorStrategy(factor_engine, strategy_config)
+        if strategy is None:
+            # 默认路径：和改动前完全一样，构造内置的通用多因子策略。
+            factor_engine = FactorEngine(self.data)
+            factor_engine.prime(
+                factor_prices,
+                self.data.fundamentals(symbols, config.end_date),
+                self.data.benchmark(date(2018, 1, 1), config.end_date),
+            )
+            strategy = MultiFactorStrategy(factor_engine, strategy_config)
         prices_by_date = wide.ffill()
         cash = config.initial_capital
         quantities: Dict[str, int] = {symbol: 0 for symbol in symbols}
         entry_prices: Dict[str, float] = {}
         trades: List[Dict[str, object]] = []
-        target_by_execution: Dict[date, Dict[str, float]] = {}
-        execution_context: Dict[date, Dict[str, object]] = {}
-        ranking_frames = []
-        notes: List[str] = []
+        # 只算"哪个信号日对应哪个执行日"，不在这里调 generate_weights——
+        # 调仓权重必须在真正走到那个执行日的时候才算，紧挨着当天的交易执行，
+        # 这样有状态的策略（比如 V3Strategy 靠 self.positions 判断"这只股票
+        # 是不是已经持有"）在调仓时看到的才是当时真实已经成交的持仓，而不是
+        # 还没执行到那天、引擎尚未回放出来的未来状态。
+        signal_date_by_execution: Dict[date, date] = {}
         for signal_date in rebalance_dates:
             signal_index = dates.get_loc(pd.Timestamp(signal_date))
             if signal_index + 1 >= len(dates):
                 continue
             execution_date = dates[signal_index + 1].date()
-            result = strategy.generate_weights(signal_date, symbols)
-            target_by_execution[execution_date] = result.weights
-            execution_context[execution_date] = {
-                "regime": result.market_regime,
-                "target_exposure": result.target_exposure,
-            }
-            notes.extend(result.data_quality_notes)
-            ranking_frames.append(result.ranking.assign(signal_date=signal_date))
+            signal_date_by_execution[execution_date] = signal_date
+        target_by_execution: Dict[date, Dict[str, float]] = {}
+        execution_context: Dict[date, Dict[str, object]] = {}
+        ranking_frames = []
+        notes: List[str] = []
 
         equity_values = []
         equity_history: List[float] = []
@@ -174,8 +242,51 @@ class BacktestEngine:
             # This is the compounding capital base: all realized and
             # unrealized gains remain in total assets and fund later trades.
             portfolio_value = self._portfolio_value(cash, quantities, price_row)
+
+            # Daily risk hook: runs every trading day, not just rebalance
+            # dates. A strategy with per-symbol exit rules (stop loss,
+            # trailing stop, model-driven exits, cooldown) can force a
+            # liquidation regardless of what generate_weights said last time.
+            # The default BaseStrategy returns no exits, so this is a no-op
+            # for every strategy that doesn't override on_daily_close.
+            risk_result = strategy.on_daily_close(current_day, price_row)
+            if risk_result.exits:
+                for symbol, reason in risk_result.exits.items():
+                    qty = quantities.get(symbol, 0)
+                    if qty <= 0:
+                        continue
+                    price = float(price_row.get(symbol, 0)) * (1 - config.slippage)
+                    amount = qty * price
+                    fee = amount * config.commission
+                    cash += amount - fee
+                    quantities[symbol] = 0
+                    entry_prices.pop(symbol, None)
+                    trades.append({"trade_date": current_day, "symbol": symbol, "side": "SELL", "quantity": qty, "price": price, "amount": amount, "fee": fee, "reason": reason})
+                    strategy.notify_fill(symbol, "SELL", price, qty, current_day)
+                portfolio_value = self._portfolio_value(cash, quantities, price_row)
+
+            if current_day in signal_date_by_execution:
+                signal_date = signal_date_by_execution[current_day]
+                result = strategy.generate_weights(signal_date, symbols)
+                target_by_execution[current_day] = result.weights
+                execution_context[current_day] = {
+                    "regime": result.market_regime,
+                    "target_exposure": result.target_exposure,
+                }
+                notes.extend(result.data_quality_notes)
+                ranking_frames.append(result.ranking.assign(signal_date=signal_date))
+
             if current_day in target_by_execution:
                 target = target_by_execution[current_day]
+                if risk_result.blocked_symbols:
+                    # Cooldown: don't let a rebalance re-buy a symbol that
+                    # just force-exited. Already-held positions in cooldown
+                    # would have been closed by the exit branch above.
+                    target = {
+                        symbol: weight
+                        for symbol, weight in target.items()
+                        if symbol not in risk_result.blocked_symbols
+                    }
                 context = execution_context.get(current_day, {})
                 regime = str(context.get("regime", "unknown"))
                 base_target_exposure = float(context.get("target_exposure", 1.0))
@@ -271,6 +382,7 @@ class BacktestEngine:
                         else "目标权重下降 · %s" % regime
                     )
                     trades.append({"trade_date": current_day, "symbol": symbol, "side": "SELL", "quantity": sell_qty, "price": price, "amount": amount, "fee": fee, "reason": reason})
+                    strategy.notify_fill(symbol, "SELL", price, sell_qty, current_day)
                 for symbol, target_qty in desired.items():
                     delta = target_qty - quantities.get(symbol, 0)
                     if delta <= 0:
@@ -300,6 +412,7 @@ class BacktestEngine:
                         reason_suffix.append("波动率缩放")
                     reason_suffix_text = (" · " + " / ".join(reason_suffix)) if reason_suffix else ""
                     trades.append({"trade_date": current_day, "symbol": symbol, "side": "BUY", "quantity": buy_qty, "price": price, "amount": amount, "fee": fee, "reason": "综合评分进入 Top %s · %s · 股票暴露 %.0f%%%s" % (strategy_config.holdings_count, regime, target_exposure * 100, reason_suffix_text)})
+                    strategy.notify_fill(symbol, "BUY", price, buy_qty, current_day)
                 # Always re-mark after the complete rebalance.  This matters
                 # when a rebalance only sells: fees and adverse slippage must
                 # reduce the compounded total assets as well.

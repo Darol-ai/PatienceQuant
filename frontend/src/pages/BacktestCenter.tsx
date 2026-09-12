@@ -94,8 +94,10 @@ export function BacktestCenter() {
     )
   }, [strategies])
 
+  const selectedStrategy = strategies?.find((item: any) => item.id === form.strategy_id)
+  const isQuantV3Strategy = selectedStrategy?.kind === 'quant_v3_regression'
   const selectedSymbols = form.custom_symbols
-  const manualUniverse = form.universe === 'custom'
+  const manualUniverse = !isQuantV3Strategy && form.universe === 'custom'
   const { data: stockSearchData, isFetching: stocksLoading } = useQuery({
     queryKey: ['backtest-stock-search', debouncedStockSearch, stockGroup, stockExchange, directoryMode],
     queryFn: async () =>
@@ -120,7 +122,7 @@ export function BacktestCenter() {
       : stockSearchData?.source === 'local_cache'
         ? '本地缓存目录'
         : '本地 Demo 目录；搜不到时自动回退 AKShare'
-  const canRun = Boolean(form.strategy_id) && (!manualUniverse || selectedSymbols.length >= 10)
+  const canRun = Boolean(form.strategy_id) && (isQuantV3Strategy || !manualUniverse || selectedSymbols.length >= 10)
 
   const toggleSymbol = (stock: StockOption) => {
     const symbol = stock.symbol
@@ -301,7 +303,19 @@ export function BacktestCenter() {
                 策略
                 <select
                   value={form.strategy_id}
-                  onChange={event => setForm({ ...form, strategy_id: Number(event.target.value) })}
+                  onChange={event => {
+                    const nextId = Number(event.target.value)
+                    const next = strategies?.find((item: any) => item.id === nextId)
+                    setForm(current => ({
+                      ...current,
+                      strategy_id: nextId,
+                      // 每个策略支持的回测区间不一样(比如LightGBM策略只有
+                      // 2019-2025年的滚动训练模型)，切换策略时把日期范围
+                      // 同步过去，避免用着上一个策略的区间跑出422报错。
+                      start_date: next?.research_start_date || current.start_date,
+                      end_date: next?.research_end_date || current.end_date,
+                    }))
+                  }}
                 >
                   {strategies?.map((strategy: any) => (
                     <option key={strategy.id} value={strategy.id}>
@@ -310,28 +324,40 @@ export function BacktestCenter() {
                   ))}
                 </select>
               </label>
-              <label>
-                股票池
-                <select value={form.universe} onChange={event => setForm({ ...form, universe: event.target.value })}>
-                  {universes?.map((item: any) => (
-                    <option key={item.id} value={item.id}>
-                      {item.name} · {item.count}只
-                    </option>
-                  ))}
-                  <option value="custom">手动选择股票 · {selectedSymbols.length}只</option>
-                </select>
-              </label>
-              <label>
-                调仓周期
-                <select
-                  value={form.rebalance_frequency}
-                  onChange={event => setForm({ ...form, rebalance_frequency: event.target.value })}
-                >
-                  <option value="weekly">每周</option>
-                  <option value="monthly">每月</option>
-                  <option value="quarterly">每季度</option>
-                </select>
-              </label>
+              {isQuantV3Strategy && (
+                <div className="strategy-note full">
+                  <div>
+                    <b>固定30支跨行业候选池 · 月度调仓</b>
+                    <p>由策略自动管理股票池和调仓周期，无需手动选择。只支持 2019-01-01 至 2025-12-31 之间的回测区间（逐年滚动训练的模型覆盖范围）。</p>
+                  </div>
+                </div>
+              )}
+              {!isQuantV3Strategy && (
+                <label>
+                  股票池
+                  <select value={form.universe} onChange={event => setForm({ ...form, universe: event.target.value })}>
+                    {universes?.map((item: any) => (
+                      <option key={item.id} value={item.id}>
+                        {item.name} · {item.count}只
+                      </option>
+                    ))}
+                    <option value="custom">手动选择股票 · {selectedSymbols.length}只</option>
+                  </select>
+                </label>
+              )}
+              {!isQuantV3Strategy && (
+                <label>
+                  调仓周期
+                  <select
+                    value={form.rebalance_frequency}
+                    onChange={event => setForm({ ...form, rebalance_frequency: event.target.value })}
+                  >
+                    <option value="weekly">每周</option>
+                    <option value="monthly">每月</option>
+                    <option value="quarterly">每季度</option>
+                  </select>
+                </label>
+              )}
               <label>
                 <span>
                   <CalendarRange size={14} />开始日期
@@ -361,31 +387,35 @@ export function BacktestCenter() {
                   onChange={event => setForm({ ...form, initial_capital: Number(event.target.value) })}
                 />
               </label>
-              <label>
-                最终选股 Top N（至少10只）
-                <input
-                  type="number"
-                  min="10"
-                  max="100"
-                  value={form.holdings_count}
-                  onChange={event =>
-                    setForm({ ...form, holdings_count: Math.max(10, Number(event.target.value)) })
-                  }
-                />
-              </label>
-              <label>
-                单股最大权重
-                <div className="input-with-suffix">
+              {!isQuantV3Strategy && (
+                <label>
+                  最终选股 Top N（至少10只）
                   <input
                     type="number"
-                    min="1"
+                    min="10"
                     max="100"
-                    value={form.max_weight * 100}
-                    onChange={event => setForm({ ...form, max_weight: Number(event.target.value) / 100 })}
+                    value={form.holdings_count}
+                    onChange={event =>
+                      setForm({ ...form, holdings_count: Math.max(10, Number(event.target.value)) })
+                    }
                   />
-                  <span>%</span>
-                </div>
-              </label>
+                </label>
+              )}
+              {!isQuantV3Strategy && (
+                <label>
+                  单股最大权重
+                  <div className="input-with-suffix">
+                    <input
+                      type="number"
+                      min="1"
+                      max="100"
+                      value={form.max_weight * 100}
+                      onChange={event => setForm({ ...form, max_weight: Number(event.target.value) / 100 })}
+                    />
+                    <span>%</span>
+                  </div>
+                </label>
+              )}
               <label>
                 手续费
                 <div className="input-with-suffix">
@@ -631,6 +661,11 @@ export function BacktestCenter() {
             <Metric label="胜率" value={formatPercent(result.metrics.win_rate)} />
             <Metric label="成交次数" value={Number(result.metrics.trade_count || 0).toFixed(0)} />
             <Metric label="换手率" value={formatPercent(result.metrics.turnover)} />
+            <Metric label="Sortino" value={Number(result.metrics.sortino || 0).toFixed(2)} />
+            <Metric label="Calmar" value={Number(result.metrics.calmar || 0).toFixed(2)} />
+            <Metric label="信息比率" value={Number(result.metrics.information_ratio || 0).toFixed(2)} />
+            <Metric label="盈亏比" value={Number(result.metrics.profit_loss_ratio || 0).toFixed(2)} />
+            <Metric label="平均持仓天数" value={Number(result.metrics.avg_holding_days || 0).toFixed(1)} />
           </div>
 
           <Card className="risk-summary-card">

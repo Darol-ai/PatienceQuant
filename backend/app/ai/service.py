@@ -12,7 +12,7 @@ class AIResearchService:
         self.rules = RuleExplainer()
 
     def explain(self, context: Dict[str, Any], use_llm: bool = False) -> Dict[str, Any]:
-        baseline = self.rules.explain(context)
+        baseline = {**self.rules.explain(context), "model_version": "rules", "confidence": None}
         settings = get_settings()
         if not use_llm or not settings.openai_api_key:
             return baseline
@@ -29,7 +29,9 @@ class AIResearchService:
                 ],
             )
             content = response.choices[0].message.content or baseline["content"]
-            return {**baseline, "content": content, "provider": "openai-compatible"}
+            # 置信度：模型没有直接给出可信的数值置信度（没有 logprobs），
+            # 宁可留空也不伪造一个看起来很精确的数字。
+            return {**baseline, "content": content, "provider": "openai-compatible", "model_version": settings.openai_model, "confidence": None}
         except Exception:
             return baseline
 

@@ -107,16 +107,37 @@ class PaperTradingService:
         result["automation"] = self.automation_status()
         return result
 
+    def _resolve_paper_data(self, strategy: Optional[Strategy]):
+        """自由探索阶段最终确定的LightGBM策略(kind="quant_v3_regression")
+        走独立的parquet数据管道(见 app/quant_v3/final_strategy.py)，不是
+        SQLite/MarketDataService那套通用股票目录——它的持仓symbol是
+        "600519.SH"这种带交易所后缀的格式，SQLite目录里存的是不带后缀
+        的"600519"，两边对不上，模拟盘查当前价格/公司名必须按持仓所属的
+        策略切到对应的数据源，不能一直用构造函数传进来的那个。
+        """
+        if strategy is not None and strategy.kind == "quant_v3_regression":
+            from app.quant_v3.a_phase_data_service import APhaseDataService
+            from app.quant_v3.final_strategy import final_strategy_history
+            return APhaseDataService(final_strategy_history())
+        return self.data
+
     def snapshot(self, as_of: Optional[date] = None) -> Dict[str, object]:
         portfolio = self.get_or_create_portfolio()
-        as_of = as_of or self.data.demo.as_of
+        strategy = self.db.get(Strategy, portfolio.strategy_id) if portfolio.strategy_id else None
+        data = self._resolve_paper_data(strategy)
+        is_quant_v3 = data is not self.data
+        if is_quant_v3:
+            from app.quant_v3.final_strategy import latest_trading_day_on_or_before
+            as_of = as_of or latest_trading_day_on_or_before(date.today())
+        else:
+            as_of = as_of or self.data.demo.as_of
         positions = self.db.scalars(select(Position).where(Position.portfolio_id == portfolio.id)).all()
-        catalog = self.data.stocks().set_index("symbol")
+        catalog = data.stocks().set_index("symbol")
         symbols = [position.symbol for position in positions]
         # Paper positions are an explicit user-visible market-data request,
         # so selected AKShare symbols may refresh their current price. The
         # service still falls back to deterministic Demo prices on failure.
-        price_df = self.data.prices(symbols, date(2018, 1, 1), as_of, allow_network=True) if symbols else pd.DataFrame()
+        price_df = data.prices(symbols, date(2018, 1, 1), as_of, allow_network=True) if symbols else pd.DataFrame()
         latest = price_df.sort_values("trade_date").groupby("symbol").tail(1).set_index("symbol") if not price_df.empty else pd.DataFrame()
         items = []
         market_value = 0.0
@@ -125,12 +146,16 @@ class PaperTradingService:
             value = position.quantity * current_price
             pnl = (current_price - position.avg_cost) * position.quantity
             market_value += value
-            items.append({"symbol": position.symbol, "name": catalog.loc[position.symbol]["name"] if position.symbol in catalog.index else position.symbol, "industry": catalog.loc[position.symbol]["industry"] if position.symbol in catalog.index else "", "quantity": position.quantity, "avg_cost": position.avg_cost, "current_price": current_price, "market_value": value, "pnl": pnl, "pnl_pct": pnl / max(position.avg_cost * position.quantity, .01)})
+            # catalog列(name/industry)只有MarketDataService的通用目录才有，
+            # 我们自己的parquet数据源只有symbol这一列——按列是否存在兜底，
+            # 不能假设这两列一定在。
+            name = catalog.loc[position.symbol]["name"] if position.symbol in catalog.index and "name" in catalog.columns else position.symbol
+            industry = catalog.loc[position.symbol]["industry"] if position.symbol in catalog.index and "industry" in catalog.columns else ""
+            items.append({"symbol": position.symbol, "name": name, "industry": industry, "quantity": position.quantity, "avg_cost": position.avg_cost, "current_price": current_price, "market_value": value, "pnl": pnl, "pnl_pct": pnl / max(position.avg_cost * position.quantity, .01)})
         total_assets = portfolio.cash + market_value
         initial = portfolio.initial_capital
         daily = self.db.scalar(select(DailyAccount).where(DailyAccount.portfolio_id == portfolio.id).order_by(DailyAccount.trade_date.desc()).limit(1))
         previous = daily.total_assets if daily else initial
-        strategy = self.db.get(Strategy, portfolio.strategy_id) if portfolio.strategy_id else None
         execution_symbols = getattr(portfolio, "execution_symbols", None) or []
         if isinstance(execution_symbols, str):
             try:
@@ -173,31 +198,55 @@ class PaperTradingService:
         source_backtest_run_id: Optional[int] = None,
     ) -> Dict[str, object]:
         portfolio = self.get_or_create_portfolio()
-        as_of = as_of or self.data.demo.as_of
-        # Follow the saved strategy universe so a Pink Sheets strategy is
-        # executed against the same market it was researched on.  The default
-        # strategy remains the liquid large-cap A-share basket.
-        previous_strategy_id = portfolio.strategy_id
-        requested_symbols = list(dict.fromkeys(str(symbol).strip() for symbol in (symbols or []) if str(symbol).strip()))
-        saved_symbols = getattr(portfolio, "execution_symbols", None) or []
-        if isinstance(saved_symbols, str):
+        data = self._resolve_paper_data(strategy)
+        is_quant_v3 = data is not self.data
+        if is_quant_v3:
+            # 自由探索阶段最终确定的LightGBM策略固定用它自己的30支候选池
+            # (docs/adr/0013~0039)，不接受universe/自定义股票池这些通用
+            # 参数——和 /api/backtests 的分流逻辑保持一致。
+            from app.quant_v3.broad_universe import BROAD_STOCKS
+            from app.quant_v3.final_strategy import latest_trading_day_on_or_before, validate_backtest_date_range
+            as_of = as_of or date.today()
             try:
-                import json
-                saved_symbols = json.loads(saved_symbols)
-            except (TypeError, ValueError):
-                saved_symbols = []
-        if requested_symbols:
-            symbols = requested_symbols
-        elif saved_symbols and previous_strategy_id == strategy.id and not universe:
-            symbols = list(dict.fromkeys(str(symbol) for symbol in saved_symbols))
+                validate_backtest_date_range(as_of, as_of)
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+            # `as_of` (today's wall-clock date by default) isn't necessarily
+            # a trading day — the signal sources need an exact bar match and
+            # have no fallback, so a weekend/holiday date silently produces
+            # zero scores for every symbol instead of an error. Snap to the
+            # most recent real trading day first.
+            as_of = latest_trading_day_on_or_before(as_of)
+            symbols = [stock["symbol"] for stock in BROAD_STOCKS]
+            portfolio.execution_symbols = []
+            portfolio.source_backtest_run_id = None
+            portfolio.execution_universe = "custom"
         else:
-            symbols = self.data.universe_symbols(universe or strategy.universe or "large_cap")
-            # Switching to another strategy without an explicit custom scope
-            # must not accidentally inherit the previous backtest's symbols.
-            if not requested_symbols:
-                portfolio.execution_symbols = []
-                portfolio.source_backtest_run_id = None
-                portfolio.execution_universe = universe or strategy.universe or "large_cap"
+            as_of = as_of or self.data.demo.as_of
+            # Follow the saved strategy universe so a Pink Sheets strategy is
+            # executed against the same market it was researched on.  The default
+            # strategy remains the liquid large-cap A-share basket.
+            previous_strategy_id = portfolio.strategy_id
+            requested_symbols = list(dict.fromkeys(str(symbol).strip() for symbol in (symbols or []) if str(symbol).strip()))
+            saved_symbols = getattr(portfolio, "execution_symbols", None) or []
+            if isinstance(saved_symbols, str):
+                try:
+                    import json
+                    saved_symbols = json.loads(saved_symbols)
+                except (TypeError, ValueError):
+                    saved_symbols = []
+            if requested_symbols:
+                symbols = requested_symbols
+            elif saved_symbols and previous_strategy_id == strategy.id and not universe:
+                symbols = list(dict.fromkeys(str(symbol) for symbol in saved_symbols))
+            else:
+                symbols = self.data.universe_symbols(universe or strategy.universe or "large_cap")
+                # Switching to another strategy without an explicit custom scope
+                # must not accidentally inherit the previous backtest's symbols.
+                if not requested_symbols:
+                    portfolio.execution_symbols = []
+                    portfolio.source_backtest_run_id = None
+                    portfolio.execution_universe = universe or strategy.universe or "large_cap"
         if len(symbols) < strategy.holdings_count:
             # A manually selected pool can be smaller than a legacy strategy
             # setting.  Keep the strategy executable while preserving the
@@ -209,16 +258,20 @@ class PaperTradingService:
             raise ValueError("模拟盘执行股票池至少需要 10 只股票")
         if strategy_holdings * strategy.max_weight < 1:
             raise ValueError("当前模拟盘股票池与单股权重上限无法构建组合")
-        if requested_symbols or universe:
-            portfolio.execution_symbols = requested_symbols
-            portfolio.execution_universe = universe or strategy.universe or "large_cap"
-            portfolio.source_backtest_run_id = source_backtest_run_id
-        elif not getattr(portfolio, "execution_universe", None):
-            portfolio.execution_universe = strategy.universe or "large_cap"
-        if requested_symbols:
-            portfolio.execution_symbols = requested_symbols
-        elif not saved_symbols:
-            portfolio.execution_symbols = []
+        if not is_quant_v3:
+            # is_quant_v3 分支已经在上面把这几个字段设成固定值了，这里的
+            # "沿用上次自定义股票池"逻辑是给通用策略用的，对我们的策略
+            # 不适用（也没有 requested_symbols/saved_symbols 这些变量）。
+            if requested_symbols or universe:
+                portfolio.execution_symbols = requested_symbols
+                portfolio.execution_universe = universe or strategy.universe or "large_cap"
+                portfolio.source_backtest_run_id = source_backtest_run_id
+            elif not getattr(portfolio, "execution_universe", None):
+                portfolio.execution_universe = strategy.universe or "large_cap"
+            if requested_symbols:
+                portfolio.execution_symbols = requested_symbols
+            elif not saved_symbols:
+                portfolio.execution_symbols = []
         config = StrategyConfig(
             name=strategy.name,
             weights=strategy.weights,
@@ -238,7 +291,11 @@ class PaperTradingService:
             drawdown_brake_exposure=float(strategy.drawdown_brake_exposure if strategy.drawdown_brake_exposure is not None else .50),
         )
         config.holdings_count = strategy_holdings
-        strategy_result = MultiFactorStrategy(FactorEngine(self.data), config).generate_weights(as_of, symbols)
+        if is_quant_v3:
+            from app.quant_v3.final_strategy import build_final_strategy
+            strategy_result = build_final_strategy().generate_weights(as_of, symbols)
+        else:
+            strategy_result = MultiFactorStrategy(FactorEngine(self.data), config).generate_weights(as_of, symbols)
         snapshot = self.snapshot(as_of)
         total_assets = float(snapshot["total_assets"])
         # Apply the same portfolio-level risk budget used by the backtest.
@@ -285,9 +342,9 @@ class PaperTradingService:
             for p in self.db.scalars(select(Position).where(Position.portfolio_id == portfolio.id)).all()
         }
         price_symbols = list(dict.fromkeys(symbols + list(current_positions)))
-        prices = self.data.prices(price_symbols, as_of, as_of, allow_network=True)
+        prices = data.prices(price_symbols, as_of, as_of, allow_network=True)
         if prices.empty:
-            prices = self.data.prices(price_symbols, date(2018, 1, 1), as_of, allow_network=True)
+            prices = data.prices(price_symbols, date(2018, 1, 1), as_of, allow_network=True)
         latest = prices.sort_values("trade_date").groupby("symbol").tail(1).set_index("symbol")
         orders: List[Dict[str, object]] = []
         # Sell positions that are no longer in the target, then trim overweight positions.
@@ -386,9 +443,14 @@ class PaperTradingService:
             portfolio.next_rebalance_date = self.next_rebalance_date(as_of, portfolio.auto_rebalance_frequency)
         held_after = {position.symbol for position in self.db.scalars(select(Position).where(Position.portfolio_id == portfolio.id)).all()}
         for row in strategy_result.ranking.head(30).to_dict(orient="records"):
-            action = "HOLD" if row["symbol"] in held_after and row["target_weight"] > 0 else row["action"]
+            # RegressionRotationStrategy的ranking没有"action"列(那是
+            # MultiFactorStrategy特有的)，也可能给出score=None(信号源
+            # 缺数据时的诚实占位，不是bug)——按列/值是否存在兜底，不能
+            # 直接假设都在。
+            default_action = "BUY" if row.get("target_weight", 0) > 0 else "WATCH"
+            action = "HOLD" if row["symbol"] in held_after and row["target_weight"] > 0 else row.get("action", default_action)
             self.db.add(Signal(strategy_id=strategy.id, symbol=row["symbol"], signal_date=as_of, action=action,
-                               score=float(row["score"]), target_weight=float(row["target_weight"]),
+                               score=float(row.get("score") or 0.0), target_weight=float(row["target_weight"]),
                                reason="综合评分第 %s 名，目标权重 %.1f%%" % (row["rank"], row["target_weight"] * 100)))
         self.db.commit()
         snapshot = self.snapshot(as_of)

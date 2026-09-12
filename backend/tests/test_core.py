@@ -47,6 +47,55 @@ def test_backtest_metrics_use_compounded_total_assets():
     assert metrics["compounded_return"] == pytest.approx(.20)
 
 
+def test_backtest_metrics_include_sortino_calmar_and_information_ratio():
+    equity = pd.Series([100.0, 110.0, 95.0, 120.0, 90.0, 130.0])
+    benchmark = pd.Series([100.0, 101.0, 102.0, 103.0, 104.0, 105.0])
+
+    metrics = BacktestEngine._metrics(equity, benchmark, pd.DataFrame(), 100.0)
+
+    # Sortino only penalizes downside days, so with the same numerator it
+    # must be at least as large as Sharpe (which penalizes all volatility).
+    assert metrics["sortino"] >= metrics["sharpe"]
+    assert metrics["calmar"] == pytest.approx(metrics["annual_return"] / abs(metrics["max_drawdown"]))
+    # Strategy has real up-and-down swings the flat-climbing benchmark
+    # doesn't share, so tracking error (and thus IR) must be nonzero.
+    assert metrics["information_ratio"] != 0.0
+
+
+def test_backtest_metrics_profit_loss_ratio_and_holding_days_from_round_trips():
+    trades = pd.DataFrame([
+        {"trade_date": date(2024, 1, 2), "symbol": "A", "side": "BUY", "quantity": 100, "price": 10.0, "amount": 1000.0, "fee": 1.0, "reason": ""},
+        {"trade_date": date(2024, 1, 12), "symbol": "A", "side": "SELL", "quantity": 100, "price": 12.0, "amount": 1200.0, "fee": 1.0, "reason": ""},
+        {"trade_date": date(2024, 2, 1), "symbol": "B", "side": "BUY", "quantity": 100, "price": 20.0, "amount": 2000.0, "fee": 1.0, "reason": ""},
+        {"trade_date": date(2024, 2, 6), "symbol": "B", "side": "SELL", "quantity": 100, "price": 18.0, "amount": 1800.0, "fee": 1.0, "reason": ""},
+    ])
+    equity = pd.Series([100.0, 105.0, 102.0, 108.0])
+    benchmark = pd.Series([100.0, 101.0, 102.0, 103.0])
+
+    metrics = BacktestEngine._metrics(equity, benchmark, trades, 100.0)
+
+    # Round trip A: bought 100@10 (+1 fee), sold 100@12 (-1 fee) -> pnl = 1200-1-1001 = 198, held 10 days.
+    # Round trip B: bought 100@20 (+1 fee), sold 100@18 (-1 fee) -> pnl = 1800-1-2001 = -202, held 5 days.
+    assert metrics["profit_loss_ratio"] == pytest.approx(198.0 / 202.0)
+    assert metrics["avg_holding_days"] == pytest.approx((10 + 5) / 2)
+
+
+def test_round_trip_trades_matches_fifo_lots_across_partial_sells():
+    trades = pd.DataFrame([
+        {"trade_date": date(2024, 1, 1), "symbol": "A", "side": "BUY", "quantity": 100, "price": 10.0, "amount": 1000.0, "fee": 0.0, "reason": ""},
+        {"trade_date": date(2024, 1, 5), "symbol": "A", "side": "BUY", "quantity": 100, "price": 12.0, "amount": 1200.0, "fee": 0.0, "reason": ""},
+        {"trade_date": date(2024, 1, 20), "symbol": "A", "side": "SELL", "quantity": 150, "price": 15.0, "amount": 2250.0, "fee": 0.0, "reason": ""},
+    ])
+
+    round_trips = BacktestEngine._round_trip_trades(trades)
+
+    assert len(round_trips) == 2
+    assert round_trips.quantity.tolist() == [100, 50]
+    assert round_trips.holding_days.tolist() == [19, 15]
+    assert round_trips.pnl.iloc[0] == pytest.approx(100 * (15.0 - 10.0))
+    assert round_trips.pnl.iloc[1] == pytest.approx(50 * (15.0 - 12.0))
+
+
 def test_akshare_search_normalizes_chinese_names(monkeypatch):
     fake_akshare = types.SimpleNamespace(
         stock_info_a_code_name=lambda: pd.DataFrame({"code": ["000002"], "name": ["万  科Ａ"]})

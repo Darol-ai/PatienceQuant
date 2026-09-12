@@ -23,12 +23,15 @@ class StrategyPayload(BaseModel):
     trend_filter: bool = True
     risk_off_exposure: float = Field(.75, gt=0, le=1)
     turnover_band: float = Field(.03, ge=0, le=.25)
-    stop_loss: float = Field(.18, gt=0, le=.8)
+    # stop_loss/target_volatility/max_drawdown_budget 允许 0——0 是"关闭
+    # 这条引擎级风控"的合法取值（ADR-0037：这层叠加对LightGBM策略是净
+    # 拖累，特意存的就是0），不是"忘了设置"，schema不能把它当非法输入拒绝。
+    stop_loss: float = Field(.18, ge=0, le=.8)
     benchmark_enhancement: bool = True
     dip_buy_strength: float = Field(.06, ge=0, le=.5)
     profit_take_strength: float = Field(.05, ge=0, le=.5)
-    target_volatility: float = Field(.22, gt=0, le=1)
-    max_drawdown_budget: float = Field(.15, gt=0, le=.95)
+    target_volatility: float = Field(.22, ge=0, le=1)
+    max_drawdown_budget: float = Field(.15, ge=0, le=.95)
     drawdown_brake_exposure: float = Field(.50, gt=0, le=1)
     model_enabled: bool = True
     model_buy_threshold: float = Field(.60, ge=0, le=1)
@@ -137,6 +140,15 @@ class ExplainRequest(BaseModel):
     max_drawdown: float = 0
     target_weight: float = 0
     use_llm: bool = False
+
+
+class StrategyAssistRequest(BaseModel):
+    description: str = Field(..., min_length=1, max_length=2000)
+
+
+class AIDecisionRequest(BaseModel):
+    adopted: Optional[bool] = None
+    rolled_back: Optional[bool] = None
 
 
 class SyncRequest(BaseModel):

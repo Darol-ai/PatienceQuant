@@ -1,26 +1,35 @@
 from __future__ import annotations
 
 import csv
+import json
 from datetime import date, datetime
 from io import StringIO
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.ai.report_analysis import ReportAnalysisService
+from app.ai.report_extraction import extract_text
+from app.ai.report_factor import ReportFactorService
 from app.ai.service import AIResearchService
+from app.ai.strategy_assistant import StrategyAssistantService
 from app.backtest.engine import BacktestConfig, BacktestEngine
 from app.config import get_settings
 from app.data.service import MarketDataService
+from app.quant_v3.a_phase_data_service import APhaseDataService
+from app.quant_v3.broad_universe import BROAD_STOCKS
+from app.quant_v3.final_strategy import build_final_strategy, final_strategy_history, validate_backtest_date_range
+from app.quant_v3.research_notes import quant_v3_research_universe
 from app.db.models import AIExplanation, BacktestEquity, BacktestMetric, BacktestRun, DailyAccount, Order, Portfolio, Position, ResearchAnnotation, ResearchGroup, Stock, Strategy, StrategyFactor, Trade, Watchlist
 from app.db.session import get_db
 from app.factors.engine import FactorEngine
 from app.portfolio.service import PaperTradingService
-from app.schemas import ApplyBacktestPaperRequest, BacktestRequest, ExplainRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyPayload, SyncRequest
+from app.schemas import AIDecisionRequest, ApplyBacktestPaperRequest, BacktestRequest, ExplainRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyAssistRequest, StrategyPayload, SyncRequest
 from app.strategies.base import StrategyConfig
 from app.strategies.multifactor import MultiFactorStrategy
 
@@ -190,6 +199,26 @@ def universes(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
         {"id": "pink_sheets", "name": "OTC / Pink Sheets（Demo）", "count": len(pink), "description": "离线示例扩展市场；不代表实时 OTC 行情"},
         {"id": "all_assets", "name": "A股 + OTC扩展", "count": len(catalog), "description": "统一 Data Adapter 下的全部可研究资产"},
     ] + [{"id": "custom:%s" % row.id, "name": row.name, "count": len(row.symbols), "description": "自定义研究股票池"} for row in watchlists]
+
+
+@router.get("/research/quant-v3-universe")
+def quant_v3_research_coverage() -> Dict[str, Any]:
+    """本组自由探索阶段最终确定的LightGBM策略实际使用的30支候选池研究
+    标注（docs/adr/0013~0039）——独立于SQLite通用目录和/api/research/coverage
+    那套多因子排序展示，直接返回本组真实的研究依据，不是脚手架自带的
+    demo文案。"""
+    rows = quant_v3_research_universe()
+    sectors = {}
+    for row in rows:
+        sectors.setdefault(row["group"], []).append(row["symbol"])
+    return {
+        "items": rows,
+        "total": len(rows),
+        "groups": [{"name": name, "count": len(symbols), "symbols": symbols} for name, symbols in sectors.items()],
+        "industries": sorted({row["industry"] for row in rows}),
+        "research_window": {"start": "2019-01-01", "end": "2025-12-31"},
+        "strategy_summary": "LightGBM回归预测(90日窗口，5模型集成) + Top-K相对排序 + 动量兜底 + 流动性资格判断，2019-2025历史回测6/7年跑赢等权重买入持有基准，详见 docs/adr/0013~0039",
+    }
 
 
 @router.get("/research/coverage")
@@ -377,7 +406,7 @@ def list_strategies(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
             metrics = {item.name: item.value for item in db.scalars(select(BacktestMetric).where(BacktestMetric.backtest_run_id == latest.id)).all()}
         research_start = row.research_start_date or date(2018, 1, 1)
         research_end = row.research_end_date or date(2025, 12, 31)
-        result.append({"id": row.id, "name": row.name, "version": row.version, "description": row.description, "weights": row.weights, "holdings_count": row.holdings_count, "max_weight": row.max_weight, "rebalance_frequency": row.rebalance_frequency, "universe": row.universe or "large_cap", "research_start_date": research_start.isoformat(), "research_end_date": research_end.isoformat(),
+        result.append({"id": row.id, "name": row.name, "kind": row.kind or "multifactor", "version": row.version, "description": row.description, "weights": row.weights, "holdings_count": row.holdings_count, "max_weight": row.max_weight, "rebalance_frequency": row.rebalance_frequency, "universe": row.universe or "large_cap", "research_start_date": research_start.isoformat(), "research_end_date": research_end.isoformat(),
                        "cash_buffer": float(row.cash_buffer if row.cash_buffer is not None else .02),
                        "trend_filter": bool(row.trend_filter if row.trend_filter is not None else True),
                        "risk_off_exposure": float(row.risk_off_exposure if row.risk_off_exposure is not None else .75),
@@ -437,6 +466,14 @@ def update_strategy(strategy_id: int, payload: StrategyPayload, db: Session = De
     strategy = db.get(Strategy, strategy_id)
     if not strategy:
         raise HTTPException(404, "策略不存在")
+    if strategy.kind and strategy.kind != "multifactor":
+        # 通用编辑表单/schema是给 MultiFactorStrategy 的权重、止损等参数
+        # 设计的——LightGBM策略(kind="quant_v3_regression")的止损/波动率/
+        # 回撤字段特意存的是0(ADR-0037：关闭引擎级风控叠加层，那层对它是
+        # 净拖累)，一次无条件全量覆盖式的更新会把这些字段悄悄填回schema
+        # 默认值，重新引入已经修复过的问题。这类策略的参数由代码固定
+        # 管理，不通过这个通用编辑端点改。
+        raise HTTPException(422, f"策略类型「{strategy.kind}」的参数由代码固定管理，不支持通过通用编辑接口修改")
     for field, value in payload.model_dump().items():
         setattr(strategy, field, value)
     db.commit()
@@ -460,39 +497,71 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
     db.refresh(run)
     try:
         sc = _strategy_config(strategy, payload)
-        market_data = MarketDataService(db)
-        run.data_mode = market_data.mode
-        if payload.universe == "custom":
-            catalog_sync = market_data.ensure_symbols(payload.custom_symbols)
-            if catalog_sync.get("missing"):
-                raise HTTPException(
-                    422,
-                    "以下股票代码无法从本地目录或 AKShare 解析: %s"
-                    % ", ".join(catalog_sync["missing"]),
-                )
-        symbols = _universe_symbols(market_data, payload.universe, payload.custom_symbols)
-        if sc.holdings_count > len(symbols):
+        if strategy.kind == "quant_v3_regression":
+            # 自由探索阶段最终确定的LightGBM量化策略（docs/adr/0013~0037）：
+            # 固定30支跨行业候选池，走独立的parquet数据管道（不经过SQLite/
+            # MarketDataService），不接受universe/custom_symbols这类通用
+            # 股票池参数。sc.stop_loss/turnover_band/target_volatility/
+            # max_drawdown_budget 在seed.py里都已经置0（ADR-0037已证明
+            # 引擎级风控叠加层是净拖累，这里保持策略设计文档描述的行为）。
+            try:
+                validate_backtest_date_range(payload.start_date, payload.end_date)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+            history = final_strategy_history()
+            symbols = [stock["symbol"] for stock in BROAD_STOCKS]
             sc.holdings_count = len(symbols)
-        if sc.holdings_count * sc.max_weight < 1:
-            raise HTTPException(422, "当前股票池标的数量不足以满足单股最大权重限制，请增加股票或提高上限")
-        result = BacktestEngine(market_data).run(
-            BacktestConfig(
-                start_date=payload.start_date,
-                end_date=payload.end_date,
-                initial_capital=payload.initial_capital,
-                rebalance_frequency=sc.rebalance_frequency,
-                holdings_count=sc.holdings_count,
-                max_weight=sc.max_weight,
-                commission=payload.commission,
-                slippage=payload.slippage,
-            ),
-            sc,
-            symbols,
-            # A manually selected pool is an explicit user request for
-            # current AKShare data. Named full-market universes remain
-            # offline-safe unless DATA_MODE=real is enabled.
-            allow_network=payload.universe == "custom",
-        )
+            result = BacktestEngine(APhaseDataService(history)).run(
+                BacktestConfig(
+                    start_date=payload.start_date,
+                    end_date=payload.end_date,
+                    initial_capital=payload.initial_capital,
+                    rebalance_frequency="monthly",
+                    holdings_count=len(symbols),
+                    max_weight=1.0,
+                    commission=payload.commission,
+                    slippage=payload.slippage,
+                ),
+                sc,
+                symbols,
+                strategy=build_final_strategy(),
+                allow_network=False,
+            )
+            run.data_mode = result.data_mode
+        else:
+            market_data = MarketDataService(db)
+            run.data_mode = market_data.mode
+            if payload.universe == "custom":
+                catalog_sync = market_data.ensure_symbols(payload.custom_symbols)
+                if catalog_sync.get("missing"):
+                    raise HTTPException(
+                        422,
+                        "以下股票代码无法从本地目录或 AKShare 解析: %s"
+                        % ", ".join(catalog_sync["missing"]),
+                    )
+            symbols = _universe_symbols(market_data, payload.universe, payload.custom_symbols)
+            if sc.holdings_count > len(symbols):
+                sc.holdings_count = len(symbols)
+            if sc.holdings_count * sc.max_weight < 1:
+                raise HTTPException(422, "当前股票池标的数量不足以满足单股最大权重限制，请增加股票或提高上限")
+            result = BacktestEngine(market_data).run(
+                BacktestConfig(
+                    start_date=payload.start_date,
+                    end_date=payload.end_date,
+                    initial_capital=payload.initial_capital,
+                    rebalance_frequency=sc.rebalance_frequency,
+                    holdings_count=sc.holdings_count,
+                    max_weight=sc.max_weight,
+                    commission=payload.commission,
+                    slippage=payload.slippage,
+                ),
+                sc,
+                symbols,
+                # A manually selected pool is an explicit user request for
+                # current AKShare data. Named full-market universes remain
+                # offline-safe unless DATA_MODE=real is enabled.
+                allow_network=payload.universe == "custom",
+            )
         run.data_mode = result.data_mode
         selected_stocks = _latest_selection(result.ranking, sc.holdings_count)
         run.config = {
@@ -817,25 +886,52 @@ def get_backtest_stocks(run_id: int, db: Session = Depends(get_db)) -> List[Dict
     return _latest_selection(ranking.assign(signal_date=run.end_date), config.holdings_count)
 
 
+def _quant_v3_stock_prices(symbol: str, start: date, end: date) -> pd.DataFrame:
+    """`APhaseDataService.prices()` strips the frame down to just
+    trade_date/symbol/adj_close for the backtest engine's own needs — the
+    per-stock chart also wants volume, so this reads the raw history frame
+    directly instead of going through that narrower interface.
+    """
+    history = final_strategy_history()
+    frame = history[history.symbol == symbol].copy()
+    frame["trade_date"] = pd.to_datetime(frame["date"]).dt.date
+    frame["adj_close"] = frame["close"]
+    return frame[(frame.trade_date >= start) & (frame.trade_date <= end)].sort_values("trade_date")
+
+
 @router.get("/backtests/{run_id}/stocks/{symbol}/chart")
 def get_backtest_stock_chart(run_id: int, symbol: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
     run = db.get(BacktestRun, run_id)
     if not run:
         raise HTTPException(404, "回测不存在")
-    stock = db.scalar(select(Stock).where(Stock.symbol == symbol, Stock.active.is_(True)))
-    if not stock:
-        raise HTTPException(404, "股票不存在")
-    data = MarketDataService(db)
-    prices = data.prices([symbol], run.start_date, run.end_date, allow_network=True)
-    price_data_mode = data.frame_data_mode(prices)
+    strategy = db.get(Strategy, run.strategy_id)
+    if strategy and strategy.kind == "quant_v3_regression":
+        # 我们自己的30支候选池走独立的parquet数据管道，symbol格式("
+        # 600519.SH"带交易所后缀)和SQLite通用目录("600519"裸代码)本来
+        # 就对不上——用通用`Stock`表查这些symbol必然查不到，是两套数据
+        # 源天生不兼容，不是这支股票真的不存在。
+        name_by_symbol = {stock["symbol"]: stock["name"] for stock in BROAD_STOCKS}
+        if symbol not in name_by_symbol:
+            raise HTTPException(404, "股票不存在")
+        prices = _quant_v3_stock_prices(symbol, run.start_date, run.end_date)
+        price_data_mode = "quant_v3"
+        name = name_by_symbol[symbol]
+    else:
+        stock = db.scalar(select(Stock).where(Stock.symbol == symbol, Stock.active.is_(True)))
+        if not stock:
+            raise HTTPException(404, "股票不存在")
+        data = MarketDataService(db)
+        prices = data.prices([symbol], run.start_date, run.end_date, allow_network=True)
+        price_data_mode = data.frame_data_mode(prices)
+        name = stock.name
     if prices.empty:
-        return {"symbol": symbol, "name": stock.name, "prices": [], "trade_markers": [], "data_mode": price_data_mode}
+        return {"symbol": symbol, "name": name, "prices": [], "trade_markers": [], "data_mode": price_data_mode}
     prices = prices.sort_values("trade_date")
     trades = db.scalars(select(Trade).where(Trade.backtest_run_id == run_id, Trade.symbol == symbol).order_by(Trade.trade_date)).all()
     markers = [{"trade_date": item.trade_date.isoformat(), "price": item.price, "side": item.side, "quantity": item.quantity, "amount": item.amount, "reason": item.reason} for item in trades]
     first_price = float(prices.adj_close.iloc[0])
     last_price = float(prices.adj_close.iloc[-1])
-    return {"symbol": symbol, "name": stock.name, "start_date": run.start_date.isoformat(), "end_date": run.end_date.isoformat(),
+    return {"symbol": symbol, "name": name, "start_date": run.start_date.isoformat(), "end_date": run.end_date.isoformat(),
             "prices": _records(prices[["trade_date", "adj_close", "volume"]]), "trade_markers": markers, "data_mode": price_data_mode,
             "return": last_price / first_price - 1 if first_price else 0, "trade_count": len(markers)}
 
@@ -851,21 +947,33 @@ def get_backtest_stock_charts(run_id: int, db: Session = Depends(get_db)) -> Dic
     run = db.get(BacktestRun, run_id)
     if not run:
         raise HTTPException(404, "回测不存在")
+    strategy = db.get(Strategy, run.strategy_id)
+    is_quant_v3 = bool(strategy and strategy.kind == "quant_v3_regression")
     stored = (run.config or {}).get("selected_stocks", [])
     symbols = [str(item.get("symbol")) for item in stored if item.get("symbol")]
     if not symbols:
         symbols = [str(item.get("symbol")) for item in get_backtest_stocks(run_id, db) if item.get("symbol")]
     data = MarketDataService(db)
+    name_by_symbol = {stock["symbol"]: stock["name"] for stock in BROAD_STOCKS} if is_quant_v3 else {}
     result: List[Dict[str, Any]] = []
     for symbol in symbols[:100]:
-        stock = db.scalar(select(Stock).where(Stock.symbol == symbol, Stock.active.is_(True)))
-        if not stock:
-            continue
-        prices = data.prices([symbol], run.start_date, run.end_date, allow_network=True)
+        if is_quant_v3:
+            # 同一套symbol格式不兼容问题（600519.SH vs 通用目录的裸代码），
+            # 见上面单支股票接口的说明——这里也不能用`Stock`表查名字/价格。
+            name = name_by_symbol.get(symbol)
+            if name is None:
+                continue
+            prices = _quant_v3_stock_prices(symbol, run.start_date, run.end_date)
+        else:
+            stock = db.scalar(select(Stock).where(Stock.symbol == symbol, Stock.active.is_(True)))
+            if not stock:
+                continue
+            name = stock.name
+            prices = data.prices([symbol], run.start_date, run.end_date, allow_network=True)
         if prices.empty:
             result.append({
                 "symbol": symbol,
-                "name": stock.name,
+                "name": name,
                 "start_date": run.start_date.isoformat(),
                 "end_date": run.end_date.isoformat(),
                 "prices": [],
@@ -896,12 +1004,12 @@ def get_backtest_stock_charts(run_id: int, db: Session = Depends(get_db)) -> Dic
         last_price = float(prices.adj_close.iloc[-1])
         result.append({
             "symbol": symbol,
-            "name": stock.name,
+            "name": name,
             "start_date": run.start_date.isoformat(),
             "end_date": run.end_date.isoformat(),
             "prices": _records(prices[["trade_date", "adj_close", "volume"]]),
             "trade_markers": markers,
-            "data_mode": data.frame_data_mode(prices),
+            "data_mode": "quant_v3" if is_quant_v3 else data.frame_data_mode(prices),
             "return": last_price / first_price - 1 if first_price else 0,
             "trade_count": len(markers),
         })
@@ -1182,7 +1290,10 @@ def paper_rebalance(payload: PaperRebalanceRequest, db: Session = Depends(get_db
     strategy = db.get(Strategy, strategy_id) if strategy_id is not None else None
     if not strategy:
         raise HTTPException(404, "策略不存在")
-    return _clean(PaperTradingService(db, MarketDataService(db)).rebalance(strategy, payload.as_of))
+    try:
+        return _clean(PaperTradingService(db, MarketDataService(db)).rebalance(strategy, payload.as_of))
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @router.get("/paper/automation")
@@ -1236,9 +1347,141 @@ def universe_analytics(db: Session = Depends(get_db)) -> Dict[str, Any]:
 @router.post("/ai/explain/trade")
 def explain_trade(payload: ExplainRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
     result = AIResearchService().explain(payload.model_dump(), payload.use_llm)
-    db.add(AIExplanation(symbol=payload.symbol, explanation_type="trade", content=result["content"], provider=result["provider"], context=payload.model_dump()))
+    record = AIExplanation(
+        symbol=payload.symbol, explanation_type="trade", content=result["content"],
+        provider=result["provider"], model_version=result.get("model_version", "rules"),
+        confidence=result.get("confidence"), context=payload.model_dump(),
+    )
+    db.add(record)
     db.commit()
-    return result
+    db.refresh(record)
+    return {**result, "audit_id": record.id}
+
+
+@router.post("/ai/strategy-assistant")
+def strategy_assistant(payload: StrategyAssistRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    result = StrategyAssistantService().suggest(payload.description)
+    record = AIExplanation(
+        symbol="-", explanation_type="strategy_assist", content=result["content"],
+        provider=result["provider"], model_version=result.get("model_version", "rules"),
+        confidence=result.get("confidence"), context={"description": payload.description},
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return {**result, "audit_id": record.id}
+
+
+@router.post("/ai/audit/{audit_id}/decision")
+def record_ai_decision(audit_id: int, payload: AIDecisionRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """人工对某次 AI 输出的采纳/回滚记录——审计留痕闭环的另一半：不仅要
+    记录 AI 说了什么，还要记录人有没有听、有没有事后撤销。"""
+    record = db.get(AIExplanation, audit_id)
+    if not record:
+        raise HTTPException(404, "审计记录不存在")
+    if payload.adopted is not None:
+        record.adopted = payload.adopted
+    if payload.rolled_back is not None:
+        record.rolled_back = payload.rolled_back
+    record.decided_at = datetime.utcnow()
+    db.commit()
+    return {"id": record.id, "adopted": record.adopted, "rolled_back": record.rolled_back, "decided_at": record.decided_at.isoformat()}
+
+
+@router.get("/ai/audit")
+def list_ai_audit(limit: int = 50, db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
+    rows = db.scalars(select(AIExplanation).order_by(AIExplanation.id.desc()).limit(limit)).all()
+    return [
+        {
+            "id": row.id, "symbol": row.symbol, "explanation_type": row.explanation_type,
+            "provider": row.provider, "model_version": row.model_version, "confidence": row.confidence,
+            "content": row.content, "created_at": row.created_at.isoformat(),
+            "adopted": row.adopted, "rolled_back": row.rolled_back,
+            "decided_at": row.decided_at.isoformat() if row.decided_at else None,
+        }
+        for row in rows
+    ]
+
+
+@router.post("/ai/report/analyze")
+async def analyze_report(file: UploadFile = File(...), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """功能①：上传研报，AI 挖掘给总结和策略参考——只解读，不生成代码、
+    不自动创建策略。"""
+    content = await file.read()
+    try:
+        report_text = extract_text(file.filename or "report.txt", content)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    result = ReportAnalysisService().analyze(report_text)
+    record = AIExplanation(
+        symbol="-", explanation_type="report_analysis", content=json.dumps(
+            {"summary": result["summary"], "key_points": result["key_points"], "strategy_reference": result["strategy_reference"]},
+            ensure_ascii=False,
+        ),
+        provider=result["provider"], model_version=result.get("model_version", "rules"),
+        confidence=result.get("confidence"), context={"filename": file.filename, "text_preview": report_text[:500]},
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return {**result, "audit_id": record.id, "filename": file.filename}
+
+
+@router.post("/ai/report/generate-factor")
+async def generate_factor_from_report(
+    file: UploadFile = File(...),
+    top_n: int = 5,
+    run_backtest: bool = True,
+    start_date: date = date(2024, 1, 1),
+    end_date: date = date(2025, 12, 31),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """功能②：如果研报对因子/建模有参考价值，生成一个白名单特征的线性因子，
+    并（默认）直接接进 A 阶段回测系统跑一遍——不要求这个因子真的赚钱，只
+    要求这条"生成 → 回测"的链路是真的在跑，不是摆设。"""
+    content = await file.read()
+    try:
+        report_text = extract_text(file.filename or "report.txt", content)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+    result = ReportFactorService().generate(report_text)
+    backtest_summary: Optional[Dict[str, Any]] = None
+    backtest_error: Optional[str] = None
+    if run_backtest and result["factor_weights"]:
+        try:
+            from app.quant_v3.factor_backtest import run_generated_factor_backtest
+
+            backtest_result = run_generated_factor_backtest(
+                result["factor_weights"], start=start_date, end=end_date, top_n=top_n,
+            )
+            backtest_summary = {
+                "metrics": backtest_result.metrics,
+                "trade_count": int(len(backtest_result.trades)),
+                "trades": _records(backtest_result.trades.head(50)),
+            }
+        except FileNotFoundError:
+            backtest_error = "本地 A 阶段历史数据不存在，运行 scripts/fetch_a_phase_history.py 后再试"
+        except Exception as exc:
+            backtest_error = str(exc)
+
+    record = AIExplanation(
+        symbol="-", explanation_type="report_factor",
+        content=json.dumps({"rationale": result["rationale"], "factor_weights": result["factor_weights"]}, ensure_ascii=False),
+        provider=result["provider"], model_version=result.get("model_version", "rules"),
+        confidence=result.get("confidence"),
+        context={"filename": file.filename, "text_preview": report_text[:500], "backtest_error": backtest_error},
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return {
+        **result,
+        "audit_id": record.id,
+        "filename": file.filename,
+        "backtest": backtest_summary,
+        "backtest_error": backtest_error,
+    }
 
 
 @router.post("/data/sync")

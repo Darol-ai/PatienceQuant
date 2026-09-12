@@ -97,6 +97,10 @@ class Strategy(Base):
     __tablename__ = "strategies"
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(120), index=True)
+    # "multifactor"（默认，原有通用因子策略）或 "quant_v3_regression"
+    # （自由探索阶段的最终LightGBM量化策略，见 docs/adr/0036）——按 kind
+    # 分流到不同的数据源/策略对象，不影响原有策略的行为。
+    kind: Mapped[str] = mapped_column(String(30), default="multifactor")
     version: Mapped[int] = mapped_column(Integer, default=1)
     description: Mapped[str] = mapped_column(Text, default="")
     weights: Mapped[Dict[str, float]] = mapped_column(JSON)
@@ -265,11 +269,20 @@ class Signal(Base):
 
 
 class AIExplanation(Base):
+    """AI 助手的审计留痕：每次调用记模型版本、输入、输出、时间、置信度、
+    是否被人工采纳、是否被回滚（PRD §19.1 第 5 条）。confidence 允许为空——
+    规则解释器给不出真实置信度时，宁可留空也不伪造一个数字。
+    """
     __tablename__ = "ai_explanations"
     id: Mapped[int] = mapped_column(primary_key=True)
     symbol: Mapped[str] = mapped_column(String(20), index=True)
     explanation_type: Mapped[str] = mapped_column(String(40))
     content: Mapped[str] = mapped_column(Text)
     provider: Mapped[str] = mapped_column(String(30), default="rules")
+    model_version: Mapped[str] = mapped_column(String(60), default="rules")
+    confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     context: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    adopted: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    rolled_back: Mapped[bool] = mapped_column(Boolean, default=False)
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

@@ -50,6 +50,20 @@ def migrate_lightweight_schema() -> None:
             with engine.begin() as connection:
                 for statement in pending:
                     connection.execute(text(statement))
+    if "ai_explanations" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("ai_explanations")}
+        migrations = {
+            "model_version": "ALTER TABLE ai_explanations ADD COLUMN model_version VARCHAR(60) DEFAULT 'rules'",
+            "confidence": "ALTER TABLE ai_explanations ADD COLUMN confidence FLOAT",
+            "adopted": "ALTER TABLE ai_explanations ADD COLUMN adopted BOOLEAN",
+            "rolled_back": "ALTER TABLE ai_explanations ADD COLUMN rolled_back BOOLEAN DEFAULT 0",
+            "decided_at": "ALTER TABLE ai_explanations ADD COLUMN decided_at DATETIME",
+        }
+        pending = [statement for name, statement in migrations.items() if name not in columns]
+        if pending:
+            with engine.begin() as connection:
+                for statement in pending:
+                    connection.execute(text(statement))
     if "strategies" in inspector.get_table_names():
         columns = {column["name"] for column in inspector.get_columns("strategies")}
         migrations = {
@@ -67,6 +81,7 @@ def migrate_lightweight_schema() -> None:
             "target_volatility": "ALTER TABLE strategies ADD COLUMN target_volatility FLOAT DEFAULT 0.22",
             "max_drawdown_budget": "ALTER TABLE strategies ADD COLUMN max_drawdown_budget FLOAT DEFAULT 0.15",
             "drawdown_brake_exposure": "ALTER TABLE strategies ADD COLUMN drawdown_brake_exposure FLOAT DEFAULT 0.50",
+            "kind": "ALTER TABLE strategies ADD COLUMN kind VARCHAR(30) DEFAULT 'multifactor'",
         }
         pending = [statement for name, statement in migrations.items() if name not in columns]
         if pending:

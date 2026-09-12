@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.backtest.engine import BacktestConfig, BacktestEngine
 from app.data.service import MarketDataService
+from app.quant_v3.broad_universe import BROAD_STOCKS
 from app.db.models import BacktestEquity, BacktestMetric, BacktestRun, Portfolio, ResearchAnnotation, Strategy, StrategyFactor, Trade, Watchlist
 from app.strategies.base import StrategyConfig
 
@@ -113,7 +114,46 @@ def seed_database(db: Session) -> None:
         strategy.drawdown_brake_exposure = .50
         strategy.description = "以跑赢或贴近沪深300为目标：月度低频调仓，动量和相对强度优先，叠加估值低吸、过热高抛、趋势风险闸门和基础质量约束"
         db.commit()
+    _ensure_quant_v3_strategy(db)
     _ensure_demo_backtest(db, strategy)
+
+
+def _ensure_quant_v3_strategy(db: Session) -> None:
+    """自由探索阶段最终确定的LightGBM量化策略（docs/adr/0013~0037），
+    走独立的parquet数据管道（见 app/quant_v3/final_strategy.py），不经过
+    SQLite/MarketDataService通用股票目录。stop_loss/turnover_band/
+    target_volatility/max_drawdown_budget 全部置0——ADR-0037已经证明
+    BacktestEngine的引擎级风控叠加层对这个策略是净拖累，这里保持和策略
+    设计文档一致的行为，不叠加没被写进策略本身的额外风控。
+    """
+    if db.scalar(select(Strategy).where(Strategy.kind == "quant_v3_regression").limit(1)):
+        return
+    db.add(Strategy(
+        name="LightGBM动量增强策略(30支候选池)",
+        kind="quant_v3_regression",
+        version=1,
+        description="30支跨行业候选池 + LightGBM回归预测(90日窗口，5模型集成) + Top-K相对排序 + 独立动量兜底 + 流动性资格判断，2019-2025历史回测6/7年跑赢等权重买入持有基准，详见 docs/adr/0013~0037",
+        weights={},
+        holdings_count=len(BROAD_STOCKS),
+        max_weight=1.0,
+        rebalance_frequency="monthly",
+        universe="custom",
+        research_start_date=date(2019, 1, 1),
+        research_end_date=date(2025, 12, 31),
+        cash_buffer=0,
+        trend_filter=False,
+        risk_off_exposure=1.0,
+        turnover_band=0,
+        stop_loss=0,
+        benchmark_enhancement=False,
+        dip_buy_strength=0,
+        profit_take_strength=0,
+        target_volatility=0,
+        max_drawdown_budget=0,
+        drawdown_brake_exposure=1.0,
+        is_default=False,
+    ))
+    db.commit()
 
 
 def _ensure_group_research_annotations(db: Session) -> None:
