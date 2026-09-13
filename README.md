@@ -23,7 +23,7 @@ docker compose up --build
 # 浏览器打开 http://localhost:8080
 ```
 
-默认使用确定性离线 Demo 数据，页面会明确标记 `DEMO MODE`。如果需要尝试 AKShare：
+默认使用确定性离线 Demo 数据，页面会明确标记"通用目录 · DEMO MODE"——这个标记只描述脚手架自带的通用股票目录（自定义股票池等次要功能用到），下文"沪深300策略集"里的 3 个已验证策略、以及 30 支候选池策略，走独立的真实数据管道，不受这个开关影响，也不会被这个标记覆盖。如果需要让通用目录也尝试 AKShare：
 
 ```bash
 uv pip install --python .venv/bin/python -e './backend[real-data]'
@@ -32,7 +32,7 @@ DATA_MODE=real make backend
 
 AKShare 访问失败会自动回退 Demo Provider，因此不影响离线演示。
 
-在“回测中心 → 手动选择股票”中，可以切换 `AKShare` 目录，直接用中文名称或股票代码搜索并添加股票。点击“刷新 AKShare 目录”可将代码/名称目录缓存到 SQLite；点击“同步所选行情”可按当前回测区间尝试下载选中股票的前复权日线。若网络、限流或字段变化导致 AKShare 不可用，页面会回退到本地目录和确定性 Demo fallback，并明确保留数据源状态。
+“回测中心 → 手动选择股票”这套搜索/勾选 AKShare 目录的交互仍在代码里（`frontend/src/pages/BacktestCenter.tsx` 的 `manualUniverse` 分支），可以切换 `AKShare` 目录、用中文名称或股票代码搜索、点击“刷新 AKShare 目录”缓存到 SQLite、点击“同步所选行情”下载前复权日线。**但目前回测中心的策略下拉框只展示已验证的沪深300策略（见下文），这些策略都使用固定的沪深300全市场 universe，不会触发手动选股分支**——这套交互暂时没有可从下拉框直接进入的入口。若网络、限流或字段变化导致 AKShare 不可用，通用目录会回退到本地目录和确定性 Demo fallback，并明确保留数据源状态。
 
 如果希望 Docker 默认优先使用 AKShare：
 
@@ -42,23 +42,26 @@ DATA_MODE=real docker compose up --build
 
 ## 模块边界
 
-- `backend/app/data`：统一市场数据 Provider 和 SQLite 缓存
+- `backend/app/data`：统一市场数据 Provider 和 SQLite 缓存（脚手架默认多因子策略使用）
 - `backend/app/factors`：因子计算、横截面标准化、缺失值填充
 - `backend/app/strategies`：策略配置、选股和目标权重
 - `backend/app/backtest`：无未来数据泄漏的月度/周度/季度回测
 - `backend/app/portfolio`：Paper Trading 账户、订单和成交账本
 - `backend/app/ai`：规则解释器和可选 OpenAI-compatible 适配器
+- `backend/app/quant_v3`：本组独立开发的真实数据策略——30支候选池的 LightGBM 动量增强策略，以及沪深300全市场（300支真实成分股）的 LightGBM/XGBoost/集成三个已验证策略；走独立 parquet 数据管道，不经过 SQLite 通用目录，不受 `DATA_MODE` 影响
 - `frontend/src`：企业级暗色量化 Dashboard
+
+更详细的分模块操作说明（含每个页面的截图）见 [`docs/使用说明.md`](docs/使用说明.md)。
 
 参考项目的复用边界：借鉴 Qlib 的数据/因子/回测分层、FinRL-X 的权重中心契约和 FinRL 的交易/账本思路；不把大型框架整体嵌入产品。
 
 ## 演示路径
 
 1. 打开 Dashboard，查看总资产、净值和信号。
-2. 在股票池查看 5 个研究组、1,000 只跨行业 Demo 股票、171 个细分行业和行业分析图。
+2. 在股票池查看两个真实候选池：本组30支跨行业研究池（含逐股入选依据与风险点），以及沪深300全部300支真实成分股（按 LightGBM 最新真实打分排名），下方附行业分布/评分分布/估值成长三张分析图。
 3. 在策略中心使用“快速制定策略”设置策略名称、股票池、调仓频率和持仓数量；LightGBM 信号与风险控制默认开启，确有需要时再展开高级设置调整因子和阈值。
-4. 在回测中心选择大盘股等预置股票池，或切换到“手动选择股票”，搜索并勾选至少 10 只股票。
-5. 框定 2018-2025 等研究年份并运行回测，查看最终 Top N、累计/年化收益、回撤、Sharpe、年度收益和完整成交记录。
+4. 在回测中心的策略下拉框里选择——下拉框只展示当前已验证的策略（三个沪深300 LightGBM/XGBoost/集成策略），不会混入未验证或已废弃的策略。
+5. 框定研究区间并运行回测，查看最终 Top N、累计/年化收益、回撤、Sharpe、年度收益和完整成交记录。
 6. 点击任一入选股票，在独立价格曲线上查看该股票的 BUY/SELL 成交点；组合净值曲线也会标注买卖点。
 7. 点击“导出 CSV”下载该回测的完整交易账本，包含日期、代码、名称、市场、研究组、行业、方向、数量、价格、金额、手续费、策略和触发原因。
 8. 在自动交易执行一次调仓。
@@ -77,7 +80,9 @@ DATA_MODE=real docker compose up --build
 - **流动性资格判断**：按 60 日日均成交额、可交易天数、是否停牌做入选前置过滤。
 - **不叠加引擎级止损/波动率/回撤控制**——这层通用风控被验证过是净拖累，本策略默认关闭（详见下方"结果"里的对照）。
 
-这套策略走的是和通用策略共用的 `/api/backtests`、`/api/paper/*` 接口（按策略 `kind` 字段分流数据管道），股票池、模拟盘、回测中心页面都能直接选中它跑。
+这套策略走的是和通用策略共用的 `/api/backtests`、`/api/paper/*` 接口（按策略 `kind` 字段分流数据管道）。
+
+> **现状说明**：这是本组最早跑通的独立策略，仍在股票池页面展示完整研究候选池和入选依据；但回测中心/自动交易的策略下拉框目前只展示下一节"沪深300策略集"里已验证的 3 个策略（`validated` 标志见 `app/quant_v3/csi300_strategies.py::ACTIVE_CSI300_STRATEGIES`），这套 30 支候选池策略暂不在下拉框可选范围内。
 
 ### 结果（真实回测，2019-01-01 ~ 2025-12-31，逐年独立回测）
 
@@ -102,6 +107,20 @@ DATA_MODE=real docker compose up --build
 - 诊断过多种假设试图解决"等权基准下2019年跑输"这个问题（拉长动量回看期、粘性持仓、杠杆、多时间尺度融合、基本面特征、市场状态切换……详见开发过程记录），指向的是一个结构性事实：2019 年是近乎普涨的贝塔行情，模型的相对排序在普涨市场里区分度较弱——这不是一个已解决的问题，是诚实报告的已知局限。
 - 这是历史区间的回测结果，7 个自然年、30 支股票的样本量，不构成对未来收益的任何保证；模拟盘（Paper Trading）只做本地撮合，不接入真实券商。
 - 开发过程中两次被"结果好得不太合理"的直觉倒查出真实系统 bug（基准计算的价格量级偏差、LightGBM 集成模型未开子采样导致 5 个"不同随机种子"训出完全相同的树），修复后的数字比修复前更保守——这两个 bug 修复前的版本曾经短暂报告过更高但错误的收益数字，均已在过程记录里更正。
+
+## 沪深300策略集（当前已验证、生产可用的策略）
+
+在 30 支候选池策略之后，本组进一步把 universe 换成**沪深300全部 300 支真实成分股**——对齐主流量化平台的做法（用可复现、可点位核对的指数成分股作为交易范围，而不是自选池），并逐年独立回测验证了 3 个策略。这 3 个是当前唯一在回测中心 / 自动交易页面下拉框中可选的策略：
+
+| kind | 名称 | 说明（节选自策略描述，原文见 `app/db/seed.py::_CSI300_STRATEGY_LABELS`） |
+|---|---|---|
+| `csi300_lightgbm` | LightGBM沪深300策略 | LightGBM回归预测(90日窗口，5模型集成) + Top-30相对排序，2019-2025历史回测6/7年跑赢真实沪深300指数，**7年复合+646.9% vs 指数+58.9%** |
+| `csi300_xgboost` | XGBoost沪深300策略 | 同一套特征/训练规则，模型换成XGBoost，验证"树模型持续有效"的公开研究结论，**7年复合+620.8% vs 指数+58.9%** |
+| `csi300_ensemble` | LightGBM+XGBoost集成沪深300策略 | 两个独立训练的模型预测分数取平均，**7年复合+611.9% vs 指数+58.9%**（略低于单独任一模型，简单平均在两个高度相关的树模型间没有额外增益，如实记录，仍是有效策略） |
+
+如实说明边界：这 3 个策略共用同一套沪深300全市场 universe 和训练/回测规则，同样不叠加引擎级止损/波动率/回撤控制层（`app/quant_v3` 下策略共同的设计，详见上方 30 支候选池策略一节"结果"中对该层被验证为净拖累的说明）；这是历史区间回测结果，不构成未来收益保证。逐年细分数据尚未整理进独立 ADR 文档（代码注释标注"详见 docs/adr 待补"），目前权威数字以 `app/quant_v3/csi300_strategies.py` 和 `app/db/seed.py` 中的策略描述为准。
+
+因为构建 LightGBM/XGBoost 信号源需要一次性加载 70 个模型文件并建立约 90 万行历史数据的索引（冷启动约 5 分钟），服务启动时会在后台线程自动预热一次，通常不会让首个用户等待；预热过程用锁保证同一时间只构建一次，避免并发请求重复构建拖慢/占满内存。
 
 ### 界面截图
 
@@ -151,27 +170,28 @@ uv pip install --python .venv/bin/python -e './backend'
 ## 用户体验与结果审计
 
 - 策略中心优先展示少量核心配置，高级参数按需调整。
-- 回测中心支持搜索并勾选至少 10 只股票，研究区间默认覆盖 2018—2025。
+- 回测中心/自动交易的策略下拉框只展示已验证策略，选中后会展示该策略的介绍文字和研究区间，避免手动来回核对。
 - 结果统一展示最终 Top N、累计/年化收益、最大回撤、Sharpe、年度收益、风险闸门和完整成交记录。
 - 成交账本可导出 CSV；数据源状态、Demo/Real 模式和模型后端会随结果保留。
+- 慢操作（沪深300策略首次冷启动、调仓）有明确的进度反馈和失败原因提示，不会静默复位按钮状态。
 
 ## 前端界面预览
 
-以下截图来自本地运行的 Demo Mode，统一使用 `1440×900` 短视口（未使用整页长截图），每张图只保留一个功能的首屏或结果视图：
+以下截图取自当前版本（commit `2aa83b4`）的真实运行状态，`1440×900` 视口。更完整的分模块说明见 [`docs/使用说明.md`](docs/使用说明.md)。
 
 <table>
   <tr>
     <td valign="top" width="50%">
       <strong>Dashboard · 收益与风险总览</strong><br>
-      总资产、年化收益、最大回撤、Sharpe、策略/沪深300净值和买卖点。
+      总资产、年化收益、最大回撤、Sharpe、策略/沪深300净值和真实买卖点；右上角只保留一处数据来源标注（系统状态卡片），不再重复展示。
       <br><br>
-      <img src="docs/screenshots/dashboard.png" alt="Dashboard：收益与风险总览" width="520">
+      <img src="docs/screenshots/guide/01-dashboard.png" alt="Dashboard：收益与风险总览" width="520">
     </td>
     <td valign="top" width="50%">
-      <strong>股票池 · 搜索、评分与行业分布</strong><br>
-      1,000+ 示例股票、研究组、行业、综合评分和 BUY/HOLD/SELL 信号。
+      <strong>股票池 · 真实策略候选池</strong><br>
+      30支跨行业研究池 + 沪深300全部300支真实成分股排名，下附行业分布/评分分布/估值成长三张分析图。
       <br><br>
-      <img src="docs/screenshots/stock-pool.png" alt="股票池：搜索、评分与行业分布" width="520">
+      <img src="docs/screenshots/guide/02-stocks.png" alt="股票池：真实策略候选池" width="520">
     </td>
   </tr>
   <tr>
@@ -179,35 +199,35 @@ uv pip install --python .venv/bin/python -e './backend'
       <strong>策略中心 · 快速制定策略与 LightGBM</strong><br>
       先设置策略名称、股票池、调仓频率和持仓数量；LightGBM 信号层与风险控制默认开启，高级参数按需展开。
       <br><br>
-      <img src="docs/screenshots/strategy-center.png" alt="策略中心：快速制定策略与 LightGBM 默认开启" width="520">
+      <img src="docs/screenshots/guide/03-strategy.png" alt="策略中心：快速制定策略与 LightGBM 默认开启" width="520">
     </td>
     <td valign="top">
-      <strong>回测中心 · 搜索并勾选股票</strong><br>
-      切换到手动股票池，搜索或筛选股票并勾选至少 10 只；研究区间可直接选择 `2018-01-01` 至 `2025-12-31`。
+      <strong>回测中心 · 策略下拉框</strong><br>
+      策略下拉框只展示当前已验证的沪深300策略；选中后会展示该策略的说明文字与执行口径。
       <br><br>
-      <img src="docs/screenshots/backtest-center.png" alt="回测中心：手动搜索并勾选至少 10 只股票" width="520">
+      <img src="docs/screenshots/guide/04-backtest.png" alt="回测中心：只展示已验证策略的下拉框" width="520">
     </td>
   </tr>
   <tr>
     <td valign="top">
-      <strong>回测结果 · Top N、收益与风险指标</strong><br>
-      展示候选池与最终 Top N、累计/年化收益、Sharpe、最大回撤、沪深300对比、年度收益和完整成交记录。
+      <strong>回测结果 · 沪深300策略真实指标</strong><br>
+      16 项收益/风险/交易指标（含候选池等权基准、真实沪深300指数超额收益、Sortino、Calmar、信息比率、盈亏比等），以及风险闸门/回撤刹车触发次数。
       <br><br>
-      <img src="docs/screenshots/backtest-result.png" alt="回测结果：最终 Top N、收益指标与风险闸门" width="520">
+      <img src="docs/screenshots/csi300-result.png" alt="回测结果：沪深300策略真实指标面板" width="520">
     </td>
     <td valign="top">
       <strong>自动交易 · 调仓订单与触发原因</strong><br>
-      从策略评分到目标权重、风险控制、BUY/SELL/HOLD 和 Paper Broker 执行。
+      策略评分 → 组合构建 → 风险控制 → 模拟执行；交易账本记录每笔调仓的方向、数量、金额与来源策略。
       <br><br>
-      <img src="docs/screenshots/auto-trading.png" alt="自动交易：调仓订单与触发原因" width="520">
+      <img src="docs/screenshots/guide/06-autotrading.png" alt="自动交易：调仓订单与触发原因" width="520">
     </td>
   </tr>
   <tr>
     <td valign="top">
       <strong>模拟盘 · 资产、现金与持仓收益</strong><br>
-      展示策略净值、资金变化、持仓市值、浮动盈亏和成交点。
+      展示策略净值、资金变化、持仓市值、浮动盈亏和成交点，执行模式明确标注 PAPER。
       <br><br>
-      <img src="docs/screenshots/paper-trading.png" alt="模拟盘：资产、现金与持仓收益" width="520">
+      <img src="docs/screenshots/guide/05-paper.png" alt="模拟盘：资产、现金与持仓收益" width="520">
     </td>
     <td valign="top">
       <strong>股票详情 · 多年份价格曲线</strong><br>
@@ -218,10 +238,10 @@ uv pip install --python .venv/bin/python -e './backend'
   </tr>
   <tr>
     <td valign="top">
-      <strong>AI 投研 · 可审计的交易解释</strong><br>
-      基于评分、因子、行业权重和风险指标生成解释；AI 只解释，不直接下单。
+      <strong>AI 投研 · 可审计的交易解释（不参与交易决策）</strong><br>
+      基于评分、因子、行业权重和风险指标生成解释；页面底部明确划定"只解释/建议、不下单"的使用边界。
       <br><br>
-      <img src="docs/screenshots/ai-research.png" alt="AI 投研：可审计的交易解释" width="520">
+      <img src="docs/screenshots/guide/07-airesearch.png" alt="AI 投研：可审计的交易解释" width="520">
     </td>
   </tr>
 </table>
