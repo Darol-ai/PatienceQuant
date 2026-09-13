@@ -353,6 +353,21 @@ def test_quant_v3_backtest_stock_charts_use_the_parquet_data_pipeline():
         assert all(item["prices"] for item in items)
 
 
+def test_strategies_list_flags_only_validated_effective_strategies():
+    """前端回测中心的策略下拉框只展示`validated=true`的策略——这个字段
+    必须直接来自ACTIVE_CSI300_STRATEGIES这个唯一注册表，不能前后端各
+    维护一份判断标准，否则两边容易不同步。"""
+    with TestClient(app) as client:
+        strategies = client.get("/api/strategies").json()
+        by_kind = {row["kind"]: row["validated"] for row in strategies}
+        assert by_kind["csi300_lightgbm"] is True
+        assert by_kind["csi300_xgboost"] is True
+        assert by_kind["csi300_ensemble"] is True
+        # 默认的通用多因子策略和废弃的动量候选都没有经过"vs真实指数"的
+        # 逐年验证，不能被标成有效。
+        assert by_kind.get("multifactor") is not True
+
+
 def test_quant_v3_strategy_params_are_protected_from_generic_edit_endpoint():
     """LightGBM策略(kind=quant_v3_regression)的stop_loss/target_volatility/
     max_drawdown_budget特意存0(ADR-0037：关闭引擎级风控叠加层)——通用的

@@ -184,6 +184,7 @@ class PaperTradingService:
             "last_rebalance_at": portfolio.last_rebalance_at,
             "strategy_id": portfolio.strategy_id,
             "strategy_name": strategy.name if strategy else None,
+            "strategy_kind": strategy.kind if strategy else None,
             "execution_universe": getattr(portfolio, "execution_universe", None) or (strategy.universe if strategy else "large_cap"),
             "execution_symbols": execution_symbols,
             "source_backtest_run_id": getattr(portfolio, "source_backtest_run_id", None),

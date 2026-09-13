@@ -23,7 +23,7 @@ from app.config import get_settings
 from app.data.service import MarketDataService
 from app.quant_v3.a_phase_data_service import APhaseDataService
 from app.quant_v3.broad_universe import BROAD_STOCKS
-from app.quant_v3.csi300_strategies import BUILDERS as CSI300_STRATEGY_BUILDERS, TOP_K_RATIO as CSI300_TOP_K_RATIO
+from app.quant_v3.csi300_strategies import ACTIVE_CSI300_STRATEGIES, BUILDERS as CSI300_STRATEGY_BUILDERS, TOP_K_RATIO as CSI300_TOP_K_RATIO
 from app.quant_v3.csi300_strategies import build_csi300_lightgbm_strategy, csi300_history, validate_csi300_date_range
 from app.quant_v3.csi300_strategies import latest_csi300_trading_day_on_or_before
 from app.quant_v3.csi300_universe import csi300_stocks
@@ -466,6 +466,7 @@ def list_strategies(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
                        "model_buy_threshold": float(getattr(row, "model_buy_threshold", .60)),
                        "model_down_threshold": float(getattr(row, "model_down_threshold", .25)),
                        "is_default": row.is_default, "created_at": row.created_at.isoformat(),
+                       "validated": row.kind in ACTIVE_CSI300_STRATEGIES,
                        "study_period": {"start": latest.start_date.isoformat(), "end": latest.end_date.isoformat()} if latest else {"start": research_start.isoformat(), "end": research_end.isoformat()},
                        "backtest_run_id": latest.id if latest else None, "backtest_metrics": metrics})
     return result

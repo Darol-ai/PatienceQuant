@@ -36,10 +36,13 @@ const TRADE_PAGE_SIZE = 25
 export function BacktestCenter() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const { data: strategies } = useQuery({
+  const { data: allStrategies } = useQuery({
     queryKey: ['strategies'],
     queryFn: async () => (await api.get('/strategies')).data,
   })
+  // 只保留逐年回测验证过真实有效的策略——`validated`是后端按
+  // ACTIVE_CSI300_STRATEGIES算出来的，不在前端另外维护一份判断标准。
+  const strategies = allStrategies?.filter((item: any) => item.validated)
   const { data: universes } = useQuery({
     queryKey: ['universes'],
     queryFn: async () => (await api.get('/universes')).data,
@@ -90,6 +93,12 @@ export function BacktestCenter() {
             rebalance_frequency: defaultStrategy.rebalance_frequency || current.rebalance_frequency,
             holdings_count: Math.max(10, defaultStrategy.holdings_count || current.holdings_count),
             max_weight: defaultStrategy.max_weight || current.max_weight,
+            // 现在过滤后剩下的都是CSI300策略(只支持2019-2026年)，表单
+            // 初始值却是2018年——首次进页面自动选中默认策略时，如果不
+            // 在这里也同步一次日期，会一进页面就带着一个必定超范围的
+            // 默认区间，用户什么都没改就点"运行回测"也会报422。
+            start_date: defaultStrategy.research_start_date || current.start_date,
+            end_date: defaultStrategy.research_end_date || current.end_date,
           },
     )
   }, [strategies])
@@ -198,8 +207,16 @@ export function BacktestCenter() {
     onError: () => setSyncMessage('行情同步失败，回测仍可使用 Demo/fallback 数据运行'),
   })
 
+  const [backtestError, setBacktestError] = useState('')
+  const [elapsedSeconds, setElapsedSeconds] = useState(0)
   const mutation = useMutation({
-    mutationFn: async () => (await api.post('/backtests', form)).data,
+    // 沪深300策略要在300支股票上跑集成模型，比之前30支候选池慢不少；
+    // 之前这里用的是全局120秒超时，冷启动(刚重启后端、模型还没读进
+    // 内存)时经常超过这个时间，请求被axios直接掐断、按钮却悄悄跳回
+    // 可点击状态，没有任何提示——看起来像是"切了个浏览器标签页就断了"，
+    // 实际是超时。这里单独给这个请求放宽到10分钟。
+    mutationFn: async () => (await api.post('/backtests', form, { timeout: 600_000 })).data,
+    onMutate: () => setBacktestError(''),
     onSuccess: data => {
       setResult(data)
       setTradePage(1)
@@ -210,7 +227,24 @@ export function BacktestCenter() {
       )
       setSelectedSymbol(firstTraded?.symbol || data.selected_stocks?.[0]?.symbol || '')
     },
+    onError: (error: any) => {
+      setBacktestError(
+        error?.code === 'ECONNABORTED'
+          ? '回测运行超时（超过10分钟），请稍后重试；如果反复超时可能是后端刚重启、模型还在冷启动。'
+          : error?.response?.data?.detail || '回测运行失败，请检查参数后重试。',
+      )
+    },
   })
+
+  useEffect(() => {
+    if (!mutation.isPending) {
+      setElapsedSeconds(0)
+      return
+    }
+    const startedAt = Date.now()
+    const timer = window.setInterval(() => setElapsedSeconds(Math.round((Date.now() - startedAt) / 1000)), 1000)
+    return () => window.clearInterval(timer)
+  }, [mutation.isPending])
 
   const applyPaperMutation = useMutation({
     mutationFn: async () =>
@@ -289,10 +323,15 @@ export function BacktestCenter() {
         actions={
           <button className="primary-button" onClick={() => mutation.mutate()} disabled={mutation.isPending || !canRun}>
             <Play size={16} />
-            {mutation.isPending ? '正在回测…' : '运行回测'}
+            {mutation.isPending ? `正在回测…(${elapsedSeconds}s)` : '运行回测'}
           </button>
         }
       />
+      {backtestError && (
+        <div className="form-error" style={{ marginBottom: 16 }}>
+          {backtestError}
+        </div>
+      )}
 
       <div className="backtest-layout">
         <div>
@@ -324,6 +363,14 @@ export function BacktestCenter() {
                   ))}
                 </select>
               </label>
+              {selectedStrategy?.description && (
+                <div className="strategy-note full">
+                  <div>
+                    <b>策略介绍</b>
+                    <p>{selectedStrategy.description}</p>
+                  </div>
+                </div>
+              )}
               {isQuantV3Strategy && (
                 <div className="strategy-note full">
                   <div>
