@@ -252,7 +252,7 @@ export function BacktestCenter() {
         execute: true,
         reset_account: false,
         enable_automation: false,
-      })).data,
+      }, { timeout: 600_000 })).data,
     onSuccess: data => {
       const orderCount = data.rebalance?.orders?.length || 0
       setPaperMessage(`已应用到模拟盘：${data.strategy?.name || '回测策略'} · 本次生成 ${orderCount} 笔订单`)

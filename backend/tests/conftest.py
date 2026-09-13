@@ -22,6 +22,13 @@ _TEST_DB_PATH = Path(tempfile.gettempdir()) / f"patience_quant_test_{os.getpid()
 _TEST_DB_PATH.unlink(missing_ok=True)
 os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB_PATH}"
 
+# app.main的lifespan会在后台线程里预热沪深300策略的模型缓存(真实冷启动
+# 要5分多钟)，这是给手动起的开发服务器用的，不是给测试套件用的——每个
+# `with TestClient(app) as client:`都会重新进一次lifespan，测试本身该
+# 用到这些缓存的地方(CSI300相关测试)自然会通过真实调用把它们建起来，
+# 不需要额外再触发一次5分钟的后台预热跟测试的HTTP调用抢CPU。
+os.environ["PATIENCEQUANT_WARM_CSI300"] = "0"
+
 import pytest
 
 

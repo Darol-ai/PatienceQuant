@@ -18,7 +18,11 @@ export function MetricCard({ label, value, change, icon, tone = 'neutral' }: { l
   return <div className="metric-card"><div className="metric-top"><span>{label}</span><div className="metric-icon">{icon}</div></div><strong>{value}</strong>{change && <div className={`metric-change ${tone}`}>{positive ? <ArrowUpRight size={14}/> : tone === 'negative' ? <ArrowDownRight size={14}/> : null}{change}</div>}</div>
 }
 
-export function DataBadge({ mode = 'demo' }: { mode?: string }) {
+export function DataBadge({ mode = 'demo', scope = '通用目录' }: { mode?: string; scope?: string }) {
+  // 这个徽标只描述脚手架自带的通用股票目录(不是我们自己的LightGBM/
+  // XGBoost策略——那几个策略一直是真实数据，不受这个开关影响)。之前
+  // 单独一句"DEMO MODE"容易让人以为整个页面都是假数据，加上"通用目录"
+  // 这个限定词，说明白它具体指的是哪部分。
   const labels: Record<string, string> = {
     real: 'REAL DATA',
     real_or_demo_fallback: 'REAL → DEMO FALLBACK',
@@ -28,7 +32,7 @@ export function DataBadge({ mode = 'demo' }: { mode?: string }) {
     demo: 'DEMO MODE',
   }
   const real = mode === 'real'
-  return <span className={`data-badge ${real ? 'real' : mode !== 'demo' ? 'mixed' : ''}`}><DatabaseZap size={13}/>{labels[mode] || mode.toUpperCase()}</span>
+  return <span className={`data-badge ${real ? 'real' : mode !== 'demo' ? 'mixed' : ''}`}><DatabaseZap size={13}/>{scope} · {labels[mode] || mode.toUpperCase()}</span>
 }
 
 export function SignalBadge({ signal }: { signal: string }) {
