@@ -9,7 +9,8 @@ scripts/run_csi300_*_per_year_backtest.py 逐年验证后再决定是否纳入
 """
 from __future__ import annotations
 
-from functools import lru_cache
+import threading
+from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Tuple
 
@@ -74,7 +75,27 @@ def validate_csi300_date_range(start, end) -> None:
 ACTIVE_CSI300_STRATEGIES: Tuple[str, ...] = ("csi300_lightgbm", "csi300_xgboost", "csi300_ensemble")
 
 
-@lru_cache(maxsize=1)
+def _singleton(builder):
+    """lru_cache(maxsize=1)本身只保证"读缓存"线程安全,两个线程同时
+    miss缓存时会各自独立跑一遍builder(观测到过:预热线程和真实请求线程
+    撞在一起,90万行索引被重复构建,内存直接翻倍、耗时也翻倍)。这里用一把
+    锁把"构建"这一步也串行化——后来者拿锁时前者早已把结果写进lru_cache,
+    直接命中返回,不会重复计算。"""
+    lock = threading.Lock()
+    cached = lru_cache(maxsize=1)(builder)
+
+    @wraps(builder)
+    def wrapper():
+        # 每次调用都先拿锁再查缓存:一旦builder跑过一次,后续调用在锁内
+        # 也是纯缓存命中,开销可以忽略;真正要避免的是"锁外先探测缓存"这种
+        # 写法给并发miss留出重复构建的窗口。
+        with lock:
+            return cached()
+
+    return wrapper
+
+
+@_singleton
 def _history() -> pd.DataFrame:
     return pd.read_parquet(_HISTORY_FILE)
 
@@ -83,17 +104,17 @@ def csi300_history() -> pd.DataFrame:
     return _history()
 
 
-@lru_cache(maxsize=1)
+@_singleton
 def _lightgbm_signal_source() -> EnsembleRegressionWalkForwardSignalSource:
     return EnsembleRegressionWalkForwardSignalSource(_LIGHTGBM_MODEL_DIR, _HISTORY_FILE)
 
 
-@lru_cache(maxsize=1)
+@_singleton
 def _xgboost_signal_source() -> XGBoostWalkForwardSignalSource:
     return XGBoostWalkForwardSignalSource(_XGBOOST_MODEL_DIR, _HISTORY_FILE)
 
 
-@lru_cache(maxsize=1)
+@_singleton
 def _momentum_signal_source() -> MomentumSignalSource:
     return MomentumSignalSource(_history(), lookback=252, skip=21)
 
