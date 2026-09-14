@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { CalendarRange, Check, Download, ExternalLink, Play, RefreshCw, RotateCcw, Search, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { api, dataModeLabel, formatMoney, formatPercent } from '../api'
 import { BarChart, DrawdownChart, EquityChart, StockTradeChart } from '../components/Charts'
 import { Card, ErrorState, LoadingState, PageHeader, PanelHeader } from '../components/UI'
@@ -35,6 +35,7 @@ const TRADE_PAGE_SIZE = 25
 
 export function BacktestCenter() {
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const queryClient = useQueryClient()
   const { data: allStrategies } = useQuery({
     queryKey: ['strategies'],
@@ -43,6 +44,16 @@ export function BacktestCenter() {
   // 只保留逐年回测验证过真实有效的策略——`validated`是后端按
   // ACTIVE_CSI300_STRATEGIES算出来的，不在前端另外维护一份判断标准。
   const strategies = allStrategies?.filter((item: any) => item.validated)
+  // 策略中心的"用当前配置运行回测"会带上具体策略id跳转过来——哪怕这个
+  // 策略没在上面的已验证列表里(比如默认多因子策略)，既然是用户从策略
+  // 中心点过来的明确意图，也应该按这个id选中，而不是被下拉框的默认筛选
+  // 悄悄换成别的策略。
+  const linkedStrategyId = Number(searchParams.get('strategy_id')) || null
+  const linkedStrategy = linkedStrategyId ? allStrategies?.find((item: any) => item.id === linkedStrategyId) : null
+  const dropdownStrategies =
+    linkedStrategy && !strategies?.some((item: any) => item.id === linkedStrategy.id)
+      ? [...(strategies || []), linkedStrategy]
+      : strategies
   const { data: universes } = useQuery({
     queryKey: ['universes'],
     queryFn: async () => (await api.get('/universes')).data,
@@ -81,7 +92,7 @@ export function BacktestCenter() {
   }, [stockSearch])
 
   useEffect(() => {
-    const defaultStrategy = strategies?.find((item: any) => item.is_default) || strategies?.[0]
+    const defaultStrategy = linkedStrategy || strategies?.find((item: any) => item.is_default) || strategies?.[0]
     if (!defaultStrategy) return
     setForm(current =>
       current.strategy_id === defaultStrategy.id
@@ -101,9 +112,9 @@ export function BacktestCenter() {
             end_date: defaultStrategy.research_end_date || current.end_date,
           },
     )
-  }, [strategies])
+  }, [strategies, linkedStrategy])
 
-  const selectedStrategy = strategies?.find((item: any) => item.id === form.strategy_id)
+  const selectedStrategy = allStrategies?.find((item: any) => item.id === form.strategy_id)
   const isQuantV3Strategy = selectedStrategy?.kind === 'quant_v3_regression' || Boolean(selectedStrategy?.kind?.startsWith('csi300_'))
   const selectedSymbols = form.custom_symbols
   const manualUniverse = !isQuantV3Strategy && form.universe === 'custom'
@@ -344,7 +355,7 @@ export function BacktestCenter() {
                   value={form.strategy_id}
                   onChange={event => {
                     const nextId = Number(event.target.value)
-                    const next = strategies?.find((item: any) => item.id === nextId)
+                    const next = allStrategies?.find((item: any) => item.id === nextId)
                     setForm(current => ({
                       ...current,
                       strategy_id: nextId,
@@ -356,9 +367,10 @@ export function BacktestCenter() {
                     }))
                   }}
                 >
-                  {strategies?.map((strategy: any) => (
+                  {dropdownStrategies?.map((strategy: any) => (
                     <option key={strategy.id} value={strategy.id}>
                       {strategy.name} · V{strategy.version}
+                      {!strategy.validated ? '（未验证）' : ''}
                     </option>
                   ))}
                 </select>
