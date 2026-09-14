@@ -20,6 +20,29 @@ def test_explain_trade_persists_and_returns_an_audit_id():
         assert any(row["id"] == body["audit_id"] for row in audit)
 
 
+def test_ai_settings_can_be_configured_from_the_api_without_leaking_the_key():
+    """OpenAI key要能通过API配置(不只靠.env+重启)，但读取时不能把已保存的
+    key明文吐回来——GET只暴露has_api_key这个布尔值。"""
+    with TestClient(app) as client:
+        before = client.get("/api/settings/ai").json()
+        assert before["source"] == "env"  # .env里配了真实key，这里应为env来源
+
+        updated = client.post("/api/settings/ai", json={"api_key": "sk-test-12345", "model": "gpt-test"}).json()
+        assert updated["has_api_key"] is True
+        assert updated["model"] == "gpt-test"
+        assert updated["source"] == "database"
+        assert "api_key" not in updated
+        assert "sk-test-12345" not in str(updated)
+
+        # 只传model，api_key不应被清空。
+        partial = client.post("/api/settings/ai", json={"model": "gpt-test-2"}).json()
+        assert partial["has_api_key"] is True
+        assert partial["model"] == "gpt-test-2"
+
+        reset = client.delete("/api/settings/ai").json()
+        assert reset["source"] == "env"
+
+
 def test_ai_decision_records_adoption_and_rollback():
     with TestClient(app) as client:
         created = client.post(
@@ -50,17 +73,16 @@ def test_ai_decision_on_missing_audit_id_is_404():
 
 
 def test_strategy_assistant_falls_back_to_rules_without_an_api_key(monkeypatch):
-    """pydantic-settings 从 .env 文件读密钥，光 delenv 进程变量盖不掉它——
-    直接把 strategy_assistant 模块看到的 get_settings 换成一个没有 key 的假
-    settings，这样测试才是真的在测"没有 key 时的回退行为"。"""
+    """.env 文件里配了真实key，光 delenv 进程变量盖不掉它——直接把
+    strategy_assistant 模块看到的 get_ai_credentials 换成返回空key的假
+    实现，这样测试才是真的在测"没有 key 时的回退行为"。"""
     import app.ai.strategy_assistant as module
+    from app.ai.credentials import AICredentials
 
-    class _NoKeySettings:
-        openai_api_key = None
-        openai_base_url = None
-        openai_model = "unused"
-
-    monkeypatch.setattr(module, "get_settings", lambda: _NoKeySettings())
+    monkeypatch.setattr(
+        module, "get_ai_credentials",
+        lambda db: AICredentials(api_key=None, base_url=None, model="unused", source="env"),
+    )
     with TestClient(app) as client:
         response = client.post("/api/ai/strategy-assistant", json={"description": "低波动、大盘股为主的月度调仓策略"})
         assert response.status_code == 200

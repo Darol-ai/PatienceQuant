@@ -12,14 +12,16 @@ from app.strategies.multifactor import MultiFactorStrategy
 
 
 def test_demo_catalog_has_five_groups_and_broad_coverage():
+    """Demo目录只保留手工维护的真实公司(不再用前缀+序号规则生成900多支
+    虚构代码凑数)——这里断言的是这份小而真实的列表本身，不是"越大越好"。
+    """
     provider = DemoDataProvider(seed=42, as_of=date(2026, 1, 2))
     catalog = provider.stock_catalog()
-    assert len(catalog) >= 1000
+    assert len(catalog) == len(STOCK_SPECS) == 50
     counts = catalog.groupby("group").size().to_dict()
     assert set(counts) == {"消费", "科技", "新能源", "金融", "红利/央国企"}
     assert min(counts.values()) >= 10
-    assert len(STOCK_SPECS) >= 1000
-    assert len(catalog.industry.unique()) >= 100
+    assert len(catalog.industry.unique()) >= 15
 
 
 def test_demo_generation_is_reproducible():

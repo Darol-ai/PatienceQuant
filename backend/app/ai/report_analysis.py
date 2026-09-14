@@ -6,7 +6,9 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
-from app.config import get_settings
+from sqlalchemy.orm import Session
+
+from app.ai.credentials import get_ai_credentials
 
 
 class ReportAnalysisService:
@@ -21,16 +23,16 @@ class ReportAnalysisService:
             "confidence": None,
         }
 
-    def analyze(self, report_text: str) -> Dict[str, Any]:
-        settings = get_settings()
-        if not settings.openai_api_key:
+    def analyze(self, report_text: str, db: Session) -> Dict[str, Any]:
+        credentials = get_ai_credentials(db)
+        if not credentials.api_key:
             return self._rule_fallback(report_text)
         try:
             from openai import OpenAI
 
-            client = OpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url)
+            client = OpenAI(api_key=credentials.api_key, base_url=credentials.base_url)
             response = client.chat.completions.create(
-                model=settings.openai_model,
+                model=credentials.model,
                 temperature=0.2,
                 messages=[
                     {
@@ -54,7 +56,7 @@ class ReportAnalysisService:
                 "key_points": parsed.get("key_points", []) if isinstance(parsed.get("key_points"), list) else [],
                 "strategy_reference": parsed.get("strategy_reference", ""),
                 "provider": "openai-compatible",
-                "model_version": settings.openai_model,
+                "model_version": credentials.model,
                 "confidence": None,
             }
         except Exception:

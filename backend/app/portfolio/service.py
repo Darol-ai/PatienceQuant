@@ -144,7 +144,7 @@ class PaperTradingService:
         catalog = data.stocks().set_index("symbol")
         symbols = [position.symbol for position in positions]
         # Paper positions are an explicit user-visible market-data request,
-        # so selected AKShare symbols may refresh their current price. The
+        # so selected baostock symbols may refresh their current price. The
         # service still falls back to deterministic Demo prices on failure.
         price_df = data.prices(symbols, date(2018, 1, 1), as_of, allow_network=True) if symbols else pd.DataFrame()
         latest = price_df.sort_values("trade_date").groupby("symbol").tail(1).set_index("symbol") if not price_df.empty else pd.DataFrame()
@@ -240,9 +240,9 @@ class PaperTradingService:
             portfolio.execution_universe = "custom"
         else:
             as_of = as_of or self.data.demo.as_of
-            # Follow the saved strategy universe so a Pink Sheets strategy is
-            # executed against the same market it was researched on.  The default
-            # strategy remains the liquid large-cap A-share basket.
+            # Follow the saved strategy universe so execution matches the
+            # market it was researched on.  The default strategy remains the
+            # liquid large-cap A-share basket.
             previous_strategy_id = portfolio.strategy_id
             requested_symbols = list(dict.fromkeys(str(symbol).strip() for symbol in (symbols or []) if str(symbol).strip()))
             saved_symbols = getattr(portfolio, "execution_symbols", None) or []

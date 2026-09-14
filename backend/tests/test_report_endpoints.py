@@ -38,13 +38,12 @@ def test_generate_factor_without_llm_reports_no_reference_value(monkeypatch):
     """没有配置语言模型时，功能②要诚实回退——不能假装研报有参考价值、
     也不能在没有真实因子的情况下还去跑回测。"""
     import app.ai.report_factor as module
+    from app.ai.credentials import AICredentials
 
-    class _NoKeySettings:
-        openai_api_key = None
-        openai_base_url = None
-        openai_model = "unused"
-
-    monkeypatch.setattr(module, "get_settings", lambda: _NoKeySettings())
+    monkeypatch.setattr(
+        module, "get_ai_credentials",
+        lambda db: AICredentials(api_key=None, base_url=None, model="unused", source="env"),
+    )
     with TestClient(app) as client:
         response = client.post(
             "/api/ai/report/generate-factor",
@@ -67,7 +66,7 @@ def test_generate_factor_runs_a_real_backtest_when_weights_are_produced(monkeypa
 
     monkeypatch.setattr(
         module.ReportFactorService, "generate",
-        lambda self, report_text: {
+        lambda self, report_text, db: {
             "has_reference_value": True,
             "rationale": "测试用固定因子，不依赖真实模型调用。",
             "factor_weights": {"return_20d": 0.5, "volatility_60d": -0.3},

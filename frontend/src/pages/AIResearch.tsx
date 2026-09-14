@@ -1,8 +1,101 @@
-import { useMutation } from '@tanstack/react-query'
-import { BrainCircuit, FileText, Sparkles, UploadCloud } from 'lucide-react'
-import { useRef, useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { BrainCircuit, FileText, Settings, Sparkles, UploadCloud, X } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
 import { api, formatPercent } from '../api'
 import { Card, PageHeader, PanelHeader, Toast } from '../components/UI'
+
+type AISettings = {
+  has_api_key: boolean
+  base_url: string | null
+  model: string
+  source: 'database' | 'env'
+}
+
+function AISettingsModal({ onClose }: { onClose: () => void }) {
+  const queryClient = useQueryClient()
+  const { data: settings } = useQuery<AISettings>({ queryKey: ['ai-settings'], queryFn: async () => (await api.get('/settings/ai')).data })
+  const [apiKey, setApiKey] = useState('')
+  const [baseUrl, setBaseUrl] = useState('')
+  const [model, setModel] = useState('')
+  const [message, setMessage] = useState('')
+
+  useEffect(() => {
+    if (settings) {
+      setBaseUrl(settings.base_url || '')
+      setModel(settings.model || '')
+    }
+  }, [settings])
+
+  const saveMutation = useMutation({
+    mutationFn: async () =>
+      (await api.post('/settings/ai', {
+        api_key: apiKey.trim() || undefined,
+        base_url: baseUrl.trim() || undefined,
+        model: model.trim() || undefined,
+      })).data,
+    onSuccess: (data: AISettings) => {
+      queryClient.setQueryData(['ai-settings'], data)
+      setApiKey('')
+      setMessage('已保存，立即生效（无需重启服务）')
+    },
+  })
+
+  const resetMutation = useMutation({
+    mutationFn: async () => (await api.delete('/settings/ai')).data,
+    onSuccess: (data: AISettings) => {
+      queryClient.setQueryData(['ai-settings'], data)
+      setApiKey('')
+      setMessage('已恢复为部署环境（.env）里的默认配置')
+    },
+  })
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-card" onClick={event => event.stopPropagation()}>
+        <div className="modal-title">
+          <div><span className="eyebrow">SETTINGS</span><h2>OpenAI API 配置</h2></div>
+          <button className="icon-button" onClick={onClose}><X size={16}/></button>
+        </div>
+        <p className="factor-copy" style={{ margin: '0 0 14px' }}>
+          在这里保存的配置存在数据库里，优先于部署环境的 .env；改完立即对下一次 AI 调用生效，不需要重启服务。
+          当前来源：<b>{settings?.source === 'database' ? '数据库（前端已配置）' : '.env（部署默认值）'}</b>
+          {' · '}已配置 Key：<b>{settings?.has_api_key ? '是' : '否'}</b>
+        </p>
+        <label className="stack-label">
+          API Key
+          <input
+            type="password"
+            value={apiKey}
+            onChange={e => setApiKey(e.target.value)}
+            placeholder={settings?.has_api_key ? '已配置，留空则不修改' : '未配置（sk-...）'}
+          />
+        </label>
+        <label className="stack-label">
+          Base URL（可选，OpenAI 兼容网关）
+          <input value={baseUrl} onChange={e => setBaseUrl(e.target.value)} placeholder="https://api.openai.com/v1" />
+        </label>
+        <label className="stack-label">
+          模型名称
+          <input value={model} onChange={e => setModel(e.target.value)} placeholder="gpt-4.1-mini" />
+        </label>
+        <div className="modal-actions">
+          <button
+            className="secondary-button"
+            onClick={() => resetMutation.mutate()}
+            disabled={resetMutation.isPending || settings?.source !== 'database'}
+          >
+            恢复默认（.env）
+          </button>
+          <button className="primary-button" onClick={() => saveMutation.mutate()} disabled={saveMutation.isPending}>
+            {saveMutation.isPending ? '保存中…' : '保存'}
+          </button>
+        </div>
+        {saveMutation.isError && <div className="form-error">保存失败，请检查输入后重试。</div>}
+        {message && <div className="factor-copy" style={{ marginTop: 10 }}>{message}</div>}
+      </div>
+    </div>
+  )
+}
 
 type ExplainResult = {
   headline: string
@@ -90,6 +183,7 @@ function ReportFilePicker({ file, onChange }: { file: File | null; onChange: (fi
 }
 
 export function AIResearch() {
+  const [showSettings, setShowSettings] = useState(false)
   const [form, setForm] = useState({ symbol: '600036', action: 'BUY', score: 82, rank: 3, industry: '银行', volatility: .23, max_drawdown: .18, target_weight: .15, use_llm: true })
   const [result, setResult] = useState<ExplainResult | null>(null)
   const mutation = useMutation({ mutationFn: async () => (await api.post('/ai/explain/trade', form)).data, onSuccess: setResult })
@@ -128,8 +222,12 @@ export function AIResearch() {
       eyebrow="INTELLIGENCE / 07"
       title="AI 投研助手"
       description="解释量化引擎为什么产生信号、把自然语言和研报翻译成策略参数与因子建议，但不替代 Quant Engine 做交易决定。"
-      actions={<span className="ai-mode"><Sparkles size={15}/>{form.use_llm ? 'LLM 研究摘要（OpenAI 兼容）' : '规则解释器 · 无需 API Key'}</span>}
+      actions={<>
+        <span className="ai-mode"><Sparkles size={15}/>{form.use_llm ? 'LLM 研究摘要（OpenAI 兼容）' : '规则解释器 · 无需 API Key'}</span>
+        <button className="secondary-button" onClick={() => setShowSettings(true)}><Settings size={15}/>API 设置</button>
+      </>}
     />
+    {showSettings && <AISettingsModal onClose={() => setShowSettings(false)} />}
     <div className="ai-layout">
       <Card>
         <PanelHeader title="交易上下文" subtitle="输入一笔信号，生成可追溯解释"/>

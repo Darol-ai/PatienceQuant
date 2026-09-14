@@ -16,10 +16,6 @@ class Settings(BaseSettings):
     data_mode: str = "demo"
     demo_seed: int = 20260909
     demo_as_of: date = Field(default_factory=date.today)
-    # The offline universe is intentionally large enough to exercise realistic
-    # cross-sectional ranking without requiring a network connection.  It can
-    # be lowered for constrained CI machines via DEMO_UNIVERSE_SIZE.
-    demo_universe_size: int = Field(default=1000, ge=50, le=2000)
     auto_rebalance_poll_seconds: int = Field(default=60, ge=10, le=3600)
     cors_origins: str = "http://localhost:5173,http://localhost:8080"
     openai_api_key: Optional[str] = None

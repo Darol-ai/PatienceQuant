@@ -23,21 +23,22 @@ docker compose up --build
 # 浏览器打开 http://localhost:8080
 ```
 
-默认使用确定性离线 Demo 数据，页面会明确标记"通用目录 · DEMO MODE"——这个标记只描述脚手架自带的通用股票目录（自定义股票池等次要功能用到），下文"沪深300策略集"里的 3 个已验证策略、以及 30 支候选池策略，走独立的真实数据管道，不受这个开关影响，也不会被这个标记覆盖。如果需要让通用目录也尝试 AKShare：
+**这一步不需要任何前置准备就能起来**：沪深300策略集、30支候选池策略依赖的真实历史数据和训练好的模型文件不在 git 里（体积太大，且本来就是"能重新生成的派生数据"，不适合塞进仓库），文件缺失时这几个策略会被自动跳过注册，服务照常启动，通用股票目录（实时连 baostock）、AI 投研、Dashboard 等其它功能都正常可用。
+
+**想要这几个真实策略可用，跑一条命令**（详细说明见 [`docs/部署-真实数据准备.md`](docs/部署-真实数据准备.md)）：
 
 ```bash
-uv pip install --python .venv/bin/python -e './backend[real-data]'
-DATA_MODE=real make backend
+cd backend
+pip install -e '.[real-data]'          # 装baostock，如果make setup没装过
+bash scripts/prepare_real_data.sh      # 抓真实行情 + 训练模型，几十分钟到数小时不等
 ```
 
-AKShare 访问失败会自动回退 Demo Provider，因此不影响离线演示。
+跑完之后正常重启服务（或者 `docker compose up`——数据目录绑定的是宿主机 `backend/data/`，不需要 `docker cp`）即可让这几个策略生效；生成一次之后长期有效，不用每次部署都重跑。
 
-“回测中心 → 手动选择股票”这套搜索/勾选 AKShare 目录的交互仍在代码里（`frontend/src/pages/BacktestCenter.tsx` 的 `manualUniverse` 分支），可以切换 `AKShare` 目录、用中文名称或股票代码搜索、点击“刷新 AKShare 目录”缓存到 SQLite、点击“同步所选行情”下载前复权日线。**但目前回测中心的策略下拉框只展示已验证的沪深300策略（见下文），这些策略都使用固定的沪深300全市场 universe，不会触发手动选股分支**——这套交互暂时没有可从下拉框直接进入的入口。若网络、限流或字段变化导致 AKShare 不可用，通用目录会回退到本地目录和确定性 Demo fallback，并明确保留数据源状态。
-
-如果希望 Docker 默认优先使用 AKShare：
+默认 `DATA_MODE=real`：通用股票目录运行时直接连 [baostock](http://baostock.com/) 查询全市场真实代码/名称/行业（`backend/app/data/baostock_provider.py`），不需要预生成任何文件；baostock 连不上时自动回退到本地 50 支真实公司的离线数据（Demo Provider），页面会标记"通用目录 · DEMO MODE"，这个标记只描述这个兜底状态，不影响沪深300策略集和30支候选池策略——它们走独立的真实数据管道，不受这个开关影响。如果想强制离线：
 
 ```bash
-DATA_MODE=real docker compose up --build
+DATA_MODE=demo make backend
 ```
 
 ## 模块边界
@@ -47,7 +48,7 @@ DATA_MODE=real docker compose up --build
 - `backend/app/strategies`：策略配置、选股和目标权重
 - `backend/app/backtest`：无未来数据泄漏的月度/周度/季度回测
 - `backend/app/portfolio`：Paper Trading 账户、订单和成交账本
-- `backend/app/ai`：规则解释器和可选 OpenAI-compatible 适配器
+- `backend/app/ai`：规则解释器和可选 OpenAI-compatible 适配器；API Key/Base URL/模型名可以直接在前端"AI 投研"页面配置并立即生效，不用改 `.env`、不用重启服务（数据库配置优先，没配置过时回退读 `.env`）
 - `backend/app/quant_v3`：本组独立开发的真实数据策略——30支候选池的 LightGBM 动量增强策略，以及沪深300全市场（300支真实成分股）的 LightGBM/XGBoost/集成三个已验证策略；走独立 parquet 数据管道，不经过 SQLite 通用目录，不受 `DATA_MODE` 影响
 - `frontend/src`：企业级暗色量化 Dashboard
 

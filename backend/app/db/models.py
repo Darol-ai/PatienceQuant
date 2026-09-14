@@ -268,6 +268,20 @@ class Signal(Base):
     reason: Mapped[str] = mapped_column(Text)
 
 
+class AppSetting(Base):
+    """运行时可改的配置覆盖——目前只用来存OpenAI key/base_url/model。
+
+    这些原本只能通过.env在部署时写死、改完要重启进程才生效；有了这张表，
+    前端可以直接调POST /api/settings/ai写入，立即对后续AI调用生效，不用
+    重启Docker容器。key按`key`列取值，value统一存成字符串(即使本质是
+    简单标量)，避免为每种设置类型单独建列。
+    """
+    __tablename__ = "app_settings"
+    key: Mapped[str] = mapped_column(String(60), primary_key=True)
+    value: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class AIExplanation(Base):
     """AI 助手的审计留痕：每次调用记模型版本、输入、输出、时间、置信度、
     是否被人工采纳、是否被回滚（PRD §19.1 第 5 条）。confidence 允许为空——

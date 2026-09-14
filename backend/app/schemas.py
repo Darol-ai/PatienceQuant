@@ -56,8 +56,8 @@ class StrategyPayload(BaseModel):
     @field_validator("universe")
     @classmethod
     def valid_strategy_universe(cls, value: str) -> str:
-        if value not in {"a_share", "large_cap", "pink_sheets", "all_assets"} and not value.startswith("custom:"):
-            raise ValueError("策略股票池仅支持大盘股、A股、Pink Sheets 或自定义股票池")
+        if value not in {"a_share", "large_cap", "all_assets"} and not value.startswith("custom:"):
+            raise ValueError("策略股票池仅支持大盘股、A股或自定义股票池")
         return value
 
     @model_validator(mode="after")
@@ -92,8 +92,8 @@ class BacktestRequest(BaseModel):
     @field_validator("universe")
     @classmethod
     def valid_universe(cls, value: str) -> str:
-        if value not in {"a_share", "large_cap", "hs300", "csi_a500", "pink_sheets", "all_assets", "custom"} and not value.startswith("custom:"):
-            raise ValueError("股票池仅支持 a_share/large_cap/hs300/csi_a500/pink_sheets/all_assets/custom")
+        if value not in {"a_share", "large_cap", "hs300", "csi_a500", "all_assets", "custom"} and not value.startswith("custom:"):
+            raise ValueError("股票池仅支持 a_share/large_cap/hs300/csi_a500/all_assets/custom")
         return value
 
 
@@ -155,3 +155,10 @@ class SyncRequest(BaseModel):
     symbols: List[str] = Field(default_factory=list)
     start_date: date = date(2025, 1, 1)
     end_date: date = Field(default_factory=date.today)
+
+
+class AISettingsRequest(BaseModel):
+    """留空(None)的字段不修改，只更新显式传入的字段。"""
+    api_key: Optional[str] = Field(None, min_length=1, max_length=300)
+    base_url: Optional[str] = Field(None, min_length=1, max_length=300)
+    model: Optional[str] = Field(None, min_length=1, max_length=100)

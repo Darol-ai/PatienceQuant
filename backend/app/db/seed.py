@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.backtest.engine import BacktestConfig, BacktestEngine
+from app.config import get_settings
 from app.data.service import MarketDataService
 from app.quant_v3.broad_universe import BROAD_STOCKS
 from app.quant_v3.csi300_strategies import ACTIVE_CSI300_STRATEGIES
@@ -75,13 +76,20 @@ def seed_database(db: Session) -> None:
     if not db.scalar(select(Watchlist).where(Watchlist.name == "我的低频研究清单")):
         db.add(Watchlist(name="我的低频研究清单", symbols=[
             "600519", "000333", "600036", "300750", "002594", "601318",
-            "688981", "601088", "600900", "601006", "PINK003", "PINK005",
-            "PINK009", "PINK014",
+            "688981", "601088", "600900", "601006",
         ]))
     from app.api.routes import RESEARCH_ANNOTATIONS
     for symbol, annotation in RESEARCH_ANNOTATIONS.items():
         if not db.scalar(select(ResearchAnnotation).where(ResearchAnnotation.symbol == symbol)):
             db.add(ResearchAnnotation(symbol=symbol, **annotation))
+    # SessionLocal是autoflush=False(app/db/session.py)，上面这些db.add()在
+    # commit前不会自动对后续select()可见。_ensure_group_research_annotations
+    # 内部会重新select一遍"已存在的symbol"来去重——如果不在这里flush一下，
+    # 它会看不到刚add的这些行，把同一个symbol(比如RESEARCH_ANNOTATIONS和
+    # 通用目录里都有的000333)当成"不存在"再插一遍，commit时两条pending
+    # insert撞唯一约束报错。缩小Demo目录到50支真实公司后这种重叠概率
+    # 大幅上升，之前1000+虚构股票的目录几乎不会撞上，掩盖了这个问题。
+    db.flush()
     _ensure_group_research_annotations(db)
     db.commit()
     # Upgrade the original MVP default in place so existing test/demo
@@ -118,6 +126,17 @@ def seed_database(db: Session) -> None:
         db.commit()
     _ensure_quant_v3_strategy(db)
     _ensure_csi300_strategies(db)
+    # _ensure_demo_backtest对默认多因子策略的universe(large_cap)逐支调用
+    # market_data.prices()——real模式下这会变成真的顺序调用baostock查
+    # 2018-2025年8年日线，几十支股票可能要几分钟，还会占着baostock的
+    # 进程级锁跟真实用户请求抢(见baostock_provider.py)。这个默认多因子
+    # 策略在回测中心/自动交易的下拉框里已经不可选了(只展示已验证的
+    # ACTIVE_CSI300_STRATEGIES)，不值得为它付这个代价——real模式下直接
+    # 跳过这份种子回测，Dashboard对应位置会显示"运行一次回测后，净值
+    # 曲线会显示在这里"，不影响页面可用性。demo模式下这条路径一直很快
+    # (纯本地模拟价格)，行为不变。
+    if get_settings().data_mode.lower() == "real":
+        return
     _ensure_demo_backtest(db, strategy)
 
 
@@ -184,8 +203,18 @@ def _ensure_csi300_strategies(db: Session) -> None:
     过真实有效的策略（docs/adr待补），走独立的parquet数据管道
     （app/quant_v3/csi300_strategies.py），不经过SQLite/MarketDataService
     通用股票目录。同样不叠加引擎级风控叠加层（ADR-0037的结论延用）。
+
+    `csi300_stocks()`要读`data/csi300_constituents.parquet`——这份文件
+    连同同一条数据管道用到的其它parquet/模型目录都不在git里，需要按
+    docs/部署-真实数据准备.md先在宿主机生成好。首次部署如果还没来得及
+    生成这些文件，不能让整个服务连启动都启动不起来——这里捕获缺文件
+    的情况，跳过这3个策略的注册(通用目录/AI投研等其它功能不受影响)，
+    等文件准备好后重启服务即可正常注册。
     """
-    holdings_count = max(1, round(len(csi300_stocks()) * 0.1))
+    try:
+        holdings_count = max(1, round(len(csi300_stocks()) * 0.1))
+    except FileNotFoundError:
+        return
     for kind in ACTIVE_CSI300_STRATEGIES:
         if db.scalar(select(Strategy).where(Strategy.kind == kind).limit(1)):
             continue
@@ -236,14 +265,13 @@ def _ensure_group_research_annotations(db: Session) -> None:
         for row in candidates.itertuples(index=False):
             if row.symbol in existing:
                 continue
-            bucket = "Pink Sheets" if row.exchange == "OTC/Pink Sheets" else "大盘核心"
             annotation = ResearchAnnotation(
                 symbol=row.symbol,
-                bucket=bucket,
+                bucket="大盘核心",
                 thesis="%s研究组 · %s / %s，作为长期低频观察样本，重点跟踪基本面、估值与动量变化"
                 % (group, row.sector, row.industry),
-                risk="关注%s行业景气、估值回撤和流动性；当前为%s数据"
-                % (row.industry, "Demo" if bucket == "Pink Sheets" else "离线 Demo"),
+                risk="关注%s行业景气、估值回撤和流动性；当前为离线 Demo 数据"
+                % row.industry,
             )
             db.add(annotation)
             existing[row.symbol] = annotation

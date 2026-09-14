@@ -82,7 +82,7 @@ export function BacktestCenter() {
   const [syncMessage, setSyncMessage] = useState('')
   const [showAllCharts, setShowAllCharts] = useState(false)
   const [selectedStocks, setSelectedStocks] = useState<Record<string, StockOption>>({})
-  const [directoryMode, setDirectoryMode] = useState<'auto' | 'local' | 'akshare'>('auto')
+  const [directoryMode, setDirectoryMode] = useState<'auto' | 'local' | 'baostock'>('auto')
   const [debouncedStockSearch, setDebouncedStockSearch] = useState('')
   const [paperMessage, setPaperMessage] = useState('')
 
@@ -137,11 +137,11 @@ export function BacktestCenter() {
   const stocks: StockOption[] = stockSearchData?.items || []
   const filteredStocks = stocks
   const directorySource =
-    stockSearchData?.source === 'akshare'
-      ? 'AKShare 股票目录（可缓存到本地）'
+    stockSearchData?.source === 'baostock'
+      ? '真实股票目录（baostock，可缓存到本地）'
       : stockSearchData?.source === 'local_cache'
         ? '本地缓存目录'
-        : '本地 Demo 目录；搜不到时自动回退 AKShare'
+        : '本地 Demo 目录；搜不到时自动回退真实目录'
   const canRun = Boolean(form.strategy_id) && (isQuantV3Strategy || !manualUniverse || selectedSymbols.length >= 10)
 
   const toggleSymbol = (stock: StockOption) => {
@@ -195,9 +195,9 @@ export function BacktestCenter() {
     mutationFn: async () => (await api.post('/data/catalog/sync')).data,
     onSuccess: data =>
       setSyncMessage(
-        `${data.message || 'AKShare 股票目录已刷新'} · 当前目录 ${data.after_count || 0} 只，新增 ${data.added_count || 0} 只`,
+        `${data.message || '真实股票目录已刷新'} · 当前目录 ${data.after_count || 0} 只，新增 ${data.added_count || 0} 只`,
       ),
-    onError: () => setSyncMessage('AKShare 目录刷新失败，仍可使用本地 Demo 目录'),
+    onError: () => setSyncMessage('真实目录刷新失败，仍可使用本地 Demo 目录'),
   })
 
   const pricesSyncMutation = useMutation({
@@ -212,8 +212,8 @@ export function BacktestCenter() {
     onSuccess: data =>
       setSyncMessage(
         data.data_mode === 'real'
-          ? `已从 AKShare 同步 ${data.real_rows || 0} 条行情记录`
-          : 'AKShare 行情暂不可用，系统将继续使用 Demo/缓存数据运行',
+          ? `已同步 ${data.real_rows || 0} 条真实行情记录`
+          : '真实行情暂不可用，系统将继续使用 Demo/缓存数据运行',
       ),
     onError: () => setSyncMessage('行情同步失败，回测仍可使用 Demo/fallback 数据运行'),
   })
@@ -536,7 +536,7 @@ export function BacktestCenter() {
                       disabled={catalogSyncMutation.isPending}
                     >
                       <RefreshCw size={13} className={catalogSyncMutation.isPending ? 'spin' : ''} />
-                      {catalogSyncMutation.isPending ? '刷新中…' : '刷新 AKShare 目录'}
+                      {catalogSyncMutation.isPending ? '刷新中…' : '刷新真实目录'}
                     </button>
                     <button
                       className="secondary-button"
@@ -571,10 +571,10 @@ export function BacktestCenter() {
                     本地 Demo
                   </button>
                   <button
-                    className={directoryMode === 'akshare' ? 'active' : ''}
-                    onClick={() => setDirectoryMode('akshare')}
+                    className={directoryMode === 'baostock' ? 'active' : ''}
+                    onClick={() => setDirectoryMode('baostock')}
                   >
-                    AKShare
+                    真实目录
                   </button>
                 </div>
                 <div className="search-box">
@@ -654,7 +654,7 @@ export function BacktestCenter() {
                         <span className="stock-picker-tags">
                           <small>{stock.group}</small>
                           <small>{stock.industry}</small>
-                          {stock.source && <small>{stock.source === 'akshare' ? 'AKShare' : 'Demo'}</small>}
+                          {stock.source && <small>{stock.source === 'baostock' ? '真实' : 'Demo'}</small>}
                         </span>
                       </button>
                     )
@@ -675,7 +675,7 @@ export function BacktestCenter() {
               <span>
                 {manualUniverse
                   ? `本次已选择 ${selectedSymbols.length} 只股票`
-                  : '大盘股、A股、Pink Sheets 或已保存自定义池'}
+                  : '大盘股、A股或已保存自定义池'}
               </span>
             </div>
             <div>

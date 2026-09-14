@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.ai.credentials import clear_ai_credentials, get_ai_credentials, set_ai_credentials
 from app.ai.report_analysis import ReportAnalysisService
 from app.ai.report_extraction import extract_text
 from app.ai.report_factor import ReportFactorService
@@ -34,7 +35,7 @@ from app.db.models import AIExplanation, BacktestEquity, BacktestMetric, Backtes
 from app.db.session import get_db
 from app.factors.engine import FactorEngine
 from app.portfolio.service import PaperTradingService
-from app.schemas import AIDecisionRequest, ApplyBacktestPaperRequest, BacktestRequest, ExplainRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyAssistRequest, StrategyPayload, SyncRequest
+from app.schemas import AIDecisionRequest, AISettingsRequest, ApplyBacktestPaperRequest, BacktestRequest, ExplainRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyAssistRequest, StrategyPayload, SyncRequest
 from app.strategies.base import StrategyConfig
 from app.strategies.multifactor import MultiFactorStrategy
 
@@ -53,10 +54,6 @@ RESEARCH_ANNOTATIONS: Dict[str, Dict[str, str]] = {
     "601088": {"bucket": "大盘核心", "thesis": "高股息、低估值与一体化能源现金流", "risk": "煤价下行和周期波动"},
     "600900": {"bucket": "大盘核心", "thesis": "水电现金流稳定，适合作为低频防守底仓", "risk": "来水和利率变化"},
     "601006": {"bucket": "大盘核心", "thesis": "铁路资产、稳定分红与低波动特征", "risk": "运量和运价变化"},
-    "PINK003": {"bucket": "Pink Sheets", "thesis": "软件服务 Demo 样本，用于验证 OTC 低频筛选", "risk": "流动性和信息披露风险"},
-    "PINK005": {"bucket": "Pink Sheets", "thesis": "清洁能源 Demo 样本，观察高成长与高波动平衡", "risk": "高波动和融资风险"},
-    "PINK009": {"bucket": "Pink Sheets", "thesis": "金融 Demo 样本，侧重低估值和资本质量", "risk": "信用和流动性风险"},
-    "PINK014": {"bucket": "Pink Sheets", "thesis": "公用事业 Demo 样本，侧重现金流与防守性", "risk": "成交深度和监管风险"},
 }
 
 
@@ -146,8 +143,6 @@ def _universe_symbols(data: MarketDataService, universe: str, custom_symbols: Op
         return symbols[: min(300, len(symbols))]
     if universe == "large_cap":
         return data.universe_symbols("large_cap")
-    if universe == "pink_sheets":
-        return data.universe_symbols("pink_sheets")
     if universe == "all_assets":
         return data.universe_symbols("all_assets")
     if universe == "csi_a500":
@@ -176,7 +171,7 @@ def _universe_symbols(data: MarketDataService, universe: str, custom_symbols: Op
 @router.get("/health")
 def health() -> Dict[str, Any]:
     settings = get_settings()
-    return {"status": "ok", "app": settings.app_name, "data_mode": settings.data_mode, "as_of": settings.demo_as_of.isoformat(), "demo_universe_size": settings.demo_universe_size, "python": ">=3.9"}
+    return {"status": "ok", "app": settings.app_name, "data_mode": settings.data_mode, "as_of": settings.demo_as_of.isoformat(), "python": ">=3.9"}
 
 
 @router.get("/research-groups")
@@ -194,15 +189,13 @@ def universes(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
     data = MarketDataService(db)
     catalog = data.stocks()
     a_share = data.universe_symbols("a_share")
-    pink = data.universe_symbols("pink_sheets")
     watchlists = db.scalars(select(Watchlist).order_by(Watchlist.id)).all()
     return [
-        {"id": "a_share", "name": "A股全市场", "count": len(a_share), "description": "Demo Provider 千级跨行业股票池"},
+        {"id": "a_share", "name": "A股全市场", "count": len(a_share), "description": "真实A股目录（Data Adapter 提供，非Demo生成）"},
         {"id": "large_cap", "name": "大盘股核心池", "count": min(300, len(a_share)), "description": "低频策略优先研究的核心大盘股票"},
-        {"id": "hs300", "name": "沪深300（Demo代理）", "count": min(300, len(a_share)), "description": "演示环境使用前 300 只核心权重代理"},
-        {"id": "csi_a500", "name": "中证A500（Demo代理）", "count": min(500, len(a_share)), "description": "演示环境使用 500 只跨行业核心股票池"},
-        {"id": "pink_sheets", "name": "OTC / Pink Sheets（Demo）", "count": len(pink), "description": "离线示例扩展市场；不代表实时 OTC 行情"},
-        {"id": "all_assets", "name": "A股 + OTC扩展", "count": len(catalog), "description": "统一 Data Adapter 下的全部可研究资产"},
+        {"id": "hs300", "name": "沪深300（目录代理）", "count": min(300, len(a_share)), "description": "通用目录里排在前面的300只股票，仅作代理；沪深300策略实际使用的是独立的真实成分股名单"},
+        {"id": "csi_a500", "name": "中证A500（目录代理）", "count": min(500, len(a_share)), "description": "通用目录里排在前面的500只股票，仅作代理"},
+        {"id": "all_assets", "name": "A股全部", "count": len(catalog), "description": "统一 Data Adapter 下的全部可研究资产"},
     ] + [{"id": "custom:%s" % row.id, "name": row.name, "count": len(row.symbols), "description": "自定义研究股票池"} for row in watchlists]
 
 
@@ -292,7 +285,6 @@ def research_coverage(db: Session = Depends(get_db)) -> Dict[str, Any]:
         "sectors": sectors,
         "total": len(rows),
         "large_cap_count": int((rows.bucket == "大盘核心").sum()),
-        "pink_count": int((rows.bucket == "Pink Sheets").sum()),
         "as_of": get_settings().demo_as_of.isoformat(),
         "data_mode": data.mode,
     }
@@ -343,7 +335,7 @@ def search_stocks(
     """Fast stock-directory search for manual portfolio construction.
 
     Unlike ``/stocks``, this endpoint does not run the factor engine across the
-    entire universe. ``source=akshare`` queries the AKShare code/name table and
+    entire universe. ``source=baostock`` queries the baostock code/name table and
     caches any newly discovered symbols in SQLite so they can immediately be
     selected for a custom backtest.
     """
@@ -366,7 +358,7 @@ def search_stocks(
         "requested_source": source,
         "source": resolved_source,
         "data_mode": data.mode,
-        "akshare_enabled": bool(data.real.catalog_cached or resolved_source == "akshare"),
+        "real_directory_enabled": bool(data.real.catalog_cached or resolved_source == "baostock"),
         "as_of": get_settings().demo_as_of.isoformat(),
     }
 
@@ -384,7 +376,7 @@ def stocks(search: str = "", group: str = "", industry: str = "", exchange: str 
     held = {position.symbol for position in db.scalars(select(Position).where(Position.portfolio_id == db.scalar(select(Portfolio.id).limit(1)))).all()}
     ranking["action"] = ranking.apply(lambda row: "HOLD" if row.symbol in held and row.target_weight > 0 else ("SELL" if row.symbol in held else row.action), axis=1)
     frame = ranking
-    if universe in {"a_share", "large_cap", "pink_sheets"}:
+    if universe in {"a_share", "large_cap"}:
         frame = frame[frame.symbol.isin(data.universe_symbols(universe))]
     if search:
         needle = search.lower()
@@ -623,7 +615,7 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
                 if catalog_sync.get("missing"):
                     raise HTTPException(
                         422,
-                        "以下股票代码无法从本地目录或 AKShare 解析: %s"
+                        "以下股票代码无法从本地目录或真实数据源解析: %s"
                         % ", ".join(catalog_sync["missing"]),
                     )
             symbols = _universe_symbols(market_data, payload.universe, payload.custom_symbols)
@@ -645,7 +637,7 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
                 sc,
                 symbols,
                 # A manually selected pool is an explicit user request for
-                # current AKShare data. Named full-market universes remain
+                # current baostock data. Named full-market universes remain
                 # offline-safe unless DATA_MODE=real is enabled.
                 allow_network=payload.universe == "custom",
             )
@@ -1455,9 +1447,35 @@ def universe_analytics(db: Session = Depends(get_db)) -> Dict[str, Any]:
     return {"industry_distribution": _records(industry), "score_distribution": [{"range": str(key), "count": int(value)} for key, value in bins.items()], "valuation_growth": _records(ranking[["symbol", "name", "industry", "pe", "revenue_growth", "score"]]), "stock_returns": _records(ranking.sort_values("return_12m", ascending=False)[["symbol", "name", "return_12m"]].head(15)), "portfolio_weights": _records(ranking[ranking.target_weight > 0][["symbol", "name", "industry", "target_weight"]])}
 
 
+@router.get("/settings/ai")
+def get_ai_settings(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """不回传真实key——前端只需要知道"有没有配置过"和base_url/model是什么，
+    没有必要（也不应该）把已保存的key明文吐回浏览器。"""
+    credentials = get_ai_credentials(db)
+    return {
+        "has_api_key": bool(credentials.api_key),
+        "base_url": credentials.base_url,
+        "model": credentials.model,
+        "source": credentials.source,
+    }
+
+
+@router.post("/settings/ai")
+def update_ai_settings(payload: AISettingsRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    set_ai_credentials(db, api_key=payload.api_key, base_url=payload.base_url, model=payload.model)
+    return get_ai_settings(db)
+
+
+@router.delete("/settings/ai")
+def reset_ai_settings(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """清掉数据库里保存的覆盖配置，回退到.env/环境变量里的默认值。"""
+    clear_ai_credentials(db)
+    return get_ai_settings(db)
+
+
 @router.post("/ai/explain/trade")
 def explain_trade(payload: ExplainRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    result = AIResearchService().explain(payload.model_dump(), payload.use_llm)
+    result = AIResearchService().explain(payload.model_dump(), db, payload.use_llm)
     record = AIExplanation(
         symbol=payload.symbol, explanation_type="trade", content=result["content"],
         provider=result["provider"], model_version=result.get("model_version", "rules"),
@@ -1471,7 +1489,7 @@ def explain_trade(payload: ExplainRequest, db: Session = Depends(get_db)) -> Dic
 
 @router.post("/ai/strategy-assistant")
 def strategy_assistant(payload: StrategyAssistRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    result = StrategyAssistantService().suggest(payload.description)
+    result = StrategyAssistantService().suggest(payload.description, db)
     record = AIExplanation(
         symbol="-", explanation_type="strategy_assist", content=result["content"],
         provider=result["provider"], model_version=result.get("model_version", "rules"),
@@ -1523,7 +1541,7 @@ async def analyze_report(file: UploadFile = File(...), db: Session = Depends(get
         report_text = extract_text(file.filename or "report.txt", content)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
-    result = ReportAnalysisService().analyze(report_text)
+    result = ReportAnalysisService().analyze(report_text, db)
     record = AIExplanation(
         symbol="-", explanation_type="report_analysis", content=json.dumps(
             {"summary": result["summary"], "key_points": result["key_points"], "strategy_reference": result["strategy_reference"]},
@@ -1556,7 +1574,7 @@ async def generate_factor_from_report(
     except ValueError as exc:
         raise HTTPException(422, str(exc))
 
-    result = ReportFactorService().generate(report_text)
+    result = ReportFactorService().generate(report_text, db)
     backtest_summary: Optional[Dict[str, Any]] = None
     backtest_error: Optional[str] = None
     if run_backtest and result["factor_weights"]:
@@ -1604,7 +1622,7 @@ def sync_data(payload: SyncRequest, db: Session = Depends(get_db)) -> Dict[str, 
 
 @router.post("/data/catalog/sync")
 def sync_catalog(db: Session = Depends(get_db)) -> Dict[str, Any]:
-    """Explicitly refresh the local stock directory from AKShare."""
+    """Explicitly refresh the local stock directory from baostock."""
     return MarketDataService(db).sync_akshare_catalog()
 
 

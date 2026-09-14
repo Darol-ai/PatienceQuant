@@ -7,7 +7,9 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Optional
 
-from app.config import get_settings
+from sqlalchemy.orm import Session
+
+from app.ai.credentials import get_ai_credentials
 
 # 只允许这些字段进入建议结果——把 LLM 的自由文本收窄成结构化、可校验的
 # 参数子集，避免模型编出策略配置里不存在的字段，或者返回可执行代码。
@@ -23,7 +25,7 @@ ALLOWED_FIELDS: Dict[str, tuple] = {
     "universe": (str, None, None),
 }
 ALLOWED_FREQUENCIES = {"weekly", "monthly", "quarterly"}
-ALLOWED_UNIVERSES = {"a_share", "hs300", "csi_a500", "large_cap", "pink_sheets", "custom"}
+ALLOWED_UNIVERSES = {"a_share", "hs300", "csi_a500", "large_cap", "custom"}
 
 
 def _clamp(field: str, value: Any) -> Optional[Any]:
@@ -76,17 +78,17 @@ class StrategyAssistantService:
             },
         }
 
-    def suggest(self, description: str) -> Dict[str, Any]:
-        settings = get_settings()
-        if not settings.openai_api_key:
+    def suggest(self, description: str, db: Session) -> Dict[str, Any]:
+        credentials = get_ai_credentials(db)
+        if not credentials.api_key:
             return self._rule_fallback(description)
         try:
             from openai import OpenAI
 
-            client = OpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url)
+            client = OpenAI(api_key=credentials.api_key, base_url=credentials.base_url)
             schema_hint = {field: kind.__name__ for field, (kind, _, _) in ALLOWED_FIELDS.items()}
             response = client.chat.completions.create(
-                model=settings.openai_model,
+                model=credentials.model,
                 temperature=0.2,
                 messages=[
                     {
@@ -96,7 +98,7 @@ class StrategyAssistantService:
                             "不承诺收益。先用一段中文说明理由，再另起一行输出一个 JSON 对象，"
                             f"字段只能从这些里选（不要编造其它字段）：{json.dumps(schema_hint, ensure_ascii=False)}。"
                             "rebalance_frequency 只能是 weekly/monthly/quarterly，"
-                            "universe 只能是 a_share/hs300/csi_a500/large_cap/pink_sheets/custom。"
+                            "universe 只能是 a_share/hs300/csi_a500/large_cap/custom。"
                         ),
                     },
                     {"role": "user", "content": description},
@@ -115,7 +117,7 @@ class StrategyAssistantService:
             return {
                 "content": content,
                 "provider": "openai-compatible",
-                "model_version": settings.openai_model,
+                "model_version": credentials.model,
                 "confidence": None,
                 "suggested_params": _sanitize(raw_params),
             }

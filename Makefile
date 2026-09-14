@@ -11,10 +11,10 @@ setup:
 				uv venv --python 3.9 .venv || uv venv .venv; \
 			fi; \
 		fi; \
-		uv pip install --python .venv/bin/python -e './backend[dev]'; \
+		uv pip install --python .venv/bin/python -e './backend[dev,real-data]'; \
 	else \
 		if [ ! -x .venv/bin/python ]; then python3 -m venv .venv; fi; \
-		.venv/bin/python -m pip install -e './backend[dev]'; \
+		.venv/bin/python -m pip install -e './backend[dev,real-data]'; \
 	fi
 	cd frontend && npm install
 
