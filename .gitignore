@@ -6,11 +6,18 @@ __pycache__/
 .ruff_cache/
 *.pyc
 *.db
-/data/
-backend/data/
+backend/data/*.db
 frontend/node_modules/
 frontend/dist/
 *.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
 /reference project/
+
+# 含 tushare token，不能提交
+Tushare_api_guide.md
+
+# 运行时产物
+*.log
+*.db-shm
+*.db-wal

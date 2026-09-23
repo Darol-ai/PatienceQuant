@@ -144,7 +144,7 @@ class PaperTradingService:
         catalog = data.stocks().set_index("symbol")
         symbols = [position.symbol for position in positions]
         # Paper positions are an explicit user-visible market-data request,
-        # so selected baostock symbols may refresh their current price. The
+        # so selected tushare symbols may refresh their current price. The
         # service still falls back to deterministic Demo prices on failure.
         price_df = data.prices(symbols, date(2018, 1, 1), as_of, allow_network=True) if symbols else pd.DataFrame()
         latest = price_df.sort_values("trade_date").groupby("symbol").tail(1).set_index("symbol") if not price_df.empty else pd.DataFrame()
@@ -374,6 +374,14 @@ class PaperTradingService:
             if symbol not in latest.index:
                 continue
             price = float(latest.loc[symbol].adj_close)
+            if pd.isna(price):
+                # 真实数据里偶尔会有一行存在但adj_close是NaN的情况——
+                # Python的max(NaN, .01)行为是"未定义"的坑：会原样返回
+                # NaN而不是.01，下面int((...)/max(price,.01)/100)就会
+                # 变成int(NaN)直接崩掉整个回测。这支股票今天没有可用的
+                # 真实价格，诚实地跳过这次调仓，不用假价格凑数，也不让
+                # 它拖垮其它股票正常的调仓(ADR-0045/0046同一个原则)。
+                continue
             position = current_positions.get(symbol)
             current_qty = position.quantity if position else 0
             if (
@@ -401,6 +409,13 @@ class PaperTradingService:
             target_qty = desired_qty.get(symbol, 0)
             delta = target_qty - position.quantity
             if delta >= 0:
+                continue
+            # 持仓股票今天可能压根没有价格行（停牌/数据缺失），或者有行
+            # 但adj_close是NaN——两种都不能硬卖：NaN价格算出来的amount/
+            # cash会悄悄把整个账户的现金污染成NaN(不会立刻报错，是更隐蔽
+            # 的一种坏)。这次调仓先跳过这支股票，仓位保持不变，等下次
+            # 有真实价格的时候再处理(ADR-0045/0046同一个原则)。
+            if symbol not in latest.index or pd.isna(latest.loc[symbol].adj_close):
                 continue
             price = float(latest.loc[symbol].adj_close)
             quantity = min(position.quantity, abs(delta))

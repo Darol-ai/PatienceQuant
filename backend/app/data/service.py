@@ -10,9 +10,9 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.data.akshare_provider import _normalise_query
-from app.data.baostock_provider import BaostockDataProvider
+from app.data.tushare_provider import TushareDataProvider
 from app.data.demo import DemoDataProvider
-from app.db.models import Fundamental, Industry, ResearchGroup, Stock, StockPrice, Watchlist
+from app.db.models import BenchmarkPrice, Fundamental, Industry, ResearchGroup, Stock, StockPrice, Watchlist
 
 
 @lru_cache
@@ -22,8 +22,8 @@ def get_demo_provider() -> DemoDataProvider:
 
 
 @lru_cache
-def get_real_provider() -> BaostockDataProvider:
-    return BaostockDataProvider(get_demo_provider())
+def get_real_provider() -> TushareDataProvider:
+    return TushareDataProvider(get_demo_provider())
 
 
 class MarketDataService:
@@ -31,6 +31,11 @@ class MarketDataService:
         self.db = db
         self.demo = get_demo_provider()
         self.real = get_real_provider()
+        # real模式下、重试3次后仍拿不到真实价格的symbol(ADR-0045：不能
+        # 悄悄退回demo数据顶替)。调用方(路由层)可以读这个属性，把"部分
+        # 行情获取失败"如实透出给用户，而不是装作一切正常。每次prices()
+        # 调用都会重置。
+        self.last_price_fetch_failures: List[str] = []
 
     @property
     def provider(self):
@@ -43,12 +48,13 @@ class MarketDataService:
         return "real" if self.real.catalog_cached else "real_or_demo_fallback"
 
     def seed_if_empty(self) -> None:
-        """启动时必须快——baostock全市场目录一次查询实测要40+秒(两次批量
-        调用+跨几千行的网络分页读取)，real模式下不能让它挡在FastAPI
-        lifespan里同步跑，否则每次重启服务都要等almost一分钟才开始接受
-        请求。这里始终先用demo的50支真实公司做启动兜底(本地生成，毫秒级)，
-        真正的全市场baostock目录交给 app.main 里和CSI300预热同一套模式的
-        后台任务异步刷新——服务立刻能起来，目录数据几十秒后自动补齐。
+        """启动时必须快——tushare全市场目录一次stock_basic()调用比baostock
+        时代(query_all_stock+query_stock_industry两次批量调用)简单，但
+        仍然是一次跨几千行的真实网络请求，real模式下不能让它挡在FastAPI
+        lifespan里同步跑，否则每次重启服务都要等它跑完才开始接受请求。
+        这里始终先用demo的50支真实公司做启动兜底(本地生成，毫秒级)，
+        真正的全市场tushare目录交给 app.main 里和CSI300预热同一套模式的
+        后台任务异步刷新——服务立刻能起来，目录数据随后自动补齐。
         """
         if self.db.scalar(select(Stock.id).limit(1)):
             if get_settings().data_mode.lower() != "real":
@@ -65,10 +71,10 @@ class MarketDataService:
         self.db.commit()
 
     def sync_akshare_catalog(self) -> Dict[str, object]:
-        """Refresh the searchable A-share directory from baostock when available."""
+        """Refresh the searchable A-share directory from tushare when available."""
         before = len(self.stocks())
         catalog = self.real.full_stock_catalog()
-        source = "baostock" if not catalog.empty and not self.real._code_name_table().empty else "demo_fallback"
+        source = "tushare" if not catalog.empty and not self.real._code_name_table().empty else "demo_fallback"
         self._insert_catalog(catalog, hide_stale=False)
         self.db.commit()
         after = len(self.stocks())
@@ -78,7 +84,7 @@ class MarketDataService:
             "before_count": before,
             "after_count": after,
             "added_count": max(0, after - before),
-            "message": "真实股票目录已刷新" if source == "baostock" else "baostock 不可用，继续使用 Demo 股票目录",
+            "message": "真实股票目录已刷新" if source == "tushare" else "tushare 不可用，继续使用 Demo 股票目录",
         }
 
     def search_catalog(
@@ -91,13 +97,13 @@ class MarketDataService:
         exchange: str = "",
     ) -> tuple[pd.DataFrame, str]:
         """Search the lightweight catalog without calculating factor scores."""
-        requested_source = source if source in {"auto", "local", "baostock"} else "auto"
+        requested_source = source if source in {"auto", "local", "tushare"} else "auto"
         # ``auto`` is intentionally local-first for offline startup, then
-        # falls through to the real baostock directory when a user searches for a
+        # falls through to the real tushare directory when a user searches for a
         # code/name that is not in the Demo catalog.  This keeps the UI fast
         # and deterministic without forcing users to understand provider
         # switches before they can add a real A-share symbol.
-        should_use_real = requested_source == "baostock"
+        should_use_real = requested_source == "tushare"
         if requested_source == "auto" and query.strip():
             local_probe = self.stocks()
             local_needle = _normalise_query(query)
@@ -124,10 +130,10 @@ class MarketDataService:
         if should_use_real:
             real_result = self.real.search_stocks(query, limit, group=group, industry=industry, exchange=exchange)
             if not real_result.empty:
-                # Make baostock-only symbols available to custom backtests and watchlists.
+                # Make tushare-only symbols available to custom backtests and watchlists.
                 self._insert_catalog(real_result.drop(columns=["source"], errors="ignore"), hide_stale=False)
                 self.db.commit()
-                return real_result, "baostock"
+                return real_result, "tushare"
 
         frame = self.stocks()
         needle = _normalise_query(query)
@@ -150,16 +156,16 @@ class MarketDataService:
         if limit is not None:
             frame = frame.head(max(1, min(int(limit), 200)))
         frame = frame.copy()
-        # Preserve the provenance of baostock-discovered rows after they have
+        # Preserve the provenance of tushare-discovered rows after they have
         # been cached in the common ``stocks`` table. Demo rows remain plainly
         # labelled, so the picker never presents a cached real directory as
         # if it were generated Demo data.
         frame["source"] = frame.tags.map(
-            lambda tags: "baostock" if isinstance(tags, list) and "baostock" in tags else (
+            lambda tags: "tushare" if isinstance(tags, list) and "tushare" in tags else (
                 "local_cache" if self.mode != "demo" else "demo"
             )
         )
-        cached_real = frame["source"].eq("baostock").any() if "source" in frame.columns else False
+        cached_real = frame["source"].eq("tushare").any() if "source" in frame.columns else False
         return frame, "local_cache" if cached_real else ("demo" if self.mode == "demo" else "local_cache")
 
     def _insert_catalog(self, catalog: pd.DataFrame, hide_stale: bool = True) -> None:
@@ -244,7 +250,7 @@ class MarketDataService:
             "requested": len(requested),
             "resolved": sum(symbol in existing for symbol in requested),
             "missing": [symbol for symbol in requested if symbol not in existing],
-            "source": "baostock" if missing and existing.intersection(set(requested)) else self.mode,
+            "source": "tushare" if missing and existing.intersection(set(requested)) else self.mode,
         }
 
     def universe_symbols(self, universe: str = "a_share") -> List[str]:
@@ -273,7 +279,7 @@ class MarketDataService:
 
     # Dashboard/股票池这类展示型因子评分不需要对全市场每一支都打分，一个
     # 有代表性的子集就够——上限不能直接照抄large_cap/hs300的"前300只"口径:
-    # baostock没有批量接口，每支股票的完整历史要单独发一次请求，实测
+    # tushare没有批量接口，每支股票的完整历史要单独发一次请求，实测
     # 2018-2025这个区间平均每支4秒左右。300支意味着冷缓存下单次请求
     # 最坏要20分钟，对一个同步HTTP接口来说太慢；缩到30支，最坏情况~2
     # 分钟，命中缓存后同一区间的后续请求是毫秒级(prices()里写透缓存)。
@@ -282,8 +288,8 @@ class MarketDataService:
     def analysis_symbols(self, symbols: List[str]) -> List[str]:
         """Return a bounded set of symbols safe for cross-sectional analytics.
 
-        real模式下baostock目录是全市场真实代码(几千支)，`prices()`对每个
-        缺价格缓存的symbol是顺序发一次baostock请求，不是批量——如果不设
+        real模式下tushare目录是全市场真实代码(几千支)，`prices()`对每个
+        缺价格缓存的symbol是顺序发一次tushare请求，不是批量——如果不设
         上限，全市场几千支顺序请求会挂起几十分钟甚至更久。这里不再区分
         demo/real：优先选已有价格缓存的symbol，否则直接截断到
         ANALYSIS_SYMBOL_CAP，两种模式下都有确定的响应时间上限。需要对
@@ -292,7 +298,7 @@ class MarketDataService:
         """
         requested = list(dict.fromkeys(str(symbol) for symbol in symbols))
         demo_symbols = set(self.demo.stock_catalog().symbol.tolist())
-        # Avoid a giant SQLite ``IN (...)`` clause when a baostock catalog
+        # Avoid a giant SQLite ``IN (...)`` clause when a tushare catalog
         # contains several thousand symbols. The distinct cache key set is
         # tiny compared with the price table and can be intersected in
         # memory safely.
@@ -326,7 +332,7 @@ class MarketDataService:
 
         ``data_mode`` on the service describes the configured provider, while
         a single custom backtest can legitimately mix cached Real rows,
-        deterministic Demo rows, and a Demo fallback for a baostock symbol.
+        deterministic Demo rows, and a Demo fallback for a tushare symbol.
         Keeping this distinction explicit prevents a mixed run from being
         presented as wholly real data.
         """
@@ -353,8 +359,7 @@ class MarketDataService:
         if not symbols:
             return pd.DataFrame()
         if get_settings().data_mode.lower() == "real":
-            # baostock是日频快照，"今天"甚至最近1-2天的数据经常还没发布
-            # (query_all_stock同样的问题，见baostock_provider.py的说明)。
+            # tushare是日频快照，"今天"甚至最近1-2天的数据经常还没发布。
             # 如果覆盖度检查死磕到调用方传入的end(通常是"今天")，缓存
             # 永远够不到这个end，每次请求都会被判定为"没缓存全"，重新
             # 触发一遍对每支股票的顺序真实请求——等于write-through缓存
@@ -373,6 +378,19 @@ class MarketDataService:
         # important after a user syncs (say) 2024-2025 and then runs a
         # 2018-2025 backtest: silently accepting the partial cache would
         # change the requested research period and distort all factor windows.
+        #
+        # 边界要留容差(ADR-0045/0046补充发现)：tushare只返回真实交易日的行情，
+        # 请求的start/end落在非交易日(元旦、春节、国庆等假期)时，缓存里
+        # 永远不可能出现"恰好等于start/end"的那一行——比如2018-01-01是
+        # 元旦，A股第一个交易日是2018-01-02，coverage[symbol][0]永远是
+        # 2018-01-02 > start(2018-01-01)。不留容差的话，每支股票每次都会
+        # 被判定"没覆盖全"，写透缓存形同虚设，每次请求都要重新顺序打一遍
+        # tushare/baostock——这正是Dashboard"一直转圈"的真正根因之一(容量上限只是
+        # 让这个重复代价从"上千支"降到"30支"，本身没有让缓存生效)。
+        # 10天的容差足够盖过任意一个法定假期(春节最长约10天)，同时远小于
+        # 上面注释担心的"2024-2025缓存冒充2018-2025"这种年级别的时间跨度，
+        # 不会放宽那个约束。
+        _COVERAGE_TOLERANCE = timedelta(days=10)
         coverage = {}
         if not cached_df.empty:
             for symbol, group in cached_df.groupby("symbol"):
@@ -380,16 +398,18 @@ class MarketDataService:
         missing = [
             symbol
             for symbol in symbols
-            if symbol not in coverage or coverage[symbol][0] > start or coverage[symbol][1] < end
+            if symbol not in coverage
+            or coverage[symbol][0] > start + _COVERAGE_TOLERANCE
+            or coverage[symbol][1] < end - _COVERAGE_TOLERANCE
         ]
         frames = [cached_df] if not cached_df.empty else []
         if missing:
-            # A user may have searched baostock while the rest of the app is
+            # A user may have searched tushare while the rest of the app is
             # still in offline Demo mode. Network access is opt-in for
             # explicit user actions (custom backtest, stock detail, sync) or
             # DATA_MODE=real. Ordinary full-universe pages stay offline and
             # therefore cannot accidentally issue thousands of serial
-            # baostock requests after a catalog refresh.
+            # tushare requests after a catalog refresh.
             demo_symbols = set(self.demo.stock_catalog().symbol.tolist())
             network_enabled = allow_network or get_settings().data_mode.lower() == "real"
             real_missing = (
@@ -397,21 +417,33 @@ class MarketDataService:
                 if get_settings().data_mode.lower() == "real"
                 else [symbol for symbol in missing if symbol not in demo_symbols and str(symbol).isdigit()]
             )
+            real_mode = get_settings().data_mode.lower() == "real"
             if network_enabled and real_missing:
                 real_prices = self.real.fetch_prices(real_missing, start, end)
                 if not real_prices.empty:
                     frames.append(real_prices)
                     # 写透缓存：不落盘的话，每次请求同一批symbol都要重新
-                    # 顺序调用一遍baostock——real模式下Dashboard/股票池这类
+                    # 顺序调用一遍tushare——real模式下Dashboard/股票池这类
                     # 页面每次打开都会命中"未缓存"，等于永远在付一次性冷
                     # 启动的代价。落盘后同一日期区间下次直接命中上面的
                     # cached查询，不再碰网络。
                     self._persist_real_prices(real_prices)
+                if real_mode:
+                    # ADR-0045：real模式下重试3次仍失败的symbol，如实记录
+                    # 下来供调用方透出给用户，不能靠下面的demo兜底悄悄
+                    # 顶替——那样看起来"成功"了，实际是假数据在冒充真实
+                    # 结果。
+                    self.last_price_fetch_failures = list(getattr(self.real, "last_failed_symbols", []))
             fetched_symbols = set()
             for frame in frames[1:]:
                 if not frame.empty:
                     fetched_symbols.update(frame.symbol.unique())
             demo_missing = [symbol for symbol in missing if symbol not in fetched_symbols]
+            if real_mode:
+                # real模式下"没拿到真实数据"到这里为止——不再用demo数据
+                # 顶替这些symbol，宁可这次结果里少几支股票，也不要让假
+                # 数字掺进真实策略计算里(ADR-0045)。
+                demo_missing = []
             if demo_missing:
                 frames.append(self.demo.fetch_prices(demo_missing, start, end))
         if not frames:
@@ -459,7 +491,55 @@ class MarketDataService:
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     def benchmark(self, start: date, end: date) -> pd.DataFrame:
-        return self.provider.fetch_benchmark(start, end)
+        """沪深300基准指数——real模式下走写透缓存(ADR-0045补充)，逻辑跟
+        prices()对齐：同样10天边界容差(tushare只在真实交易日有数据，
+        请求的start/end撞上假期时不能死磕"恰好等于")，同样"拿不到就
+        如实返回能给的部分/空表"，不拿demo序列悄悄顶替真实指数。demo
+        模式下不缓存——本地生成毫秒级，缓存没有意义。"""
+        real_mode = get_settings().data_mode.lower() == "real"
+        if not real_mode:
+            return self.provider.fetch_benchmark(start, end)
+        end = min(end, date.today() - timedelta(days=4))
+        tolerance = timedelta(days=10)
+        cached = self.db.scalars(
+            select(BenchmarkPrice).where(BenchmarkPrice.trade_date >= start, BenchmarkPrice.trade_date <= end)
+        ).all()
+        cached_df = pd.DataFrame([
+            {"trade_date": p.trade_date, "close": p.close, "adj_close": p.adj_close, "data_mode": p.data_mode}
+            for p in cached
+        ])
+        covered = (
+            not cached_df.empty
+            and cached_df.trade_date.min() <= start + tolerance
+            and cached_df.trade_date.max() >= end - tolerance
+        )
+        if covered:
+            return cached_df.sort_values("trade_date").reset_index(drop=True)
+        fetched = self.real.fetch_benchmark(start, end)
+        if not fetched.empty:
+            self._persist_benchmark_prices(fetched)
+            return fetched.sort_values("trade_date").reset_index(drop=True)
+        # ADR-0045：拿不到新数据也不能拿demo指数顶替真实基准；已缓存的
+        # 旧数据比空表更有用，原样返回给调用方自己判断够不够用。
+        return cached_df.sort_values("trade_date").reset_index(drop=True) if not cached_df.empty else fetched
+
+    def _persist_benchmark_prices(self, fetched: pd.DataFrame) -> int:
+        real = fetched[fetched.data_mode == "real"] if not fetched.empty else fetched
+        inserted = 0
+        for row in real.to_dict(orient="records"):
+            exists = self.db.scalar(select(BenchmarkPrice).where(BenchmarkPrice.trade_date == row["trade_date"]))
+            if exists:
+                exists.close = float(row["close"])
+                exists.adj_close = float(row["adj_close"])
+                exists.data_mode = row["data_mode"]
+            else:
+                self.db.add(BenchmarkPrice(
+                    trade_date=row["trade_date"], close=float(row["close"]),
+                    adj_close=float(row["adj_close"]), data_mode=row["data_mode"],
+                ))
+            inserted += 1
+        self.db.commit()
+        return inserted
 
     def _persist_real_prices(self, fetched: pd.DataFrame) -> int:
         """把fetch_prices()拿到的真实行情落盘到StockPrice缓存表——只落

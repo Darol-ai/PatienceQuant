@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import get_settings
@@ -13,8 +13,22 @@ class Base(DeclarativeBase):
 
 
 settings = get_settings()
-connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
+is_sqlite = settings.database_url.startswith("sqlite")
+# sqlite3自己的忙等超时默认只有5秒——real模式下一次大回测(300支股票，
+# 每支拿到价格就单独commit一次)持续写库的时间远不止5秒，同一时间
+# 后台的自动调仓轮询/前端的其它GET请求想读同一个库文件，很容易撞上
+# "database is locked"直接报错，而不是等一等就好。两个改动一起解决：
+# WAL模式让"一个写事务进行中"不再挡住普通读请求（读写基本不互斥），
+# busy_timeout兜底覆盖WAL模式覆盖不到的场景(比如两个写事务真的撞上)。
+connect_args = {"check_same_thread": False, "timeout": 30} if is_sqlite else {}
 engine = create_engine(settings.database_url, connect_args=connect_args, future=True)
+if is_sqlite:
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, class_=Session)
 
 

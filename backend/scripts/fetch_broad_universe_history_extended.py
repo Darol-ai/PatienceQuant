@@ -4,6 +4,10 @@
 实际上市日起算），落到独立的 data/broad_universe_history_extended.parquet，
 不覆盖原有 data/broad_universe_history.parquet。
 
+连接层（限速/超时/失败重试）统一走 app.data.tushare_client，见
+docs/adr/0046——这份脚本目前不会被运行（现有parquet保持不动），只是把
+baostock时代的代码依赖换成tushare。
+
 用法：
     conda activate stock
     cd PatienceQuant/backend
@@ -11,53 +15,50 @@
 """
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
-for _var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
-    os.environ.pop(_var, None)
-
-import baostock as bs
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.quant_v3.baostock_adapter import normalize_daily_bars
+from app.data.tushare_client import TushareQueryFailed, run as run_tushare
 from app.quant_v3.broad_universe import BROAD_STOCKS
-from scripts.fetch_a_phase_history import FIELDS, to_bao_code
+from app.quant_v3.tushare_adapter import fetch_daily_bars
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 OUT_PATH = DATA_DIR / "broad_universe_history_extended.parquet"
 
 
 def fetch_one(symbol: str, start: str, end: str) -> list[dict]:
-    rs = bs.query_history_k_data_plus(
-        to_bao_code(symbol), FIELDS, start_date=start, end_date=end,
-        frequency="d", adjustflag="2",
-    )
-    if rs.error_code != "0":
-        raise RuntimeError(f"{symbol} 查询失败: {rs.error_code} {rs.error_msg}")
-    rows = []
-    while rs.next():
-        rows.append(rs.get_row_data())
-    return normalize_daily_bars(rows)
+    start_compact = start.replace("-", "")
+    end_compact = end.replace("-", "")
+
+    def _fetch(pro):
+        return fetch_daily_bars(pro, symbol, start_compact, end_compact)
+
+    return run_tushare(_fetch)
 
 
 def main() -> None:
-    login = bs.login()
-    if login.error_code != "0":
-        raise RuntimeError(f"BaoStock 登录失败: {login.error_msg}")
-
     all_bars: list[dict] = []
-    try:
-        for stock in BROAD_STOCKS:
-            print(f"拉取 {stock['symbol']} {stock['name']} ...", end=" ", flush=True)
+    failed: list[str] = []
+    for stock in BROAD_STOCKS:
+        print(f"拉取 {stock['symbol']} {stock['name']} ...", end=" ", flush=True)
+        try:
             bars = fetch_one(stock["symbol"], "2010-01-01", "2026-09-11")
-            all_bars.extend(bars)
-            print(f"{len(bars)} 条，{bars[0]['date']} ~ {bars[-1]['date']}" if bars else "无数据")
-    finally:
-        bs.logout()
+        except TushareQueryFailed as exc:
+            # 已经在连接层重试过3次(每次重新登录)——如实记录失败、继续
+            # 处理剩下的股票，不拿demo/编造数据顶替，也不让一支股票拖垮
+            # 整批(ADR-0045/0046)。
+            print(f"重试3次后仍失败: {exc}")
+            failed.append(stock["symbol"])
+            continue
+        all_bars.extend(bars)
+        print(f"{len(bars)} 条，{bars[0]['date']} ~ {bars[-1]['date']}" if bars else "无数据")
+
+    if failed:
+        print(f"\n以下{len(failed)}支股票重试3次后仍未拿到真实数据，需要重跑脚本补齐：{failed}")
 
     frame = pd.DataFrame(all_bars)
     frame["group"] = "综合"

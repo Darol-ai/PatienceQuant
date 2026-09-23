@@ -54,6 +54,22 @@ class StockPrice(Base):
     data_mode: Mapped[str] = mapped_column(String(20), default="demo")
 
 
+class BenchmarkPrice(Base):
+    """沪深300基准指数的写透缓存(ADR-0045补充)——跟StockPrice分开建表，
+    因为它只有一条全局序列(不按symbol区分)，且index_daily()只返回date/close，
+    没有per-symbol的open/high/low/volume，硬凑进StockPrice表既不诚实也
+    不必要。没有这张表之前，FactorEngine每次算因子都会现查一遍tushare，
+    是Dashboard每次打开都要付几十秒真实网络延迟的另一个根因。"""
+
+    __tablename__ = "benchmark_prices"
+    __table_args__ = (UniqueConstraint("trade_date", name="uq_benchmark_price"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    close: Mapped[float] = mapped_column(Float)
+    adj_close: Mapped[float] = mapped_column(Float)
+    data_mode: Mapped[str] = mapped_column(String(20), default="demo")
+
+
 class Fundamental(Base):
     __tablename__ = "fundamentals"
     __table_args__ = (UniqueConstraint("symbol", "report_date", name="uq_fundamental"),)

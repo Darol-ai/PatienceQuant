@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = None
     openai_base_url: Optional[str] = None
     openai_model: str = "gpt-4.1-mini"
+    tushare_token: Optional[str] = None
+    tushare_http_url: str = "https://tuaremax.top"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

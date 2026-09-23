@@ -91,7 +91,7 @@ BASE_STOCK_SPECS: List[StockSpec] = [
 # Demo数据只保留这份手工维护的真实公司列表(代码和名字都真实，只是
 # 价格/基本面走本地模拟)——之前用前缀+序号规则批量生成的900多支虚构
 # 代码和PINK_SPECS虚构OTC代码已经删除，不再作为通用目录的兜底填充；
-# 通用目录的真实来源换成了baostock(见 app/data/baostock_provider.py)。
+# 通用目录的真实来源是tushare(见 app/data/tushare_provider.py)。
 STOCK_SPECS: List[StockSpec] = BASE_STOCK_SPECS
 
 

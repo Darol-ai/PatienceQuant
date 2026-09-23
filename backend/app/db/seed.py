@@ -127,9 +127,8 @@ def seed_database(db: Session) -> None:
     _ensure_quant_v3_strategy(db)
     _ensure_csi300_strategies(db)
     # _ensure_demo_backtest对默认多因子策略的universe(large_cap)逐支调用
-    # market_data.prices()——real模式下这会变成真的顺序调用baostock查
-    # 2018-2025年8年日线，几十支股票可能要几分钟，还会占着baostock的
-    # 进程级锁跟真实用户请求抢(见baostock_provider.py)。这个默认多因子
+    # market_data.prices()——real模式下这会变成真的顺序调用tushare查
+    # 2018-2025年8年日线，几十支股票可能要几分钟。这个默认多因子
     # 策略在回测中心/自动交易的下拉框里已经不可选了(只展示已验证的
     # ACTIVE_CSI300_STRATEGIES)，不值得为它付这个代价——real模式下直接
     # 跳过这份种子回测，Dashboard对应位置会显示"运行一次回测后，净值

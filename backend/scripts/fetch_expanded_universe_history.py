@@ -3,6 +3,10 @@
 的 `data/expanded_universe_history.parquet`——不覆盖官方 A 阶段的 parquet，
 两条数据管线分开，互不影响。
 
+连接层（限速/超时/失败重试）统一走 app.data.tushare_client，见
+docs/adr/0046——这份脚本目前不会被运行（现有parquet保持不动），只是把
+baostock时代的代码依赖换成tushare。
+
 用法：
     conda activate stock
     cd PatienceQuant/backend
@@ -10,21 +14,16 @@
 """
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
-for _var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
-    os.environ.pop(_var, None)
-
-import baostock as bs
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.data.tushare_client import TushareQueryFailed
 from app.quant_v3.a_phase_universe import A_PHASE_STOCKS, EXPANDED_A_PHASE_STOCKS
-from app.quant_v3.baostock_adapter import normalize_daily_bars
-from scripts.fetch_a_phase_history import FIELDS, fetch_one
+from scripts.fetch_a_phase_history import fetch_one
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 OUT_PATH = DATA_DIR / "expanded_universe_history.parquet"
@@ -38,22 +37,24 @@ def main() -> None:
     official_symbols = {s["symbol"] for s in A_PHASE_STOCKS}
     new_stocks = [s for s in EXPANDED_A_PHASE_STOCKS if s["symbol"] not in official_symbols]
 
-    login = bs.login()
-    if login.error_code != "0":
-        raise RuntimeError(f"BaoStock 登录失败: {login.error_msg}")
-
     new_bars: list[dict] = []
-    try:
-        for stock in new_stocks:
-            print(f"拉取 {stock['symbol']} {stock['name']} ...", end=" ", flush=True)
+    failed: list[str] = []
+    for stock in new_stocks:
+        print(f"拉取 {stock['symbol']} {stock['name']} ...", end=" ", flush=True)
+        try:
             bars = fetch_one(stock["symbol"], start, end)
-            for bar in bars:
-                bar["group"] = stock["group"]
-                bar["name"] = stock["name"]
-            new_bars.extend(bars)
-            print(f"{len(bars)} 条，{bars[0]['date']} ~ {bars[-1]['date']}" if bars else "无数据")
-    finally:
-        bs.logout()
+        except TushareQueryFailed as exc:
+            print(f"重试3次后仍失败: {exc}")
+            failed.append(stock["symbol"])
+            continue
+        for bar in bars:
+            bar["group"] = stock["group"]
+            bar["name"] = stock["name"]
+        new_bars.extend(bars)
+        print(f"{len(bars)} 条，{bars[0]['date']} ~ {bars[-1]['date']}" if bars else "无数据")
+
+    if failed:
+        print(f"\n以下{len(failed)}支股票重试3次后仍未拿到真实数据，需要重跑脚本补齐：{failed}")
 
     combined = pd.concat([existing, pd.DataFrame(new_bars)], ignore_index=True)
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)

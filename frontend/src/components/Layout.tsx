@@ -16,10 +16,27 @@ const navigation = [
 
 export function Layout({ children }: { children: ReactNode }) {
   const [open, setOpen] = useState(false)
-  const [light, setLight] = useState(false)
+  // 默认浅色（之前默认深色）；记住用户切换过的选择，不然每次刷新都要
+  // 重新点一次太阳图标。
+  const [light, setLight] = useState(() => {
+    try {
+      const saved = localStorage.getItem('theme')
+      return saved ? saved === 'light' : true
+    } catch {
+      return true
+    }
+  })
   const location = useLocation()
   useEffect(() => setOpen(false), [location.pathname])
-  useEffect(() => { document.documentElement.dataset.theme = light ? 'light' : 'dark' }, [light])
+  useEffect(() => {
+    document.documentElement.dataset.theme = light ? 'light' : 'dark'
+    try {
+      localStorage.setItem('theme', light ? 'light' : 'dark')
+    } catch {
+      // localStorage被禁用——主题这次会话内还是正常切换，只是刷新后
+      // 回到默认浅色，不是值得中断操作的错误。
+    }
+  }, [light])
   // 之前这里是写死的"Demo 数据就绪"文字，不管模拟盘实际绑定的是什么
   // 策略都不会变——现在跟着账户真正绑定的策略走，绑定我们验证过的
   // 真实策略(csi300_*/quant_v3_regression)时才说"真实策略数据"。

@@ -27,7 +27,7 @@ os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB_PATH}"
 # `with TestClient(app) as client:`都会重新进一次lifespan，测试本身该
 # 用到这些缓存的地方(CSI300相关测试)自然会通过真实调用把它们建起来，
 # 不需要额外再触发一次5分钟的后台预热跟测试的HTTP调用抢CPU。
-# 通用目录换成baostock后DATA_MODE默认值也改成了real——测试套件不能因为
+# 通用目录换成tushare后DATA_MODE默认值也改成了real——测试套件不能因为
 # 这个默认值变化就在每次seed时去真实发网络请求(慢、依赖外部服务可用性、
 # CI环境不一定有网络)，所以显式钉死用demo目录(50支真实公司的本地模拟
 # 数据，见app/data/demo.py)。CSI300/quant_v3那几个真实策略走独立的parquet

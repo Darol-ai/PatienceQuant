@@ -5,16 +5,39 @@
 #
 # 用法：
 #   cd PatienceQuant/backend
-#   pip install -e '.[real-data]'    # 装baostock（如果还没装）
+#   pip install -e '.[real-data]'    # 装tushare（如果还没装）
 #   bash scripts/prepare_real_data.sh
 #
 # 每一步都是增量的、可以安全中断后重跑——脚本本身也是幂等的，重复运行
 # 只会跳过已经生成好的文件对应的工作，不会重新算一遍全部。
 # 全程预计几十分钟到数小时，取决于机器性能和网络状况，不适合放进
 # docker build，所以设计成在宿主机/训练环境手动跑一次。
+#
+# ADR-0046：backend/data/ 下的parquet+训好的模型现在跟着仓库走Git LFS
+# 分发——正常 git clone 就能直接拿到这些文件，不需要跑这个脚本。这里
+# 先检查这批"最终产出"是不是已经在了，在的话直接跳过、不碰任何数据源
+# （不管是tushare还是别的），避免重复劳动、也避免不必要地消耗tushare
+# 积分配额。真的要强制重新生成，加 --force 参数或者先手动删掉data/里
+# 对应的文件。
+
+FORCE=0
+if [ "${1:-}" = "--force" ]; then
+    FORCE=1
+fi
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+if [ "$FORCE" -eq 0 ] \
+    && [ -f data/csi300_regression_h90_training_samples.parquet ] \
+    && [ -d data/csi300_lightgbm_ensemble_model_walkforward ] \
+    && [ -d data/csi300_xgboost_ensemble_model_walkforward ] \
+    && [ -f data/broad_regression_h90_extended_training_samples.parquet ] \
+    && [ -d data/broad_regression_h90_extended_model_walkforward ]; then
+    echo "data/ 下真实数据+训好的模型已经存在（大概率是git clone/LFS pull带过来的），跳过整套抓取+训练。"
+    echo "确实要重新生成，运行： bash scripts/prepare_real_data.sh --force"
+    exit 0
+fi
 
 run_step() {
     local desc="$1"

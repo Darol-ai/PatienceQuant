@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import time
 from datetime import date, datetime
 from io import StringIO
 from typing import Any, Dict, List, Optional
@@ -109,6 +110,23 @@ def _latest_selection(ranking: pd.DataFrame, limit: int) -> List[Dict[str, Any]]
         if column in frame.columns
     ]
     return _records(frame[columns])
+
+
+def _default_multifactor_strategy(db: Session) -> Optional[Strategy]:
+    """展示型端点(/api/stocks、/api/research/coverage、/api/signals、
+    /api/analytics/universe、Dashboard的analytics兜底)要的是"随便一个
+    可以用MultiFactorStrategy打分展示的策略"——`Strategy.is_default`
+    这个标记现在可能落在训练好的模型策略上(比如csi300_ensemble，见
+    set_default_strategy)，那类策略没有"因子权重"这个概念，
+    weights/holdings_count这些字段就算有值也是没意义的占位——直接拿去
+    喂MultiFactorStrategy会算出一堆无意义的"评分"，不是真的因子打分。
+    这里优先找同时是is_default又是multifactor的，找不到就退到随便一个
+    multifactor策略——不能因为平台默认换成了训练好的模型，这些通用
+    展示页面就跟着悄悄坏掉。"""
+    strategy = db.scalar(select(Strategy).where(Strategy.is_default.is_(True), Strategy.kind == "multifactor").limit(1))
+    if strategy:
+        return strategy
+    return db.scalar(select(Strategy).where(Strategy.kind == "multifactor").order_by(Strategy.created_at.desc()).limit(1))
 
 
 def _strategy_config(strategy: Strategy, request: Optional[BacktestRequest] = None) -> StrategyConfig:
@@ -263,7 +281,7 @@ def research_coverage(db: Session = Depends(get_db)) -> Dict[str, Any]:
     """Return the user's clearly annotated, cross-market low-frequency research list."""
     data = MarketDataService(db)
     catalog = data.stocks()
-    strategy_row = db.scalar(select(Strategy).where(Strategy.is_default.is_(True)).limit(1))
+    strategy_row = _default_multifactor_strategy(db)
     ranking_symbols = data.analysis_symbols(catalog.symbol.tolist())
     ranking = MultiFactorStrategy(FactorEngine(data), _strategy_config(strategy_row)).generate_weights(
         get_settings().demo_as_of, ranking_symbols
@@ -335,7 +353,7 @@ def search_stocks(
     """Fast stock-directory search for manual portfolio construction.
 
     Unlike ``/stocks``, this endpoint does not run the factor engine across the
-    entire universe. ``source=baostock`` queries the baostock code/name table and
+    entire universe. ``source=tushare`` queries the tushare code/name table and
     caches any newly discovered symbols in SQLite so they can immediately be
     selected for a custom backtest.
     """
@@ -358,7 +376,7 @@ def search_stocks(
         "requested_source": source,
         "source": resolved_source,
         "data_mode": data.mode,
-        "real_directory_enabled": bool(data.real.catalog_cached or resolved_source == "baostock"),
+        "real_directory_enabled": bool(data.real.catalog_cached or resolved_source == "tushare"),
         "as_of": get_settings().demo_as_of.isoformat(),
     }
 
@@ -367,7 +385,7 @@ def search_stocks(
 def stocks(search: str = "", group: str = "", industry: str = "", exchange: str = "", universe: str = "all_assets", signal: str = "", sort: str = "score", order: str = "desc", db: Session = Depends(get_db)) -> Dict[str, Any]:
     data = MarketDataService(db)
     catalog = data.stocks()
-    strategy_row = db.scalar(select(Strategy).where(Strategy.is_default.is_(True)).limit(1))
+    strategy_row = _default_multifactor_strategy(db)
     strategy = MultiFactorStrategy(FactorEngine(data), _strategy_config(strategy_row))
     ranking = strategy.generate_weights(
         get_settings().demo_as_of,
@@ -400,7 +418,7 @@ def stock_detail(symbol: str, range: str = "all", interval: str = "monthly", db:
     catalog = data.stocks()
     if symbol not in set(catalog.symbol):
         raise HTTPException(404, "股票不存在")
-    strategy = db.scalar(select(Strategy).where(Strategy.is_default.is_(True)).limit(1))
+    strategy = _default_multifactor_strategy(db)
     ranking_symbols = data.analysis_symbols(catalog.symbol.tolist())
     if symbol not in ranking_symbols:
         ranking_symbols.append(symbol)
@@ -515,6 +533,23 @@ def update_strategy(strategy_id: int, payload: StrategyPayload, db: Session = De
         setattr(strategy, field, value)
     db.commit()
     return {"id": strategy.id, "message": "策略已更新"}
+
+
+@router.post("/strategies/{strategy_id}/set-default")
+def set_default_strategy(strategy_id: int, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """把某个已有策略设为平台默认——跟create_strategy()不同，这里不新建
+    版本、不改任何参数，只是把is_default标记从当前策略挪到这一个。
+    is_default决定的是"没指定具体策略时，各个通用/展示型端点(策略中心
+    默认加载哪个、回测中心/analytics面板没有strategy_id时的兜底)用哪个
+    策略"，跟模拟盘账户实际绑定的策略(PaperTradingService单独维护)是
+    两回事——账户已经在用哪个策略调仓，不受这个接口影响。"""
+    strategy = db.get(Strategy, strategy_id)
+    if not strategy:
+        raise HTTPException(404, "策略不存在")
+    db.query(Strategy).filter(Strategy.is_default.is_(True)).update({"is_default": False}, synchronize_session=False)
+    strategy.is_default = True
+    db.commit()
+    return {"id": strategy.id, "message": f"「{strategy.name}」已设为平台默认策略"}
 
 
 @router.post("/backtests")
@@ -637,7 +672,7 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
                 sc,
                 symbols,
                 # A manually selected pool is an explicit user request for
-                # current baostock data. Named full-market universes remain
+                # current tushare data. Named full-market universes remain
                 # offline-safe unless DATA_MODE=real is enabled.
                 allow_network=payload.universe == "custom",
             )
@@ -1422,7 +1457,7 @@ def paper_automation_run(db: Session = Depends(get_db)) -> Dict[str, Any]:
 def signals(db: Session = Depends(get_db)) -> Dict[str, Any]:
     data = MarketDataService(db)
     catalog = data.stocks()
-    strategy = db.scalar(select(Strategy).where(Strategy.is_default.is_(True)).limit(1))
+    strategy = _default_multifactor_strategy(db)
     ranking = MultiFactorStrategy(FactorEngine(data), _strategy_config(strategy)).generate_weights(
         get_settings().demo_as_of,
         data.analysis_symbols(catalog.symbol.tolist()),
@@ -1430,21 +1465,25 @@ def signals(db: Session = Depends(get_db)) -> Dict[str, Any]:
     return {"items": _records(ranking.head(30)), "as_of": get_settings().demo_as_of.isoformat(), "data_mode": data.mode}
 
 
-@router.get("/analytics/universe")
-def universe_analytics(db: Session = Depends(get_db)) -> Dict[str, Any]:
-    data = MarketDataService(db)
-    catalog = data.stocks()
-    strategy = db.scalar(select(Strategy).where(Strategy.is_default.is_(True)).limit(1))
-    ranking = MultiFactorStrategy(FactorEngine(data), _strategy_config(strategy)).generate_weights(
-        get_settings().demo_as_of,
-        data.analysis_symbols(catalog.symbol.tolist()),
-    ).ranking
+def _analytics_from_ranking(ranking: pd.DataFrame, data_mode: str) -> Dict[str, Any]:
     industry = ranking.groupby("industry").agg(count=("symbol", "count"), avg_score=("score", "mean"), avg_return=("return_12m", "mean")).reset_index().sort_values("count", ascending=False)
     if len(industry) > 12:
         remainder = industry.iloc[12:]["count"].sum()
         industry = pd.concat([industry.iloc[:12], pd.DataFrame([{"industry": "其他", "count": int(remainder), "avg_score": float(ranking.score.mean()), "avg_return": float(ranking.return_12m.mean())}])], ignore_index=True)
     bins = pd.cut(ranking.score, bins=[0, 40, 50, 60, 70, 80, 100], include_lowest=True).value_counts(sort=False)
     return {"industry_distribution": _records(industry), "score_distribution": [{"range": str(key), "count": int(value)} for key, value in bins.items()], "valuation_growth": _records(ranking[["symbol", "name", "industry", "pe", "revenue_growth", "score"]]), "stock_returns": _records(ranking.sort_values("return_12m", ascending=False)[["symbol", "name", "return_12m"]].head(15)), "portfolio_weights": _records(ranking[ranking.target_weight > 0][["symbol", "name", "industry", "target_weight"]])}
+
+
+@router.get("/analytics/universe")
+def universe_analytics(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    data = MarketDataService(db)
+    catalog = data.stocks()
+    strategy = _default_multifactor_strategy(db)
+    ranking = MultiFactorStrategy(FactorEngine(data), _strategy_config(strategy)).generate_weights(
+        get_settings().demo_as_of,
+        data.analysis_symbols(catalog.symbol.tolist()),
+    ).ranking
+    return _analytics_from_ranking(ranking, data.mode)
 
 
 @router.get("/settings/ai")
@@ -1622,22 +1661,36 @@ def sync_data(payload: SyncRequest, db: Session = Depends(get_db)) -> Dict[str, 
 
 @router.post("/data/catalog/sync")
 def sync_catalog(db: Session = Depends(get_db)) -> Dict[str, Any]:
-    """Explicitly refresh the local stock directory from baostock."""
+    """Explicitly refresh the local stock directory from tushare."""
     return MarketDataService(db).sync_akshare_catalog()
 
 
-@router.get("/dashboard")
-def dashboard(db: Session = Depends(get_db)) -> Dict[str, Any]:
-    data = MarketDataService(db)
-    paper = PaperTradingService(db, data)
-    account = paper.snapshot()
-    catalog = data.stocks()
-    # "最新交易信号"应该跟着模拟盘账户当前真正绑定的策略走——之前这里
-    # 一直写死用默认的通用多因子策略打分，如果账户实际绑定的是我们自己
-    # 验证过的真实策略(quant_v3_regression/csi300_*)，会出现"账户持仓是
-    # 真实策略选出来的，但信号列表却是另一个策略(且是Demo数据)算出来的"
-    # 这种自相矛盾的真假数据混杂展示。
-    account_strategy = db.get(Strategy, account.get("strategy_id")) if account.get("strategy_id") else None
+# Dashboard信号栏/analytics面板的计算本身很贵(real模式下即使价格全部
+# 命中缓存，30支股票8年历史的多因子打分实测也要8~18秒，是SQLite读取+
+# pandas计算的真实开销，不是网络也不是缓存没命中——这不是"再多缓存一层
+# 原始数据"能解决的)。前端每30秒自动刷新一次、用户手动刷新浏览器又会
+# 把React Query的内存缓存清空重新付一次这个代价，两者叠加就是"每次都要
+# 重新加载量化数据"这个观感的根因。这里在算好之后短暂缓存60秒——同一个
+# 策略配置60秒内再来请求直接命中，不用重新跑一遍因子引擎；60秒后自然
+# 过期，不会让数据长期显得"卡在过去"（对比每天调仓一次的低频策略，
+# 60秒的陈旧度可以忽略不计）。
+_DASHBOARD_SIGNALS_CACHE: Dict[str, tuple] = {}
+_DASHBOARD_SIGNALS_CACHE_TTL_SECONDS = 60
+
+
+def _dashboard_signals_and_analytics(db: Session, data: MarketDataService, account_strategy: Optional[Strategy]) -> tuple:
+    cache_key = f"{account_strategy.id if account_strategy else 'default'}:{data.mode}"
+    cached = _DASHBOARD_SIGNALS_CACHE.get(cache_key)
+    now = time.monotonic()
+    if cached and cached[0] > now:
+        return cached[1], cached[2], cached[3]
+
+    signals, analytics, failed_symbols = _compute_dashboard_signals_and_analytics(db, data, account_strategy)
+    _DASHBOARD_SIGNALS_CACHE[cache_key] = (now + _DASHBOARD_SIGNALS_CACHE_TTL_SECONDS, signals, analytics, failed_symbols)
+    return signals, analytics, failed_symbols
+
+
+def _compute_dashboard_signals_and_analytics(db: Session, data: MarketDataService, account_strategy: Optional[Strategy]) -> tuple:
     signals: List[Dict[str, Any]] = []
     if account_strategy and (account_strategy.kind in CSI300_STRATEGY_BUILDERS or account_strategy.kind == "quant_v3_regression"):
         if account_strategy.kind in CSI300_STRATEGY_BUILDERS:
@@ -1671,18 +1724,84 @@ def dashboard(db: Session = Depends(get_db)) -> Dict[str, Any]:
             }
             for row in top_ranking.itertuples()
         ]
+        analytics = None
+        return signals, analytics, []
     else:
-        strategy_row = account_strategy or db.scalar(select(Strategy).where(Strategy.is_default.is_(True)).limit(1))
-        strategy_result = MultiFactorStrategy(FactorEngine(data), _strategy_config(strategy_row)).generate_weights(get_settings().demo_as_of, data.universe_symbols("large_cap"))
+        default_strategy_row = _default_multifactor_strategy(db)
+        strategy_row = account_strategy or default_strategy_row
+        # Dashboard信号栏只是个"预览"小部件，不是回测——不能像/api/backtests
+        # 那样老老实实对完整声明的universe(large_cap最多300支)打分，
+        # 那是这次真正的bug根源：real模式下每支都要顺序真实查tushare，
+        # 每次刷新Dashboard都要付一次这个代价。这里和其它展示型端点
+        # (/api/stocks、/api/research/coverage)一样，套上analysis_symbols
+        # 的硬顶(30支)，回测本身(用户主动点"运行回测"、有进度反馈)的
+        # universe口径不受影响。
+        strategy_result = MultiFactorStrategy(FactorEngine(data), _strategy_config(strategy_row)).generate_weights(
+            get_settings().demo_as_of, data.analysis_symbols(data.universe_symbols("large_cap"))
+        )
         signals = _records(strategy_result.ranking.head(8))
+        # "系统状态"下面的行业分布/估值成长这些"analytics"面板，口径是
+        # 平台默认策略(is_default)，跟上面"最新交易信号"的口径(账户实际
+        # 绑定的策略)概念上是两件事——只有账户刚好绑定的就是默认策略时，
+        # 两边其实是同一次计算(同一个strategy_row + analysis_symbols的
+        # 选股集合在这个前提下必然收敛到同一批30支，见service.py里
+        # analysis_symbols的说明)，这时候复用上面已经算好的ranking，不用
+        # 再对同一批股票重新算一遍因子——这曾经是real模式下Dashboard单次
+        # 请求里最大的一块耗时(实测能占到近一半)。账户绑定了别的
+        # multifactor配置时，两边口径确实不同，老老实实分开算，不能为了
+        # 省这点耗时把"账户信号"和"平台参考基准"这两个不同的东西混成一个。
+        analytics = (
+            _analytics_from_ranking(strategy_result.ranking, data.mode)
+            if default_strategy_row and strategy_row.id == default_strategy_row.id
+            else None
+        )
+        return signals, analytics if analytics is not None else universe_analytics(db), list(data.last_price_fetch_failures)
+
+
+@router.get("/dashboard")
+def dashboard(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    data = MarketDataService(db)
+    paper = PaperTradingService(db, data)
+    account = paper.snapshot()
+    catalog = data.stocks()
+    # "最新交易信号"应该跟着模拟盘账户当前真正绑定的策略走——之前这里
+    # 一直写死用默认的通用多因子策略打分，如果账户实际绑定的是我们自己
+    # 验证过的真实策略(quant_v3_regression/csi300_*)，会出现"账户持仓是
+    # 真实策略选出来的，但信号列表却是另一个策略(且是Demo数据)算出来的"
+    # 这种自相矛盾的真假数据混杂展示。
+    account_strategy = db.get(Strategy, account.get("strategy_id")) if account.get("strategy_id") else None
+    signals, analytics, failed_symbols = _dashboard_signals_and_analytics(db, data, account_strategy)
     orders = paper_orders(db)
     latest_run = db.scalar(select(BacktestRun).where(BacktestRun.status == "completed").order_by(BacktestRun.id.desc()).limit(1))
     metrics = {}
     equity = []
     trade_markers = []
+    latest_run_period = None
     if latest_run:
         metric_rows = db.scalars(select(BacktestMetric).where(BacktestMetric.backtest_run_id == latest_run.id)).all()
         metrics = {row.name: row.value for row in metric_rows}
         equity = get_backtest_equity(latest_run.id, db)
         trade_markers = _trade_markers(latest_run.id, db)
-    return {"account": _clean(account), "backtest_metrics": metrics, "equity": equity, "trade_markers": trade_markers, "positions": _clean(account["positions"]), "recent_orders": orders[:8], "signals": signals, "analytics": universe_analytics(db), "data_mode": data.mode, "as_of": get_settings().demo_as_of.isoformat(), "study_period": {"research": ["2018-01-01", "2024-12-31"], "validation": ["2025-01-01", "2025-12-31"], "paper": ["2026-01-01", get_settings().demo_as_of.isoformat()]}}
+        # "策略年化收益"这张卡片展示的是数据库里最近一次跑完的回测的结果
+        # 快照——不是"现在"重新算一遍，也不是"当前信号"对应的区间。用户
+        # 在回测中心换个日期区间/参数再跑一次，两边数字对不上是正常的，
+        # 只是之前前端没有标出这个数字到底是哪个区间跑出来的，看起来像是
+        # "无缘无故不一致"。把区间原样透出，前端标注清楚，不用再靠猜。
+        latest_run_period = {"start_date": latest_run.start_date, "end_date": latest_run.end_date}
+    return {
+        "account": _clean(account), "backtest_metrics": metrics, "equity": equity, "trade_markers": trade_markers,
+        "latest_run_period": _clean(latest_run_period),
+        "positions": _clean(account["positions"]), "recent_orders": orders[:8], "signals": signals,
+        "analytics": analytics, "data_mode": data.mode, "as_of": get_settings().demo_as_of.isoformat(),
+        "study_period": {"research": ["2018-01-01", "2024-12-31"], "validation": ["2025-01-01", "2025-12-31"], "paper": ["2026-01-01", get_settings().demo_as_of.isoformat()]},
+        # ADR-0045：real模式下重试3次仍拿不到真实数据的股票——如实透出，
+        # 不能装作这份信号列表和往常一样完整可信。为空时前端不展示提示。
+        # failed_symbols是_dashboard_signals_and_analytics()计算那一刻
+        # 记录下来的、跟着60秒缓存一起存的快照，不是这次请求自己触发的
+        # （60秒内命中缓存的请求根本没有再调用一次data.prices()）。
+        "data_warnings": (
+            {"failed_symbols": failed_symbols,
+             "message": f"{len(failed_symbols)}支股票行情本次获取失败（已重试3次），信号列表可能不完整"}
+            if failed_symbols else None
+        ),
+    }

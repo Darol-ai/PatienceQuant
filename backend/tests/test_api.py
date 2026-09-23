@@ -18,7 +18,7 @@ def test_health_and_seeded_stocks():
         stocks = client.get("/api/stocks")
         assert stocks.status_code == 200
         # /api/stocks跑因子引擎打分，analysis_symbols()把分析规模封顶在
-        # ANALYSIS_SYMBOL_CAP(30)——real模式下baostock没有批量接口，每支
+        # ANALYSIS_SYMBOL_CAP(30)——real模式下tushare没有批量接口，每支
         # 股票单独发一次网络请求，不封顶的话全市场几千支会顺序请求到
         # 挂起。这个上限不区分demo/real统一生效，所以这里即使是demo的
         # 50支小目录，也会看到30这个数字。

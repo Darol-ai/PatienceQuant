@@ -10,6 +10,8 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
+      TUSHARE_HTTP_URL: ${TUSHARE_HTTP_URL:-https://tuaremax.top}
     volumes:
       # 绑定宿主机目录而不是具名卷：沪深300/30支候选池策略依赖的真实
       # parquet数据和训练好的模型文件(几百MB)不在git里，也不在Docker

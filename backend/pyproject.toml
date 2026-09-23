@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-real-data = ["baostock>=0.8,<1", "akshare>=1.16"]
+real-data = ["tushare==1.4.24", "akshare>=1.16"]
 dev = [
   "pytest>=8.3,<9",
   "pytest-cov>=6,<7",

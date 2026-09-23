@@ -71,7 +71,29 @@ export function BacktestCenter() {
     commission: 0.001,
     slippage: 0.0005,
   })
-  const [result, setResult] = useState<any>(null)
+  // 回测结果之前只存在组件内存里(useState)——切一次页面/刷新一次浏览器
+  // 就没了，用户跑完一次回测想回来看结果得重新点一次运行。POST /backtests
+  // 的返回shape(selected_stocks/trades/equity等)没有对应的单个GET端点能
+  // 完整重建，最小代价的修法是把上一次成功的结果原样存进localStorage，
+  // 下次打开这个页面时直接读回来——不是"服务端真的记得这次回测"，只是
+  // "这个浏览器记得你上次看到的结果"，刷新/换标签页都能找回来。
+  const [result, setResultState] = useState<any>(() => {
+    try {
+      const cached = localStorage.getItem('lastBacktestResult')
+      return cached ? JSON.parse(cached) : null
+    } catch {
+      return null
+    }
+  })
+  const setResult = (data: any) => {
+    setResultState(data)
+    try {
+      localStorage.setItem('lastBacktestResult', JSON.stringify(data))
+    } catch {
+      // localStorage满了/被禁用——结果还是能在当前会话里正常看到，
+      // 只是刷新后找不回来，不是什么值得中断操作的错误。
+    }
+  }
   const [selectedSymbol, setSelectedSymbol] = useState('')
   const [stockSearch, setStockSearch] = useState('')
   const [stockGroup, setStockGroup] = useState('')
@@ -82,7 +104,7 @@ export function BacktestCenter() {
   const [syncMessage, setSyncMessage] = useState('')
   const [showAllCharts, setShowAllCharts] = useState(false)
   const [selectedStocks, setSelectedStocks] = useState<Record<string, StockOption>>({})
-  const [directoryMode, setDirectoryMode] = useState<'auto' | 'local' | 'baostock'>('auto')
+  const [directoryMode, setDirectoryMode] = useState<'auto' | 'local' | 'tushare'>('auto')
   const [debouncedStockSearch, setDebouncedStockSearch] = useState('')
   const [paperMessage, setPaperMessage] = useState('')
 
@@ -137,8 +159,8 @@ export function BacktestCenter() {
   const stocks: StockOption[] = stockSearchData?.items || []
   const filteredStocks = stocks
   const directorySource =
-    stockSearchData?.source === 'baostock'
-      ? '真实股票目录（baostock，可缓存到本地）'
+    stockSearchData?.source === 'tushare'
+      ? '真实股票目录（tushare，可缓存到本地）'
       : stockSearchData?.source === 'local_cache'
         ? '本地缓存目录'
         : '本地 Demo 目录；搜不到时自动回退真实目录'
@@ -571,8 +593,8 @@ export function BacktestCenter() {
                     本地 Demo
                   </button>
                   <button
-                    className={directoryMode === 'baostock' ? 'active' : ''}
-                    onClick={() => setDirectoryMode('baostock')}
+                    className={directoryMode === 'tushare' ? 'active' : ''}
+                    onClick={() => setDirectoryMode('tushare')}
                   >
                     真实目录
                   </button>
@@ -654,7 +676,7 @@ export function BacktestCenter() {
                         <span className="stock-picker-tags">
                           <small>{stock.group}</small>
                           <small>{stock.industry}</small>
-                          {stock.source && <small>{stock.source === 'baostock' ? '真实' : 'Demo'}</small>}
+                          {stock.source && <small>{stock.source === 'tushare' ? '真实' : 'Demo'}</small>}
                         </span>
                       </button>
                     )
