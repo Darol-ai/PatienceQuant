@@ -111,6 +111,30 @@ BUILTIN_STRATEGIES: List[dict] = [
     {"kind": "pb_ideal_amplitude", "name": "理想振幅因子选股",
      "description": "按理想振幅因子（高价日振幅−低价日振幅，λ=20%）从低到高选前30名等权，每月调仓（开源证券2020）。" + _PLAYBOOK,
      "spec": {"scorer": {"type": "factor_weights", "weights": {"ideal_amplitude": 1.0}}, "selection": {"type": "top_n", "n": 30}}},
+    # ---- 第二批（ADR-0052 第三步）：择时统一配"集成模型选前10%等权、每月选股"，因子统一"前30名等权、每月调仓"，
+    # 组合方式事先定好，不按回测结果挑 ----
+    *[{"kind": f"pb_ens_{timing}", "name": f"集成模型 + {name}",
+       "description": f"沪深300集成模型选前10%等权，整体仓位由{name}决定（{detail}）。" + _WEEKLY_NOTE + _PLAYBOOK,
+       "spec": {"scorer": _ENSEMBLE, "timing": {"type": timing}, "selection": {"type": "top_pct", "pct": 0.1},
+                "rebalance": {"frequency": "monthly"}}}
+      for timing, name, detail in [
+          ("llt", "LLT趋势线择时", "广发证券2017：低延迟趋势线 d=30，LLT 上行时满仓、下行时空仓"),
+          ("ma_channel", "均线交叉通道突破择时", "申万宏源2018：SMA 9/18，近3天金叉且收盘创3日新高开仓，近3天死叉平仓"),
+          ("one_way_vol", "单向波动差择时", "国信证券2015：日内上行波动减下行波动的60日均值为正时满仓"),
+          ("rps_vol", "RPS单向波动差择时", "国信证券2015：结合相对强弱RPS，窗口13是原作者样本内搜出的参数，可能偏乐观"),
+          ("high_moment", "高阶矩择时", "广发证券2015：20日收益5阶矩的90日EMA上升时满仓"),
+          ("volume_resonance", "价量共振择时", "华创证券2019：价能×量能，多头市场阈值1.125、空头市场1.275"),
+          ("qrs", "QRS择时", "中金公司2021：RSRS标准分×R²，高于0.7满仓、跌破−0.7空仓"),
+      ]],
+    *[{"kind": f"pb_{key}", "name": name,
+       "description": detail + "，选前30名等权，每月调仓。" + _PLAYBOOK,
+       "spec": {"scorer": {"type": "factor_weights", "weights": {key: 1.0}}, "selection": {"type": "top_n", "n": 30}}}
+      for key, name, detail in [
+          ("salience_str", "凸显理论STR因子选股", "按STR因子从低到高（招商证券2022：凸显度加权收益协方差，越高越容易回落）"),
+          ("terrified_score", "惊恐度因子选股", "按惊恐度因子从低到高（方正证券2022：相对沪深300的惊恐度加权收益；研报用中证全指）"),
+          ("apb_20d", "买卖压力APB因子选股", "按均价偏差APB从高到低（东方证券2019：20日vwap算术平均相对成交量加权平均的对数，"
+                                          "越高买压越大；研报的日度版需要30分钟K线，这里用月度版）"),
+      ]],
 ]
 
 
@@ -229,7 +253,7 @@ class IndexMembership:
             self.sets.append({code.split(".")[0] for code in group["con_code"]})
 
     def at(self, day: date) -> set:
-        # 快照从 2016-01-29 开始；更早的日子只能用第一份（最多早一个月），不外推
+        # 快照从 2010 年初开始；更早的日子只能用第一份（最多早一个月），不外推
         index = max(0, bisect.bisect_right(self.dates, day) - 1)
         return self.sets[index]
 
@@ -276,7 +300,7 @@ def broad30_symbols() -> List[str]:
 
 FIXED_UNIVERSES = {
     "csi300": ("沪深300成分股", csi300_symbols,
-               "每个调仓日只用当时真实在指数里的成分股（历史成分股，2016 年起）"),
+               "每个调仓日只用当时真实在指数里的成分股（历史成分股，2010 年起）"),
     "broad30": ("30支跨行业候选池", broad30_symbols,
                 "研究阶段手工挑选的 30 支跨行业股票；名单是事后挑的，早年回测同样可能偏乐观"),
 }

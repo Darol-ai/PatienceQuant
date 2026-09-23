@@ -71,7 +71,10 @@ export function StrategyEditor() {
         return (await api.post('/strategies/model', { name: draft.name, description: draft.description,
           default_universe: draft.default_universe, training, spec: rest })).data
       }
-      return (await api.post('/strategies/spec', draft)).data
+      const cleaned = scorer.type === 'factor_weights'
+        ? { ...draft, spec: { ...draft.spec, scorer: { ...scorer, weights: Object.fromEntries(Object.entries(scorer.weights).filter(([, w]) => Number(w) > 0)) } } }
+        : draft
+      return (await api.post('/strategies/spec', cleaned)).data
     },
     onSuccess: data => {
       queryClient.invalidateQueries({ queryKey: ['strategies'] })
@@ -124,13 +127,23 @@ export function StrategyEditor() {
               <option value="factor_weights">因子权重</option><option value="model">模型预测</option>
             </select>} />
           {spec.scorer.type === 'factor_weights' ? <div className="weight-editor">
-            {options.factors.map((f: any) => <div className="weight-row" key={f.key}>
+            {options.factors.filter((f: any) => f.kind !== 'library' || f.key in weights).map((f: any) => <div className="weight-row" key={f.key}>
               <div className="weight-label"><span className={`weight-icon ${f.key}`}><SlidersHorizontal size={14}/></span><b>{f.label}</b><small>{f.available ? f.description : `${f.description} · ${f.unavailable_reason}`}</small></div>
               <input type="range" min="0" max="100" step="5" disabled={!f.available && !Number(weights[f.key] || 0)} value={Math.round(Number(weights[f.key] || 0) * 100)}
                 onChange={e => setSpec({ scorer: { type: 'factor_weights', weights: { ...weights, [f.key]: Number(e.target.value) / 100 } } })}/>
               <strong>{Math.round(Number(weights[f.key] || 0) * 100)}%</strong>
             </div>)}
-            <p className="muted-note">权重会按合计自动归一（当前合计 {Math.round(weightTotal * 100)}%）。每个因子先换成股票池内的百分位，再按权重加总。</p>
+            <label className="add-factor">从因子库添加单个因子
+              <select value="" onChange={e => e.target.value && setSpec({ scorer: { type: 'factor_weights', weights: { ...weights, [e.target.value]: 0.5 } } })}>
+                <option value="">选择因子…</option>
+                {Object.entries(options.factors.filter((f: any) => f.kind === 'library' && !(f.key in weights))
+                  .reduce((acc: Record<string, any[]>, f: any) => ((acc[f.group] ||= []).push(f), acc), {}))
+                  .map(([group, list]: [string, any]) => <optgroup key={group} label={group}>
+                    {list.map((f: any) => <option key={f.key} value={f.key}>{f.label}</option>)}
+                  </optgroup>)}
+              </select>
+            </label>
+            <p className="muted-note">权重会按合计自动归一（当前合计 {Math.round(weightTotal * 100)}%）。每个因子先换成股票池内的百分位，再按权重加总；拉到 0% 的单个因子保存时自动去掉。</p>
             {unavailableUsed.length > 0 && <p className="muted-note warn">当前是真实行情模式，{unavailableUsed.map((f: any) => f.label).join('、')} 没有真实数据，回测时按 0 权重计算。</p>}
           </div> : reuseModels ? <div className="model-pick">
             <div className="strategy-note"><div>

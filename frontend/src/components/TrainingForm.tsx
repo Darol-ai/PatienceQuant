@@ -90,6 +90,6 @@ export function TrainingForm({ value, onChange, options, strategies, pools }: {
       <label className="checkbox-row full"><span>因子先换成当天在股票池里的百分位（默认用原始值，和旧模型一致）</span>
         <input type="checkbox" checked={value.cs_rank} onChange={e => set({ cs_rank: e.target.checked })}/></label>
     </div>
-    <p className="muted-note">滚动训练规则固定：给第 Y 年打分的模型，只用 Y−1 年 6 月底前已揭晓的样本训练、Y−1 年下半年的样本做验证，在第 Y 年上预测；数据从 2016 年开始，最早能给 2019 年打分。保存后在后台训练，训练好会自动算成绩卡。</p>
+    <p className="muted-note">滚动训练规则固定：给第 Y 年打分的模型，只用 Y−1 年 6 月底前已揭晓的样本训练、Y−1 年下半年的样本做验证，在第 Y 年上预测；数据从 2010 年开始，最早能给 2012 年打分。保存后在后台训练，训练好会自动算成绩卡。</p>
   </div>
 }

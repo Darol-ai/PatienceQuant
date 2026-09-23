@@ -55,15 +55,20 @@ class FactorWeightScorer(Scorer):
     """每个因子（组）在股票池里的百分位排名（0～100）按权重加总。
 
     权重的键可以是五个因子组（FactorEngine 的 fundamental/valuation/quality/
-    momentum/risk），也可以是 price_factors 里的单个价量因子。
+    momentum/risk）、price_factors 里的单个价量因子，也可以是因子库里任何只用
+    日线的因子（整段区间用面板函数一次算好，和模型训练同一套代码）。
     """
 
     warmup_days = 260
 
-    def __init__(self, spec: FactorWeightScorerSpec, data: MarketDataService):
+    def __init__(self, spec: FactorWeightScorerSpec, data: MarketDataService, store: Optional[AShareMarketStore] = None):
+        from app.pipeline.factor_library import FACTOR_LIBRARY, trainable
+
         self.data = data
+        self.store = store
         self.engine = FactorEngine(data)
-        unknown = [k for k in spec.weights if k not in GROUP_FACTORS and k not in PRICE_FACTORS]
+        library_keys = {k for k in FACTOR_LIBRARY if trainable(k) and k not in PRICE_FACTORS and k not in GROUP_FACTORS}
+        unknown = [k for k in spec.weights if k not in GROUP_FACTORS and k not in PRICE_FACTORS and k not in library_keys]
         if unknown:
             raise ValueError("未知的因子：%s" % "、".join(unknown))
         self.requested = {k: float(v) for k, v in spec.weights.items() if float(v) > 0}
@@ -75,7 +80,11 @@ class FactorWeightScorer(Scorer):
             raise ValueError("真实模式下没有可用的因子：%s 需要财务数据，本地行情库还没有" % "、".join(self.dropped))
         self.group_weights = {k: v for k, v in self.effective.items() if k in GROUP_FACTORS}
         self.price_weights = {k: v for k, v in self.effective.items() if k in PRICE_FACTORS}
+        self.library_weights = {k: v for k, v in self.effective.items() if k in library_keys}
+        if self.library_weights:
+            self.warmup_days = 300  # 一年期因子（如 12 个月收益）要约 252 个交易日
         self._panel: Dict[str, pd.DataFrame] = {}
+        self._library_values: Dict[str, pd.DataFrame] = {}
 
     def prepare(self, symbols: List[str], start: date, end: date) -> None:
         warm = warmup_start(start, self.warmup_days)
@@ -87,6 +96,32 @@ class FactorWeightScorer(Scorer):
                 column: frame.pivot_table(index="trade_date", columns="symbol", values=column, aggfunc="last").sort_index()
                 for column in ("open", "high", "low", "close")
             }
+        if self.library_weights:
+            self._prepare_library(symbols, start, end)
+
+    def _prepare_library(self, symbols: List[str], start: date, end: date) -> None:
+        from app.data.market_refresh import BENCHMARK_INDEX, get_market_store
+        from app.pipeline.factor_library import compute_factors, panels_from_store
+
+        store = self.store or get_market_store()
+        warm = warmup_start(start, self.warmup_days)
+        bench = store.load_index(BENCHMARK_INDEX, warm, end)
+        bench_series = pd.Series(bench["close"].to_numpy(dtype=float), index=pd.to_datetime(bench["trade_date"])) if not bench.empty else None
+        panels = panels_from_store(store, symbols, warm, end, benchmark=bench_series)
+        self._library_values = compute_factors(panels, list(self.library_weights))
+
+    def _library_factor_scores(self, as_of: date, symbols: List[str]) -> pd.DataFrame:
+        from app.pipeline.factor_library import FACTOR_LIBRARY
+
+        result = pd.DataFrame(index=pd.Index(symbols, name="symbol"))
+        day = pd.Timestamp(as_of)
+        for key in self.library_weights:
+            values = self._library_values.get(key)
+            raw = values.loc[day].reindex(symbols) if values is not None and day in values.index else pd.Series(np.nan, index=symbols)
+            raw = raw.replace([np.inf, -np.inf], np.nan)
+            result["factor_" + key] = raw
+            result["score_" + key] = raw.rank(pct=True, ascending=FACTOR_LIBRARY[key].direction > 0) * 100
+        return result
 
     def _price_factor_scores(self, as_of: date, symbols: List[str]) -> pd.DataFrame:
         cut = {k: v.loc[: pd.Timestamp(as_of)].reindex(columns=symbols) for k, v in self._panel.items()}
@@ -121,6 +156,13 @@ class FactorWeightScorer(Scorer):
             detail = detail.join(price_detail.drop(columns=[c for c in price_detail.columns if c in detail.columns]), how="outer")
             for key, weight in self.price_weights.items():
                 parts.append((weight, price_detail["score_" + key]))
+        if self.library_weights:
+            if not self._library_values:
+                self._prepare_library(symbols, as_of, as_of)
+            library_detail = self._library_factor_scores(as_of, symbols)
+            detail = detail.join(library_detail.drop(columns=[c for c in library_detail.columns if c in detail.columns]), how="outer")
+            for key, weight in self.library_weights.items():
+                parts.append((weight, library_detail["score_" + key]))
         if "name" not in detail.columns:
             catalog = self.data.stocks()
             if not catalog.empty:
@@ -209,7 +251,7 @@ class ModelScorer(Scorer):
 
 def build_scorer(spec, data: MarketDataService, store: AShareMarketStore) -> Scorer:
     if isinstance(spec, FactorWeightScorerSpec):
-        return FactorWeightScorer(spec, data)
+        return FactorWeightScorer(spec, data, store)
     if isinstance(spec, ModelScorerSpec):
         return ModelScorer(spec, store)
     raise ValueError(f"未知的打分方式：{spec}")

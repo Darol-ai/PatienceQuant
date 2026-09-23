@@ -68,7 +68,61 @@ class AlligatorTimingSpec(BaseModel):
     type: Literal["alligator"] = "alligator"
 
 
-TimingSpec = Union[NoTimingSpec, IndexTrendTimingSpec, RsrsTimingSpec, IcuMaTimingSpec, AlligatorTimingSpec]
+class LltTimingSpec(BaseModel):
+    """低延迟趋势线 LLT（广发证券 2017）：LLT 上行时满仓。"""
+
+    type: Literal["llt"] = "llt"
+    d: int = Field(30, ge=5, le=120)
+
+
+class MaChannelTimingSpec(BaseModel):
+    """均线交叉结合通道突破（申万宏源 2018）。"""
+
+    type: Literal["ma_channel"] = "ma_channel"
+    short: int = Field(9, ge=2, le=60)
+    long: int = Field(18, ge=5, le=250)
+    n: int = Field(3, ge=1, le=20)
+
+
+class OneWayVolTimingSpec(BaseModel):
+    """单向波动差（国信证券 2015）。"""
+
+    type: Literal["one_way_vol"] = "one_way_vol"
+    window: int = Field(60, ge=5, le=250)
+
+
+class RpsVolTimingSpec(BaseModel):
+    """相对强弱 RPS 下的单向波动差（国信证券 2015）。"""
+
+    type: Literal["rps_vol"] = "rps_vol"
+    period: int = Field(13, ge=2, le=60)
+
+
+class HighMomentTimingSpec(BaseModel):
+    """指数高阶矩（广发证券 2015）：5 阶矩的 EMA 上升时满仓。"""
+
+    type: Literal["high_moment"] = "high_moment"
+    ema: int = Field(90, ge=10, le=250)
+
+
+class VolumeResonanceTimingSpec(BaseModel):
+    """价量共振（华创证券 2019），参数同研报。"""
+
+    type: Literal["volume_resonance"] = "volume_resonance"
+
+
+class QrsTimingSpec(BaseModel):
+    """QRS（中金公司 2021）：RSRS 标准分 × R²。"""
+
+    type: Literal["qrs"] = "qrs"
+    n: int = Field(18, ge=5, le=60)
+    m: int = Field(600, ge=100, le=1200)
+    threshold: float = Field(0.7, gt=0, le=3)
+
+
+TimingSpec = Union[NoTimingSpec, IndexTrendTimingSpec, RsrsTimingSpec, IcuMaTimingSpec, AlligatorTimingSpec,
+                   LltTimingSpec, MaChannelTimingSpec, OneWayVolTimingSpec, RpsVolTimingSpec, HighMomentTimingSpec,
+                   VolumeResonanceTimingSpec, QrsTimingSpec]
 
 
 class SelectionSpec(BaseModel):

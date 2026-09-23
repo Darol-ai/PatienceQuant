@@ -15,6 +15,17 @@ from app.pipeline.bars import warmup_start
 from app.pipeline import index_signals
 from app.pipeline.spec import AlligatorTimingSpec, IcuMaTimingSpec, IndexTrendTimingSpec, NoTimingSpec, RsrsTimingSpec
 
+# 第二批择时信号（ADR-0052 第三步）：类型 → (状态函数, 显示名)，规格里除 type 外的字段原样作为参数
+_STATE_SIGNALS = {
+    "llt": (index_signals.llt_state, "LLT 趋势线择时"),
+    "ma_channel": (index_signals.ma_channel_state, "均线交叉通道突破择时"),
+    "one_way_vol": (index_signals.one_way_vol_state, "单向波动差择时"),
+    "rps_vol": (index_signals.rps_vol_state, "RPS 单向波动差择时"),
+    "high_moment": (index_signals.high_moment_state, "高阶矩择时"),
+    "volume_resonance": (index_signals.volume_resonance_state, "价量共振择时"),
+    "qrs": (index_signals.qrs_state, "QRS 择时"),
+}
+
 
 @dataclass
 class TimingResult:
@@ -115,4 +126,8 @@ def build_timing(spec, data: MarketDataService) -> TimingSignal:
         return IndexStateTiming("icu_ma", lambda o: index_signals.icu_ma_state(o, spec.n), "ICU 均线择时")
     if isinstance(spec, AlligatorTimingSpec):
         return IndexStateTiming("alligator", index_signals.alligator_state, "鳄鱼线择时")
+    if getattr(spec, "type", None) in _STATE_SIGNALS:
+        compute, label = _STATE_SIGNALS[spec.type]
+        params = spec.model_dump(exclude={"type"})
+        return IndexStateTiming(spec.type, lambda o: compute(o, **params), label)
     raise ValueError(f"未知的择时信号：{spec}")

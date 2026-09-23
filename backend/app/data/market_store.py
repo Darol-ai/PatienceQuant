@@ -25,7 +25,8 @@ import pandas as pd
 from app.data.tushare_client import TushareQueryFailed, run as run_tushare
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[2] / "data" / "market"
-STORE_START = date(2016, 1, 1)
+# 2010 年起：2016 年起的数据只够给 2019 年的模型约两年训练样本（ADR-0052 第二步结果）
+STORE_START = date(2010, 1, 1)
 INDEX_START = date(2005, 1, 1)
 DAILY_COLUMNS = ["ts_code", "trade_date", "open", "high", "low", "close", "vol", "amount", "adj_factor"]
 _FLUSH_EVERY_DAYS = 20
@@ -62,7 +63,8 @@ class AShareMarketStore:
         """[start, until] 内的开市日。本地日历覆盖不到 until 时，拉到当年年底并保存。"""
         path = self._calendar_path()
         cal = pd.read_parquet(path) if path.exists() else pd.DataFrame(columns=["cal_date", "is_open"])
-        if cal.empty or pd.to_datetime(cal["cal_date"]).max().date() < until:
+        cal_dates = pd.to_datetime(cal["cal_date"]).dt.date if not cal.empty else None
+        if cal.empty or cal_dates.max() < until or cal_dates.min() > self.start:
             year_end = date(until.year, 12, 31)
             fetched = self.runner(lambda pro: pro.trade_cal(exchange="SSE", start_date=_compact(self.start), end_date=_compact(year_end)))
             cal = fetched[["cal_date", "is_open"]].copy()
@@ -242,14 +244,18 @@ class AShareMarketStore:
         until = until or self.latest_trading_day()
         path = self._members_path(index_code)
         existing = pd.read_parquet(path) if path.exists() else pd.DataFrame(columns=["con_code", "trade_date", "weight"])
-        begin = self.start if existing.empty else existing["trade_date"].max().date() + timedelta(days=1)
+        # 要补的区间：库里最早一份之前（起点提前时）和最新一份之后
+        ranges = [(self.start, until)] if existing.empty else [
+            (self.start, existing["trade_date"].min().date() - timedelta(days=1)),
+            (existing["trade_date"].max().date() + timedelta(days=1), until)]
         frames = []
-        while begin <= until:
-            end = min(date(begin.year, 6, 30) if begin.month <= 6 else date(begin.year, 12, 31), until)
-            part = self.runner(lambda pro, b=begin, e=end: pro.index_weight(index_code=index_code, start_date=_compact(b), end_date=_compact(e)))
-            if part is not None and not part.empty:
-                frames.append(part[["con_code", "trade_date", "weight"]])
-            begin = end + timedelta(days=1)
+        for begin, stop in ranges:
+            while begin <= stop:
+                end = min(date(begin.year, 6, 30) if begin.month <= 6 else date(begin.year, 12, 31), stop)
+                part = self.runner(lambda pro, b=begin, e=end: pro.index_weight(index_code=index_code, start_date=_compact(b), end_date=_compact(e)))
+                if part is not None and not part.empty:
+                    frames.append(part[["con_code", "trade_date", "weight"]])
+                begin = end + timedelta(days=1)
         if not frames:
             return 0
         fetched = pd.concat(frames, ignore_index=True)

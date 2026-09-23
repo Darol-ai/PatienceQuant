@@ -17,7 +17,7 @@ from typing import Callable, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from app.pipeline import price_factors
+from app.pipeline import playbook_factors, price_factors
 
 Panels = Dict[str, pd.DataFrame]  # open/high/low/close/volume/amount/suspended/bars/benchmark
 
@@ -52,9 +52,13 @@ def panels_from_store(store, symbols: List[str], start: date, end: date, benchma
         return {k: empty.copy() for k in ("open", "high", "low", "close", "volume", "amount", "suspended", "bars")}
     daily = daily.assign(symbol=daily["ts_code"].map(code_to_symbol))
     wide = {col: daily.pivot_table(index="trade_date", columns="symbol", values=col, aggfunc="last").reindex(calendar)
-            for col in ("open", "high", "low", "close", "vol", "amount")}
-    return _finish_panels(wide["open"], wide["high"], wide["low"], wide["close"], wide["vol"] * 100, wide["amount"] * 1000,
-                          traded=wide["close"].notna(), benchmark=benchmark)
+            for col in ("open", "high", "low", "close", "vol", "amount", "adj_factor")}
+    panels = _finish_panels(wide["open"], wide["high"], wide["low"], wide["close"], wide["vol"] * 100, wide["amount"] * 1000,
+                            traded=wide["close"].notna(), benchmark=benchmark)
+    # 前复权比例（当天复权因子 / 区间最后一天的），给需要复权成交量、vwap 的因子用
+    adj = wide["adj_factor"].ffill()
+    panels["adj_ratio"] = (adj / adj.iloc[-1]).where(panels["close"].notna())
+    return panels
 
 
 def panels_from_history(history: pd.DataFrame) -> Panels:
@@ -220,6 +224,12 @@ FACTOR_LIBRARY: Dict[str, Factor] = {f.key: f for f in [
            compute=_single_day(price_factors.ubl, 30)),
     Factor("ideal_amplitude", "理想振幅", "形态", -1, price_factors.PRICE_FACTORS["ideal_amplitude"].description,
            compute=_single_day(price_factors.ideal_amplitude, 25)),
+    Factor("salience_str", "凸显理论 STR", "行为金融", -1,
+           "近 20 天按凸显度加权的收益协方差，越高越容易回落（招商证券 2022）", compute=playbook_factors.salience_str),
+    Factor("terrified_score", "惊恐度", "行为金融", -1,
+           "近 20 天相对沪深300 的惊恐度加权收益（均值与波动的平均），越低越好（方正证券 2022）", compute=playbook_factors.terrified_score),
+    Factor("apb_20d", "买卖压力 APB", "量价", 1,
+           "近 20 天 vwap 算术平均相对成交量加权平均的对数偏差，越高买压越大（东方证券 2019）", compute=playbook_factors.apb),
     *[Factor(key, label, group, direction, description, requires="financial") for key, label, group, direction, description in [
         ("roe", "ROE", "基本面组", 1, "净资产收益率"), ("roa", "ROA", "基本面组", 1, "总资产收益率"),
         ("revenue_growth", "营收增长", "基本面组", 1, "营业收入同比增长"), ("profit_growth", "利润增长", "基本面组", 1, "净利润同比增长"),

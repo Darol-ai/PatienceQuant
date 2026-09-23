@@ -37,7 +37,7 @@ export function DataModels() {
   return <>
     <PageHeader eyebrow="DATA & MODELS" title="数据与模型" description="本地行情库是系统里行情数据的唯一来源：回测、模拟盘、打分、模型都只读它；数据源只在补齐时调用。" />
     <Card>
-      <PanelHeader title="本地行情库" subtitle="A 股日线（2016 年起，含复权因子）与沪深300 指数（2005 年起）" action={<Database size={16}/>} />
+      <PanelHeader title="本地行情库" subtitle="A 股日线（2010 年起，含复权因子）、沪深300 指数（2005 年起）与历史成分股（2010 年起）" action={<Database size={16}/>} />
       <div className="account-info">
         <div><span>行情截至</span><b>{market?.latest_stored || '—'}</b></div>
         <div><span>最近交易日</span><b>{market?.latest_trading_day || '—'}</b></div>

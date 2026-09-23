@@ -252,3 +252,5 @@ nav { display: grid; gap: 5px; }.nav-item { display: flex; align-items: center; 
 .model-status.failed, .model-status.cancelled { color: #fb7185; background: rgba(251,113,133,.12); }
 @media (max-width: 720px) { .training-factors-head select { max-width: 100%; } }
 .clickable-row { cursor: pointer; }.clickable-row:hover td { background: var(--hover-wash); }
+.add-factor { display: grid; gap: 6px; color: var(--text-muted); font-size: 10px; max-width: 320px; }
+.add-factor select, .training-factors-head select { min-height: 34px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-soft); color: var(--text); padding: 0 10px; outline: none; font-size: 11px; }

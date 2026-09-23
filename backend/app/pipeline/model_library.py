@@ -203,5 +203,5 @@ def all_models() -> List[dict]:
                     "status": record.get("status"), "progress": record.get("progress"), "error": record.get("error"),
                     "years": model_years(record["id"]) if record.get("status") == "ready" else [],
                     "metrics": record.get("metrics"), "config": config, "created_at": record.get("created_at"),
-                    "finished_at": record.get("finished_at"), "data": "本地行情库（2016 年起）"})
+                    "finished_at": record.get("finished_at"), "data": f"本地行情库（{str(record.get('data_start') or '2016')[:4]} 年起）"})
     return out

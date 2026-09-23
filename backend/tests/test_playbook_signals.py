@@ -89,3 +89,82 @@ def test_new_timing_specs_validate():
         spec = StrategySpec.model_validate({"scorer": {"type": "factor_weights", "weights": {"ubl": 1}},
                                             "timing": timing, "selection": {"type": "top_n", "n": 30}})
         assert spec.timing.type == timing["type"]
+
+
+# ---- 第二批（ADR-0052 第三步）----
+
+def _random_ohlcv(days=900, seed=1):
+    rng = np.random.default_rng(seed)
+    close = pd.Series(100 * np.exp(np.cumsum(rng.normal(0, 0.012, days))), index=pd.bdate_range("2015-01-01", periods=days))
+    open_ = close.shift(1).fillna(close) * (1 + rng.normal(0, 0.003, days))
+    high = np.maximum(open_, close) * (1 + rng.uniform(0, 0.01, days))
+    low = np.minimum(open_, close) * (1 - rng.uniform(0, 0.01, days))
+    return pd.DataFrame({"open": open_, "high": high, "low": low, "close": close, "vol": rng.uniform(1e8, 3e8, days)})
+
+
+SECOND_BATCH = {
+    "llt": sig.llt_state, "ma_channel": sig.ma_channel_state, "one_way_vol": sig.one_way_vol_state,
+    "rps_vol": sig.rps_vol_state, "high_moment": sig.high_moment_state,
+    "volume_resonance": sig.volume_resonance_state, "qrs": lambda o: sig.qrs_state(o, m=200),
+}
+
+
+@pytest.mark.parametrize("name", list(SECOND_BATCH))
+def test_second_batch_signals_use_only_past_data(name):
+    frame = _random_ohlcv()
+    full = SECOND_BATCH[name](frame)
+    cut = SECOND_BATCH[name](frame.iloc[:600])
+    pd.testing.assert_series_equal(full.iloc[:600], cut, check_names=False)
+    assert set(full.unique()) <= {0.0, 1.0}
+    assert 0 < full.iloc[300:].mean() < 1, "信号在随机行情上应当有时持有有时空仓"
+
+
+def test_llt_tracks_a_straight_line_without_lag():
+    close = pd.Series(np.arange(100, 200, dtype=float), index=pd.bdate_range("2020-01-01", periods=100))
+    # 二阶滤波对线性趋势没有滞后：前两天取收盘价，之后仍在这条直线上
+    np.testing.assert_allclose(sig.llt(close, 2 / 31).to_numpy(), close.to_numpy())
+    assert sig.llt_state(pd.DataFrame({"close": close})).iloc[2:].eq(1).all()
+
+
+def test_second_batch_timing_specs_validate_and_build():
+    from app.pipeline.timing import _STATE_SIGNALS, build_timing
+
+    for timing in SECOND_BATCH:
+        spec = StrategySpec.model_validate({"scorer": {"type": "factor_weights", "weights": {"ubl": 1}},
+                                            "timing": {"type": timing}, "selection": {"type": "top_n", "n": 30}})
+        assert spec.timing.type == timing and timing in _STATE_SIGNALS
+        assert build_timing(spec.timing, None).name == timing
+
+
+def _panels(days=120, stocks=12, seed=2):
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range("2021-01-01", periods=days)
+    cols = [f"S{i:02d}" for i in range(stocks)]
+    close = pd.DataFrame(10 * np.exp(np.cumsum(rng.normal(0, 0.02, (days, stocks)), axis=0)), index=idx, columns=cols)
+    volume = pd.DataFrame(rng.uniform(1e6, 5e6, (days, stocks)), index=idx, columns=cols)
+    vwap = close * (1 + rng.normal(0, 0.003, (days, stocks)))
+    return {"close": close, "open": close, "high": close * 1.01, "low": close * 0.99, "volume": volume,
+            "amount": vwap * volume, "suspended": close * 0, "benchmark": close.mean(axis=1),
+            "adj_ratio": close * 0 + 1}
+
+
+@pytest.mark.parametrize("key", ["salience_str", "terrified_score", "apb_20d"])
+def test_playbook_factors_use_only_past_data(key):
+    from app.pipeline.factor_library import FACTOR_LIBRARY
+
+    panels = _panels()
+    full = FACTOR_LIBRARY[key].compute(panels)
+    cut = FACTOR_LIBRARY[key].compute({k: v.iloc[:80] for k, v in panels.items()})
+    pd.testing.assert_frame_equal(full.iloc[:80], cut)
+    assert full.iloc[30:].notna().all().all()
+
+
+def test_apb_sign_follows_where_volume_trades():
+    from app.pipeline.playbook_factors import apb
+
+    idx = pd.bdate_range("2021-01-01", periods=20)
+    price = pd.DataFrame({"A": np.linspace(10, 12, 20), "B": np.linspace(10, 12, 20)}, index=idx)
+    # A 在低价位放量（买压）→ APB > 0；B 在高价位放量（卖压）→ APB < 0
+    volume = pd.DataFrame({"A": np.linspace(5, 1, 20), "B": np.linspace(1, 5, 20)}, index=idx) * 1e6
+    last = apb({"close": price, "volume": volume, "amount": price * volume}).iloc[-1]
+    assert last["A"] > 0 > last["B"]

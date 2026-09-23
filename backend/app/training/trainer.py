@@ -19,11 +19,13 @@ import pandas as pd
 
 import os
 
+from app.data.market_store import STORE_START
+
 # 训练出的模型放在 data/models/<id>/；测试时用 PATIENCEQUANT_MODELS_DIR 指到临时目录
 MODELS_ROOT = Path(os.environ.get("PATIENCEQUANT_MODELS_DIR") or Path(__file__).resolve().parents[2] / "data" / "models")
 SEEDS = [42, 7, 123, 2024, 999]  # 与旧模型相同的种子顺序
-FIRST_TEST_YEAR = 2019
-DATA_START = date(2016, 1, 1)
+FIRST_TEST_YEAR = 2012  # 数据 2010 年起；训练样本不足 1000 条的年份自动跳过
+DATA_START = STORE_START
 
 
 @dataclass
@@ -63,7 +65,7 @@ class TrainingConfig:
     def fingerprint(self) -> str:
         payload = asdict(self)
         payload["factors"] = sorted(payload["factors"])
-        payload["data"] = "store-2016"
+        payload["data"] = f"store-{DATA_START.year}"
         return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:12]
 
 

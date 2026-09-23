@@ -15,6 +15,8 @@ export const frequencyLabel: Record<string, string> = { weekly: '每周', monthl
 export const originLabel: Record<string, string> = { builtin: '内置', user: '我的', paper_snapshot: '模拟盘副本' }
 export const timingLabel: Record<string, string> = {
   none: '不择时', index_trend: '均线趋势', rsrs: 'RSRS', icu_ma: 'ICU 均线', alligator: '鳄鱼线',
+  llt: 'LLT 趋势线', ma_channel: '均线交叉通道突破', one_way_vol: '单向波动差', rps_vol: 'RPS 单向波动差',
+  high_moment: '高阶矩', volume_resonance: '价量共振', qrs: 'QRS',
 }
 
 export function scorerText(spec: Spec | undefined, options?: any): string {

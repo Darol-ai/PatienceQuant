@@ -507,6 +507,10 @@ def pipeline_options(db: Session = Depends(get_db)) -> Dict[str, Any]:
     factors += [{"key": f.key, "label": f.label, "description": f.description, "kind": "price", "available": True,
                  "unavailable_reason": None} for f in PRICE_FACTORS.values()]
     from app.pipeline.factor_library import FACTOR_GROUPS, FACTOR_LIBRARY, LEGACY_MODEL_FACTORS, trainable
+    # 因子库里其余只用日线的单个因子，也能直接在因子权重策略里用（ADR-0052 第三步）
+    factors += [{"key": f.key, "label": f.label, "description": f.description, "kind": "library", "group": f.group,
+                 "available": True, "unavailable_reason": None}
+                for f in FACTOR_LIBRARY.values() if trainable(f.key) and f.key not in PRICE_FACTORS and f.key not in group_labels]
     from app.pipeline.model_library import all_models
 
     models = [m for m in all_models() if m["status"] == "ready"]
@@ -526,6 +530,23 @@ def pipeline_options(db: Session = Depends(get_db)) -> Dict[str, Any]:
         {"type": "icu_ma", "label": "ICU 均线择时", "description": "中泰证券 2023：稳健回归均线",
          "params": [{"key": "n", "label": "均线窗口", "default": 5, "min": 3, "max": 250, "step": 1}]},
         {"type": "alligator", "label": "鳄鱼线择时", "description": "招商证券 2024：鳄鱼线 + AO + 分形 + MACD", "params": []},
+        {"type": "llt", "label": "LLT 趋势线择时", "description": "广发证券 2017：低延迟趋势线上行时满仓",
+         "params": [{"key": "d", "label": "平滑天数 d（α=2/(d+1)）", "default": 30, "min": 5, "max": 120, "step": 1}]},
+        {"type": "ma_channel", "label": "均线交叉通道突破择时", "description": "申万宏源 2018：近 n 天金叉且收盘创 n 日新高开仓，近 n 天死叉平仓",
+         "params": [{"key": "short", "label": "短均线", "default": 9, "min": 2, "max": 60, "step": 1},
+                    {"key": "long", "label": "长均线", "default": 18, "min": 5, "max": 250, "step": 1},
+                    {"key": "n", "label": "确认窗口 n", "default": 3, "min": 1, "max": 20, "step": 1}]},
+        {"type": "one_way_vol", "label": "单向波动差择时", "description": "国信证券 2015：日内上行波动减下行波动的均值为正时满仓",
+         "params": [{"key": "window", "label": "均值窗口", "default": 60, "min": 5, "max": 250, "step": 1}]},
+        {"type": "rps_vol", "label": "RPS 单向波动差择时", "description": "国信证券 2015：结合相对强弱 RPS；默认 13 是原作者样本内搜出的参数",
+         "params": [{"key": "period", "label": "均值窗口", "default": 13, "min": 2, "max": 60, "step": 1}]},
+        {"type": "high_moment", "label": "高阶矩择时", "description": "广发证券 2015：20 日收益 5 阶矩的 EMA 上升时满仓",
+         "params": [{"key": "ema", "label": "EMA 窗口", "default": 90, "min": 10, "max": 250, "step": 1}]},
+        {"type": "volume_resonance", "label": "价量共振择时", "description": "华创证券 2019：价能 × 量能超过阈值时满仓（多头/空头市场阈值不同）", "params": []},
+        {"type": "qrs", "label": "QRS 择时", "description": "中金公司 2021：RSRS 标准分 × R²",
+         "params": [{"key": "n", "label": "斜率窗口 N", "default": 18, "min": 5, "max": 60, "step": 1},
+                    {"key": "m", "label": "标准分窗口 M", "default": 600, "min": 100, "max": 1200, "step": 50},
+                    {"key": "threshold", "label": "阈值 S", "default": 0.7, "min": 0.1, "max": 3, "step": 0.1}]},
     ]
     universes = [{"id": key, "name": name, "description": description} for key, (name, _, description) in FIXED_UNIVERSES.items()]
     universes += [{"id": "a_share", "name": "A股全市场", "description": "通用目录全部 A 股"}]
@@ -599,7 +620,7 @@ def create_model_strategy(payload: ModelStrategyPayload, db: Session = Depends(g
     策略立即保存，模型训练好后自动算成绩卡。"""
     from app.pipeline.library import FIXED_UNIVERSES as _pools
     from app.training import jobs
-    from app.training.trainer import TrainingConfig, find_by_fingerprint, write_record
+    from app.training.trainer import DATA_START, TrainingConfig, find_by_fingerprint, write_record
 
     try:
         config = TrainingConfig(**payload.training).validate()
@@ -616,7 +637,7 @@ def create_model_strategy(payload: ModelStrategyPayload, db: Session = Depends(g
             "id": model_id, "fingerprint": fingerprint, "status": "queued", "created_at": datetime.now().isoformat(timespec="seconds"),
             "name": f"{'LightGBM' if config.framework == 'lightgbm' else 'XGBoost'} · {pool_label} · {len(config.factors)} 个因子 · {config.horizon} 日",
             "pool_label": pool_label + ("（今天的名单）" if config.pool == "csi300" and config.membership == "latest" else ""),
-            "description": f"为策略「{payload.name}」训练", "config": config.__dict__,
+            "description": f"为策略「{payload.name}」训练", "config": config.__dict__, "data_start": DATA_START.isoformat(),
         })
     try:
         spec = StrategySpec.model_validate({**payload.spec, "scorer": {"type": "model", "models": [model_id]}})
