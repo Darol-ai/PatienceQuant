@@ -36,16 +36,17 @@ def test_health_and_seeded_stocks():
         assert len(full_search.json()["items"]) == full_search.json()["total"]
         universes = client.get("/api/universes")
         assert universes.status_code == 200
-        assert {item["id"] for item in universes.json()} >= {"a_share", "hs300", "csi_a500"}
+        ids = {item["id"] for item in universes.json()}
+        # ADR-0051：按代码顺序取前 N 支的代理股票池已删除，只剩真实的股票池
+        assert {"a_share", "csi300", "broad30"} <= ids
+        assert not ids & {"large_cap", "hs300", "csi_a500"}
         universe_counts = {item["id"]: item["count"] for item in universes.json()}
-        assert universe_counts["a_share"] == 50
-        assert universe_counts["csi_a500"] == 50
-        assert universe_counts["large_cap"] == 50
+        assert universe_counts["a_share"] == 50 and universe_counts["csi300"] == 300
 
         strategies = client.get("/api/strategies")
         assert strategies.status_code == 200
         summary = strategies.json()[0]
-        assert summary["universe"] == "large_cap"
+        assert summary["universe"] == "csi300"
         assert summary["research_start_date"] == "2018-01-01"
         assert summary["study_period"]["start"] <= summary["study_period"]["end"]
         assert summary["study_period"]["end"] == "2025-12-31"
@@ -68,10 +69,7 @@ def test_health_and_seeded_stocks():
         # 代表这一点不应该变。
         assert min(group_counts.values()) >= 5
 
-        too_small = client.post(
-            "/api/watchlists",
-            json={"name": "测试小池不应保存", "symbols": ["600519", "000333"]},
-        )
+        too_small = client.post("/api/pools", json={"name": "测试小池不应保存", "symbols": ["600519", "000333"]})
         assert too_small.status_code == 422
 
         history = client.get("/api/stocks/601006", params={"range": "all", "interval": "monthly"})
@@ -593,14 +591,14 @@ def test_define_strategy_then_practice_and_reload_history():
                 "selection": {"type": "top_n", "n": 10}, "weighting": {"type": "equal", "max_weight": 0.2},
                 "rebalance": {"frequency": "monthly", "turnover_band": 0.02}}
         created = client.post("/api/strategies/spec", json={"name": "测试·动量加影线", "description": "测试用",
-                                                            "default_universe": "large_cap", "spec": spec})
+                                                            "default_universe": "a_share", "spec": spec})
         assert created.status_code == 200, created.text
         strategy_id = created.json()["id"]
         again = client.post("/api/strategies/spec", json={"name": "测试·动量加影线", "spec": spec}).json()
         assert again["version"] == created.json()["version"] + 1  # 同名另存为新版本
 
         row = next(r for r in client.get("/api/strategies").json() if r["id"] == strategy_id)
-        assert row["origin"] == "user" and row["default_universe"] == "large_cap"
+        assert row["origin"] == "user" and row["default_universe"] == "a_share"
 
         run = client.post("/api/backtests", json={"strategy_id": strategy_id, "start_date": "2023-01-01", "end_date": "2024-12-31"})
         assert run.status_code == 200, run.text
@@ -625,3 +623,51 @@ def test_universe_analytics_without_fundamentals_returns_empty_valuation_chart()
     result = _analytics_from_ranking(ranking, "real")
     assert result["valuation_growth"] == [] and "财务数据" in result["valuation_growth_note"]
     assert len(result["portfolio_weights"]) == 1
+
+
+def test_pool_management_lifecycle():
+    """股票池管理（ADR-0051）：固定股票池只读；自定义股票池可建、可改、可删，
+    被策略用着时不能删。"""
+    with TestClient(app) as client:
+        pools = {p["id"]: p for p in client.get("/api/pools").json()}
+        assert pools["csi300"]["kind"] == "fixed" and pools["csi300"]["count"] == 300
+        members = client.get("/api/pools/csi300/members").json()
+        assert members["count"] == 300 and all(m["name"] for m in members["members"])
+        assert client.delete("/api/pools/csi300").status_code == 404
+
+        symbols = [row["symbol"] for row in client.get("/api/stocks/search", params={"source": "local"}).json()["items"][:12]]
+        created = client.post("/api/pools", json={"name": "测试·我的池", "symbols": symbols})
+        assert created.status_code == 200, created.text
+        pool_id = created.json()["id"]
+        assert client.post("/api/pools", json={"name": "测试·我的池", "symbols": symbols}).status_code == 409
+        assert client.get(f"/api/pools/{pool_id}/members").json()["count"] == 12
+        assert client.put(f"/api/pools/{pool_id}", json={"name": "测试·我的池2", "symbols": symbols[:10]}).json()["count"] == 10
+
+        spec = {"scorer": {"type": "factor_weights", "weights": {"momentum": 1}}, "selection": {"type": "top_n", "n": 5}}
+        client.post("/api/strategies/spec", json={"name": "测试·用自定义池", "default_universe": pool_id, "spec": spec})
+        blocked = client.delete(f"/api/pools/{pool_id}")
+        assert blocked.status_code == 409 and "测试·用自定义池" in blocked.json()["detail"]
+
+
+def test_explain_real_trades_from_backtest_and_paper():
+    """交易解释挂在真实交易上（ADR-0051）：按信号日重新打分，只陈述名次、分数、门槛、权重。"""
+    with TestClient(app) as client:
+        v3 = next(r for r in client.get("/api/strategies").json() if r["origin"] == "builtin" and r["kind"] == "multifactor")
+        run = client.post("/api/backtests", json={"strategy_id": v3["id"], "universe": "a_share",
+                                                  "start_date": "2024-01-01", "end_date": "2024-06-30"}).json()
+        buy = next(t for t in run["trades"] if t["side"] == "BUY")
+        out = client.post(f"/api/backtests/{run['id']}/trades/explain", json={"trade_id": buy["id"]})
+        assert out.status_code == 200, out.text
+        body = out.json()
+        assert "排第" in body["text"] and "入选" in body["text"] and body["facts"]["target_weight"] > 0
+        assert isinstance(body["audit_id"], int)
+        assert client.post(f"/api/backtests/{run['id']}/trades/explain", json={"trade_id": 999999}).status_code == 404
+
+        client.post("/api/paper/reset", json={"initial_capital": 1_000_000})
+        client.post("/api/paper/rebalance", json={"strategy_id": v3["id"]})
+        orders = client.get("/api/paper/orders").json()
+        assert orders
+        paper = client.post(f"/api/paper/orders/{orders[0]['id']}/explain")
+        assert paper.status_code == 200, paper.text
+        assert "排第" in paper.json()["text"]
+        client.post("/api/paper/reset", json={"initial_capital": 1_000_000})

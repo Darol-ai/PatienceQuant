@@ -18,9 +18,7 @@ from sqlalchemy.orm import Session
 from app.ai.credentials import clear_ai_credentials, get_ai_credentials, set_ai_credentials
 from app.ai.report_analysis import ReportAnalysisService
 from app.ai.report_extraction import extract_text
-from app.ai.report_factor import ReportFactorService
 from app.ai.service import AIResearchService
-from app.ai.strategy_assistant import StrategyAssistantService
 from app.backtest.engine import BacktestConfig, BacktestEngine
 from app.config import get_settings
 from app.data.market_refresh import market_status, start_refresh
@@ -29,14 +27,14 @@ from app.quant_v3.research_notes import quant_v3_research_universe
 from app.db.models import AIExplanation, BacktestEquity, BacktestMetric, BacktestRun, DailyAccount, Order, Portfolio, Position, ResearchAnnotation, ResearchGroup, Stock, Strategy, StrategyFactor, Trade, Watchlist
 from app.db.session import get_db
 from app.portfolio.service import PaperTradingService
-from app.schemas import AIDecisionRequest, AISettingsRequest, ApplyBacktestPaperRequest, BacktestRequest, ExplainRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyAssistRequest, StrategyPayload, StrategySpecPayload, RecommendRequest, ScorecardRefreshRequest
+from app.schemas import AIDecisionRequest, AISettingsRequest, ApplyBacktestPaperRequest, BacktestRequest, ExplainRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyPayload, StrategySpecPayload, RecommendRequest, ScorecardRefreshRequest, AgentTurnRequest
 from app.db.seed import DEFAULT_WEIGHTS
-from app.pipeline.library import FIXED_UNIVERSES, VALIDATED_KINDS, build_strategy, spec_from_legacy_row, data_service_for, default_universe, is_model_strategy, latest_market_day, strategy_spec, validate_date_range
+from app.pipeline.library import FIXED_UNIVERSES, normalize_universe, VALIDATED_KINDS, build_strategy, spec_from_legacy_row, data_service_for, default_universe, is_model_strategy, latest_market_day, strategy_spec, validate_date_range
 from app.pipeline.model_library import MODEL_LIBRARY, model_years
 from app.pipeline.price_factors import PRICE_FACTORS
 from app.pipeline.scorers import FUNDAMENTAL_FACTOR_GROUPS
 from app.pipeline.spec import StrategySpec
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from app.pipeline.strategy import build_pipeline_strategy
 from app.strategies.base import StrategyConfig, StrategyResult
 
@@ -203,17 +201,10 @@ def _backtest_symbols(data: MarketDataService, payload: BacktestRequest) -> List
 
 
 def _universe_symbols(data: MarketDataService, universe: str, custom_symbols: Optional[List[str]] = None) -> List[str]:
-    catalog = data.stocks()
-    symbols = data.universe_symbols("a_share")
-    asset_symbols = set(catalog.symbol.tolist())
-    if universe == "hs300":
-        return symbols[: min(300, len(symbols))]
-    if universe == "large_cap":
-        return data.universe_symbols("large_cap")
-    if universe == "all_assets":
-        return data.universe_symbols("all_assets")
-    if universe == "csi_a500":
-        return symbols[: min(500, len(symbols))]
+    universe = normalize_universe(universe)
+    if universe in FIXED_UNIVERSES:
+        return FIXED_UNIVERSES[universe][1]()
+    asset_symbols = set(data.stocks().symbol.tolist())
     if universe.startswith("custom:"):
         try:
             watchlist = data.db.get(Watchlist, int(universe.split(":", 1)[1]))
@@ -232,7 +223,7 @@ def _universe_symbols(data: MarketDataService, universe: str, custom_symbols: Op
         if len(requested) < 10:
             raise HTTPException(422, "自定义股票池至少需要 10 只有效股票")
         return requested
-    return symbols
+    return data.universe_symbols("a_share")
 
 
 @router.get("/health")
@@ -258,11 +249,7 @@ def universes(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
     a_share = data.universe_symbols("a_share")
     watchlists = db.scalars(select(Watchlist).order_by(Watchlist.id)).all()
     return [
-        {"id": "a_share", "name": "A股全市场", "count": len(a_share), "description": "真实A股目录（Data Adapter 提供，非Demo生成）"},
-        {"id": "large_cap", "name": "大盘股核心池", "count": min(300, len(a_share)), "description": "低频策略优先研究的核心大盘股票"},
-        {"id": "hs300", "name": "沪深300（目录代理）", "count": min(300, len(a_share)), "description": "通用目录里排在前面的300只股票，仅作代理；沪深300策略实际使用的是独立的真实成分股名单"},
-        {"id": "csi_a500", "name": "中证A500（目录代理）", "count": min(500, len(a_share)), "description": "通用目录里排在前面的500只股票，仅作代理"},
-        {"id": "all_assets", "name": "A股全部", "count": len(catalog), "description": "统一 Data Adapter 下的全部可研究资产"},
+        {"id": "a_share", "name": "A股全市场", "count": len(a_share), "description": "通用目录里的全部 A 股"},
     ] + [{"id": key, "name": name, "count": len(symbols_fn()), "description": description}
          for key, (name, symbols_fn, description) in FIXED_UNIVERSES.items()] + [{"id": "custom:%s" % row.id, "name": row.name, "count": len(row.symbols), "description": "自定义研究股票池"} for row in watchlists]
 
@@ -372,21 +359,104 @@ def update_research_annotation(symbol: str, payload: Dict[str, Any], db: Session
     return {"symbol": annotation.symbol, "bucket": annotation.bucket, "thesis": annotation.thesis, "risk": annotation.risk}
 
 
-@router.post("/watchlists")
-def create_watchlist(payload: Dict[str, Any], db: Session = Depends(get_db)) -> Dict[str, Any]:
-    name = str(payload.get("name", "自定义股票池")).strip()
+class PoolPayload(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    symbols: List[str]
+
+
+def _clean_pool_symbols(db: Session, symbols: List[str]) -> List[str]:
+    data = MarketDataService(db)
+    requested = list(dict.fromkeys(str(s).strip() for s in symbols if str(s).strip()))
+    missing = data.ensure_symbols(requested).get("missing", [])
+    if missing:
+        raise HTTPException(422, "以下股票代码在股票目录里找不到：%s" % "、".join(missing[:20]))
+    if len(requested) < 10:
+        raise HTTPException(422, "自定义股票池至少需要 10 只股票")
+    return requested
+
+
+@router.get("/pools")
+def list_pools(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
+    """股票池管理（ADR-0051）：固定股票池 + A股全市场 + 用户自定义股票池。"""
+    data = MarketDataService(db)
+    pools = [{"id": key, "name": name, "description": description, "kind": "fixed", "count": len(fn())}
+             for key, (name, fn, description) in FIXED_UNIVERSES.items()]
+    pools.append({"id": "a_share", "name": "A股全市场", "description": "通用股票目录里的全部 A 股", "kind": "fixed",
+                  "count": len(data.universe_symbols("a_share"))})
+    pools += [{"id": "custom:%s" % row.id, "name": row.name, "description": "自定义股票池", "kind": "custom", "count": len(row.symbols)}
+              for row in db.scalars(select(Watchlist).order_by(Watchlist.id)).all()]
+    return pools
+
+
+@router.get("/pools/{pool_id}/members")
+def pool_members(pool_id: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    data = MarketDataService(db)
+    pool_id = normalize_universe(pool_id)
+    if pool_id in FIXED_UNIVERSES or pool_id == "a_share":
+        symbols = data.universe_symbols(pool_id)
+    elif pool_id.startswith("custom:"):
+        row = db.get(Watchlist, int(pool_id.split(":", 1)[1])) if pool_id.split(":", 1)[1].isdigit() else None
+        if not row:
+            raise HTTPException(404, "股票池不存在")
+        symbols = list(row.symbols)
+    else:
+        raise HTTPException(404, "股票池不存在")
+    catalog = data.stocks().set_index("symbol") if not data.stocks().empty else pd.DataFrame()
+    names = _fixed_universe_names()
+    members = []
+    for symbol in symbols:
+        row = catalog.loc[symbol] if symbol in catalog.index else None
+        members.append({"symbol": symbol,
+                        "name": (row["name"] if row is not None else names.get(symbol)) or symbol,
+                        "industry": row["industry"] if row is not None else None})
+    return {"id": pool_id, "count": len(members), "members": members}
+
+
+@router.post("/pools")
+def create_pool(payload: PoolPayload, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    name = payload.name.strip()
     if db.scalar(select(Watchlist).where(Watchlist.name == name)):
-        raise HTTPException(409, "自定义股票池名称已存在")
-    symbols = [str(symbol) for symbol in payload.get("symbols", [])]
-    valid_symbols = set(MarketDataService(db).stocks().symbol.tolist())
-    symbols = list(dict.fromkeys(symbol for symbol in symbols if symbol in valid_symbols))
-    if len(symbols) < 10:
-        raise HTTPException(422, "自定义股票池至少需要 10 只有效股票")
-    watchlist = Watchlist(name=name, symbols=symbols)
-    db.add(watchlist)
+        raise HTTPException(409, "股票池名称已存在")
+    row = Watchlist(name=name, symbols=_clean_pool_symbols(db, payload.symbols))
+    db.add(row)
     db.commit()
-    db.refresh(watchlist)
-    return {"id": "custom:%s" % watchlist.id, "name": watchlist.name, "count": len(symbols), "symbols": symbols}
+    db.refresh(row)
+    return {"id": "custom:%s" % row.id, "name": row.name, "count": len(row.symbols)}
+
+
+def _pool_users(db: Session, pool_id: str) -> List[str]:
+    users = [f"策略「{row.name}」" for row in db.scalars(select(Strategy)).all() if row.universe == pool_id]
+    portfolio = db.scalar(select(Portfolio).limit(1))
+    if portfolio and portfolio.execution_universe == pool_id:
+        users.append("模拟盘")
+    return users
+
+
+@router.put("/pools/{pool_id}")
+def update_pool(pool_id: str, payload: PoolPayload, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    row = db.get(Watchlist, int(pool_id.split(":", 1)[1])) if pool_id.startswith("custom:") and pool_id.split(":", 1)[1].isdigit() else None
+    if not row:
+        raise HTTPException(404, "只能修改自定义股票池")
+    clash = db.scalar(select(Watchlist).where(Watchlist.name == payload.name.strip(), Watchlist.id != row.id))
+    if clash:
+        raise HTTPException(409, "股票池名称已存在")
+    row.name = payload.name.strip()
+    row.symbols = _clean_pool_symbols(db, payload.symbols)
+    db.commit()
+    return {"id": pool_id, "name": row.name, "count": len(row.symbols)}
+
+
+@router.delete("/pools/{pool_id}")
+def delete_pool(pool_id: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    row = db.get(Watchlist, int(pool_id.split(":", 1)[1])) if pool_id.startswith("custom:") and pool_id.split(":", 1)[1].isdigit() else None
+    if not row:
+        raise HTTPException(404, "只能删除自定义股票池")
+    users = _pool_users(db, pool_id)
+    if users:
+        raise HTTPException(409, "这个股票池正在被使用：%s" % "、".join(users))
+    db.delete(row)
+    db.commit()
+    return {"deleted": pool_id}
 
 
 @router.get("/stocks/search")
@@ -439,7 +509,7 @@ def stocks(search: str = "", group: str = "", industry: str = "", exchange: str 
     held = {position.symbol for position in db.scalars(select(Position).where(Position.portfolio_id == db.scalar(select(Portfolio.id).limit(1)))).all()}
     ranking["action"] = ranking.apply(lambda row: "HOLD" if row.symbol in held and row.target_weight > 0 else ("SELL" if row.symbol in held else row.action), axis=1)
     frame = ranking
-    if universe in {"a_share", "large_cap"}:
+    if universe == "a_share":
         frame = frame[frame.symbol.isin(data.universe_symbols(universe))]
     if search:
         needle = search.lower()
@@ -501,7 +571,7 @@ def list_strategies(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
             metrics = {item.name: item.value for item in db.scalars(select(BacktestMetric).where(BacktestMetric.backtest_run_id == latest.id)).all()}
         research_start = row.research_start_date or date(2018, 1, 1)
         research_end = row.research_end_date or date(2025, 12, 31)
-        result.append({"id": row.id, "name": row.name, "kind": row.kind or "multifactor", "version": row.version, "description": row.description, "weights": row.weights, "holdings_count": row.holdings_count, "max_weight": row.max_weight, "rebalance_frequency": row.rebalance_frequency, "universe": row.universe or "large_cap", "research_start_date": research_start.isoformat(), "research_end_date": research_end.isoformat(),
+        result.append({"id": row.id, "name": row.name, "kind": row.kind or "multifactor", "version": row.version, "description": row.description, "weights": row.weights, "holdings_count": row.holdings_count, "max_weight": row.max_weight, "rebalance_frequency": row.rebalance_frequency, "universe": row.universe or "csi300", "research_start_date": research_start.isoformat(), "research_end_date": research_end.isoformat(),
                        "cash_buffer": float(row.cash_buffer if row.cash_buffer is not None else .02),
                        "trend_filter": bool(row.trend_filter if row.trend_filter is not None else True),
                        "risk_off_exposure": float(row.risk_off_exposure if row.risk_off_exposure is not None else .75),
@@ -589,8 +659,9 @@ def pipeline_options(db: Session = Depends(get_db)) -> Dict[str, Any]:
         {"type": "alligator", "label": "鳄鱼线择时", "description": "招商证券 2024：鳄鱼线 + AO + 分形 + MACD", "params": []},
     ]
     universes = [{"id": key, "name": name, "description": description} for key, (name, _, description) in FIXED_UNIVERSES.items()]
-    universes += [{"id": "large_cap", "name": "大盘股核心池", "description": "通用目录排在前面的 300 支"},
-                  {"id": "a_share", "name": "A股全市场", "description": "通用目录全部 A 股"}]
+    universes += [{"id": "a_share", "name": "A股全市场", "description": "通用目录全部 A 股"}]
+    universes += [{"id": "custom:%s" % row.id, "name": row.name, "description": "自定义股票池"}
+                  for row in db.scalars(select(Watchlist).order_by(Watchlist.id)).all()]
     return {"data_mode": get_settings().data_mode, "factors": factors, "models": models, "timings": timings,
             "universes": universes, "markets": [{"id": "a_share", "name": "A股"}]}
 
@@ -665,8 +736,7 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
         raise HTTPException(404, "策略不存在")
     if payload.start_date >= payload.end_date:
         raise HTTPException(422, "结束日期必须晚于开始日期")
-    if payload.universe is None:
-        payload.universe = default_universe(strategy)
+    payload.universe = normalize_universe(payload.universe) if payload.universe else default_universe(strategy)
     spec = _spec_for_run(strategy, payload)
     run = BacktestRun(strategy_id=strategy.id, status="running", start_date=payload.start_date, end_date=payload.end_date, initial_capital=payload.initial_capital, config=payload.model_dump(mode="json"), data_mode=get_settings().data_mode)
     db.add(run)
@@ -791,9 +861,9 @@ def _backtest_result_payload(run: BacktestRun, db: Session) -> Dict[str, Any]:
     equity = pd.DataFrame([{"trade_date": r.trade_date, "equity": r.equity, "benchmark": r.benchmark, "drawdown": r.drawdown} for r in equity_rows],
                           columns=["trade_date", "equity", "benchmark", "drawdown"])
     trade_rows = db.scalars(select(Trade).where(Trade.backtest_run_id == run.id).order_by(Trade.trade_date, Trade.id)).all()
-    trades = pd.DataFrame([{"trade_date": r.trade_date, "symbol": r.symbol, "side": r.side, "quantity": r.quantity, "price": r.price,
+    trades = pd.DataFrame([{"id": r.id, "trade_date": r.trade_date, "symbol": r.symbol, "side": r.side, "quantity": r.quantity, "price": r.price,
                             "amount": r.amount, "fee": r.fee, "reason": r.reason} for r in trade_rows],
-                          columns=["trade_date", "symbol", "side", "quantity", "price", "amount", "fee", "reason"])
+                          columns=["id", "trade_date", "symbol", "side", "quantity", "price", "amount", "fee", "reason"])
     initial = float(run.initial_capital)
     final_assets = float(metrics.get("final_assets", initial))
     strategy = db.get(Strategy, run.strategy_id)
@@ -1216,7 +1286,7 @@ def apply_backtest_to_paper(
     if not source_strategy:
         raise HTTPException(404, "回测对应策略不存在")
     config = run.config or {}
-    universe = str(config.get("universe") or "large_cap")
+    universe = normalize_universe(str(config.get("universe") or "csi300"))
     custom_symbols = list(dict.fromkeys(str(symbol).strip() for symbol in (config.get("custom_symbols") or []) if str(symbol).strip()))
     data = data_service_for(db, source_strategy)
 
@@ -1533,18 +1603,65 @@ def explain_trade(payload: ExplainRequest, db: Session = Depends(get_db)) -> Dic
     return {**result, "audit_id": record.id}
 
 
-@router.post("/ai/strategy-assistant")
-def strategy_assistant(payload: StrategyAssistRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    result = StrategyAssistantService().suggest(payload.description, db)
-    record = AIExplanation(
-        symbol="-", explanation_type="strategy_assist", content=result["content"],
-        provider=result["provider"], model_version=result.get("model_version", "rules"),
-        confidence=result.get("confidence"), context={"description": payload.description},
-    )
+class ExplainTradeRef(BaseModel):
+    trade_id: int
+
+
+def _record_trade_explanation(db: Session, symbol: str, out: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+    record = AIExplanation(symbol=symbol, explanation_type="trade", content=out["text"], provider="rules",
+                           model_version="rules", confidence=None, context={**context, "facts": out["facts"]})
     db.add(record)
     db.commit()
     db.refresh(record)
-    return {**result, "audit_id": record.id}
+    return _clean({**out, "audit_id": record.id})
+
+
+@router.post("/backtests/{run_id}/trades/explain")
+def explain_backtest_trade(run_id: int, payload: ExplainTradeRef, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """解释回测里的一笔成交：在信号日按这次回测实际执行的规格重新打分，只陈述事实。"""
+    from app.ai.trade_explainer import explain_trade, previous_trading_day
+
+    run = db.get(BacktestRun, run_id)
+    trade = db.get(Trade, payload.trade_id)
+    if not run or not trade or trade.backtest_run_id != run_id:
+        raise HTTPException(404, "成交不存在")
+    strategy = db.get(Strategy, run.strategy_id)
+    config = run.config or {}
+    saved_spec = (config.get("strategy_config") or {}).get("spec")
+    spec = StrategySpec.model_validate(saved_spec) if saved_spec else strategy_spec(strategy)
+    data = data_service_for(db, strategy)
+    symbols = _backtest_symbols(data, BacktestRequest.model_validate({**config, "strategy_id": strategy.id}))
+    signal_date = previous_trading_day(data, trade.trade_date)
+    if signal_date is None:
+        raise HTTPException(422, "找不到这笔成交的信号日")
+    record = {"symbol": trade.symbol, "side": trade.side, "quantity": trade.quantity, "price": trade.price,
+              "amount": trade.amount, "trade_date": trade.trade_date.isoformat(), "reason": trade.reason}
+    out = explain_trade(db, strategy, symbols, signal_date, record, _stock_name(db, trade.symbol) or trade.symbol, spec)
+    return _record_trade_explanation(db, trade.symbol, out, {"run_id": run_id, "trade_id": trade.id})
+
+
+@router.post("/paper/orders/{order_id}/explain")
+def explain_paper_order(order_id: int, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """解释模拟盘的一笔订单：模拟盘在调仓当天收盘出信号并成交，按当天的打分陈述事实。"""
+    from app.ai.trade_explainer import explain_trade
+
+    order = db.get(Order, order_id)
+    if not order:
+        raise HTTPException(404, "订单不存在")
+    trade = db.scalar(select(Trade).where(Trade.portfolio_id == order.portfolio_id, Trade.symbol == order.symbol,
+                                          Trade.side == order.side, Trade.quantity == order.quantity)
+                      .order_by(Trade.id.desc()).limit(1))
+    strategy = db.scalar(select(Strategy).where(Strategy.name == order.strategy_name).order_by(Strategy.id.desc()).limit(1))
+    if not trade or not strategy:
+        raise HTTPException(422, "找不到这笔订单对应的成交或策略")
+    portfolio = db.get(Portfolio, order.portfolio_id)
+    data = data_service_for(db, strategy)
+    saved = list(portfolio.execution_symbols or []) if portfolio else []
+    symbols = saved or _strategy_symbols(data, strategy)
+    record = {"symbol": order.symbol, "side": order.side, "quantity": order.quantity, "price": order.price,
+              "amount": order.amount, "trade_date": trade.trade_date.isoformat(), "reason": order.reason}
+    out = explain_trade(db, strategy, symbols, trade.trade_date, record, _stock_name(db, order.symbol) or order.symbol)
+    return _record_trade_explanation(db, order.symbol, out, {"order_id": order.id})
 
 
 @router.get("/scorecards")
@@ -1565,41 +1682,86 @@ def refresh_scorecards(payload: Optional[ScorecardRefreshRequest] = None) -> Dic
     return {"started": started, "refresh": scorecard.refresh_state()}
 
 
-@router.post("/ai/recommend")
-def recommend_strategy(payload: RecommendRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    """智能体推荐：规则按偏好在成绩卡里选一个策略，大模型只负责解释；不下单。"""
+def _recommend(db: Session, market: str, max_drawdown: Optional[float], holding: str, question: str) -> Dict[str, Any]:
     from app.ai import recommender
     from app.pipeline import scorecard
 
     cards = scorecard.all_cards(db)
-    result = recommender.rank(cards, payload.market, payload.max_drawdown, payload.holding)
+    result = recommender.rank(cards, market, max_drawdown, holding)
     prefs_text = "市场 %s，能接受的最大回撤 %s，持仓周期 %s" % (
-        recommender.MARKET_LABEL.get(payload.market, payload.market),
-        "不限" if payload.max_drawdown is None else "−%.0f%%" % (payload.max_drawdown * 100),
-        recommender.HOLDING_LABEL[payload.holding])
+        recommender.MARKET_LABEL.get(market, market),
+        "不限" if max_drawdown is None else "−%.0f%%" % (max_drawdown * 100),
+        recommender.HOLDING_LABEL[holding])
     if result["chosen"] is None:
         return {"recommendation": None, "alternatives": [], "rules": result["rules"], "notes": result["notes"],
                 "preferences": prefs_text, "explanation": None}
-    explanation = recommender.explain(db, result, prefs_text, payload.question)
+    explanation = recommender.explain(db, result, prefs_text, question)
     chosen = result["chosen"]
     record = AIExplanation(
         symbol="-", explanation_type="strategy_recommend", content=explanation["content"],
         provider=explanation["provider"], model_version=explanation.get("model_version", "rules"), confidence=None,
-        context={"preferences": payload.model_dump(), "chosen_strategy_id": chosen["strategy_id"],
-                 "scorecard_run_id": chosen.get("run_id"), "rules": result["rules"], "notes": result["notes"],
+        context={"preferences": {"market": market, "max_drawdown": max_drawdown, "holding": holding, "question": question},
+                 "chosen_strategy_id": chosen["strategy_id"], "scorecard_run_id": chosen.get("run_id"),
+                 "rules": result["rules"], "notes": result["notes"],
                  # 被数字核对拦下的大模型原文只进审计记录，不返回给页面
                  "rejected_llm_content": explanation.pop("rejected_content", None)},
     )
     db.add(record)
     db.commit()
     db.refresh(record)
-    return _clean({
+    return {
         "recommendation": chosen, "alternatives": result["alternatives"], "rules": result["rules"],
         "notes": result["notes"], "preferences": prefs_text, "explanation": explanation, "audit_id": record.id,
         # 智能体不能下单：只给出去策略实践回测的入口和建议的回测参数
-        "next_step": {"practice_url": f"/backtest?strategy_id={chosen['strategy_id']}", "universe": chosen["universe"],
-                      "start_date": chosen["standard"]["start_date"], "end_date": chosen["standard"]["end_date"]},
-    })
+        "next_step": {"practice_url": f"/backtest?strategy_id={chosen['strategy_id']}", "strategy_url": f"/library/{chosen['strategy_id']}",
+                      "universe": chosen["universe"], "start_date": chosen["standard"]["start_date"], "end_date": chosen["standard"]["end_date"]},
+    }
+
+
+@router.post("/ai/recommend")
+def recommend_strategy(payload: RecommendRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """智能体推荐：规则按偏好在成绩卡里选一个策略，大模型只负责解释；不下单。"""
+    return _clean(_recommend(db, payload.market, payload.max_drawdown, payload.holding, payload.question))
+
+
+@router.post("/ai/agent")
+def agent_turn(payload: AgentTurnRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """智能体对话的一轮（ADR-0051）：按钮直接给出动作；打字时先由大模型翻译成四类意图之一
+    （改偏好重新推荐 / 为什么不是某个策略 / 比较两个策略 / 解释名词），回答由规则和成绩卡生成。"""
+    from app.ai import recommender
+    from app.pipeline import scorecard
+
+    prefs = dict(payload.prefs.model_dump())
+    cards = scorecard.all_cards(db)
+    action = payload.action.model_dump(exclude_none=True) if payload.action else None
+    if action is None:
+        if not payload.text.strip():
+            raise HTTPException(422, "需要一个动作或一句话")
+        action = recommender.parse_intent(db, payload.text, cards, prefs)
+    kind = action.get("type")
+    if kind == "unsupported":
+        hint = ("没有配置大模型，只能点下面的按钮提问。" if action.get("reason") == "no_llm"
+                else "这个我答不了。可以问我：换个回撤或调仓频率重新推荐、为什么不推荐某个策略、比较两个策略、解释某个名词（比如夏普比率）。")
+        return {"prefs": prefs, "reply": {"type": "unsupported", "text": hint}}
+    if kind == "recommend":
+        for key in ("max_drawdown", "holding"):
+            if key in action:
+                prefs[key] = action[key]
+        result = _recommend(db, prefs["market"], prefs.get("max_drawdown"), prefs["holding"], payload.text)
+        text = result["explanation"]["content"] if result["explanation"] else "；".join(result["notes"])
+        return _clean({"prefs": prefs, "reply": {"type": "recommend", "text": text, **result}})
+    if kind == "why_not":
+        out = recommender.why_not(cards, int(action["strategy_id"]), prefs["market"], prefs.get("max_drawdown"), prefs["holding"])
+        return _clean({"prefs": prefs, "reply": {"type": "why_not", **out}})
+    if kind == "compare":
+        out = recommender.compare(cards, [int(i) for i in action.get("strategy_ids", [])][:2])
+        return _clean({"prefs": prefs, "reply": {"type": "compare", **out}})
+    if kind == "explain_term":
+        term = action.get("term")
+        if term not in recommender.TERMS:
+            raise HTTPException(422, "不认识这个名词")
+        return {"prefs": prefs, "reply": {"type": "explain_term", "text": f"{term}：{recommender.TERMS[term]}"}}
+    raise HTTPException(422, "未知的动作")
 
 
 @router.post("/ai/audit/{audit_id}/decision")
@@ -1655,63 +1817,6 @@ async def analyze_report(file: UploadFile = File(...), db: Session = Depends(get
     db.commit()
     db.refresh(record)
     return {**result, "audit_id": record.id, "filename": file.filename}
-
-
-@router.post("/ai/report/generate-factor")
-async def generate_factor_from_report(
-    file: UploadFile = File(...),
-    top_n: int = 5,
-    run_backtest: bool = True,
-    start_date: date = date(2024, 1, 1),
-    end_date: date = date(2025, 12, 31),
-    db: Session = Depends(get_db),
-) -> Dict[str, Any]:
-    """功能②：如果研报对因子/建模有参考价值，生成一个白名单特征的线性因子，
-    并（默认）直接接进 A 阶段回测系统跑一遍——不要求这个因子真的赚钱，只
-    要求这条"生成 → 回测"的链路是真的在跑，不是摆设。"""
-    content = await file.read()
-    try:
-        report_text = extract_text(file.filename or "report.txt", content)
-    except ValueError as exc:
-        raise HTTPException(422, str(exc))
-
-    result = ReportFactorService().generate(report_text, db)
-    backtest_summary: Optional[Dict[str, Any]] = None
-    backtest_error: Optional[str] = None
-    if run_backtest and result["factor_weights"]:
-        try:
-            from app.quant_v3.factor_backtest import run_generated_factor_backtest
-
-            backtest_result = run_generated_factor_backtest(
-                result["factor_weights"], start=start_date, end=end_date, top_n=top_n,
-            )
-            backtest_summary = {
-                "metrics": backtest_result.metrics,
-                "trade_count": int(len(backtest_result.trades)),
-                "trades": _records(backtest_result.trades.head(50)),
-            }
-        except FileNotFoundError:
-            backtest_error = "本地 A 阶段历史数据不存在（data/a_phase_history.parquet），无法回测"
-        except Exception as exc:
-            backtest_error = str(exc)
-
-    record = AIExplanation(
-        symbol="-", explanation_type="report_factor",
-        content=json.dumps({"rationale": result["rationale"], "factor_weights": result["factor_weights"]}, ensure_ascii=False),
-        provider=result["provider"], model_version=result.get("model_version", "rules"),
-        confidence=result.get("confidence"),
-        context={"filename": file.filename, "text_preview": report_text[:500], "backtest_error": backtest_error},
-    )
-    db.add(record)
-    db.commit()
-    db.refresh(record)
-    return {
-        **result,
-        "audit_id": record.id,
-        "filename": file.filename,
-        "backtest": backtest_summary,
-        "backtest_error": backtest_error,
-    }
 
 
 @router.get("/data/market/status")
@@ -1795,7 +1900,7 @@ def _compute_dashboard_signals_and_analytics(db: Session, data: MarketDataServic
         # 的硬顶(30支)，回测本身(用户主动点"运行回测"、有进度反馈)的
         # universe口径不受影响。
         pipeline = build_strategy(db, strategy_row, data)
-        symbols = data.analysis_symbols(data.universe_symbols("large_cap"))
+        symbols = data.analysis_symbols(data.universe_symbols("csi300"))
         pipeline.prepare(symbols, get_settings().demo_as_of, get_settings().demo_as_of)
         strategy_result = pipeline.generate_weights(get_settings().demo_as_of, symbols)
         signals = _records(strategy_result.ranking.head(8))

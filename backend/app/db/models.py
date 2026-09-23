@@ -92,7 +92,7 @@ class Strategy(Base):
     holdings_count: Mapped[int] = mapped_column(Integer, default=10)
     max_weight: Mapped[float] = mapped_column(Float, default=0.15)
     rebalance_frequency: Mapped[str] = mapped_column(String(20), default="monthly")
-    universe: Mapped[str] = mapped_column(String(30), default="large_cap")
+    universe: Mapped[str] = mapped_column(String(30), default="csi300")
     research_start_date: Mapped[date] = mapped_column(Date, default=date(2018, 1, 1))
     research_end_date: Mapped[date] = mapped_column(Date, default=date(2025, 12, 31))
     # Risk controls are persisted with the strategy so the same rules are
@@ -175,7 +175,7 @@ class Portfolio(Base):
     # The execution scope may come from a completed custom backtest rather
     # than the strategy's named universe.  Persist it so subsequent manual
     # and scheduled paper rebalances use the same selected symbols.
-    execution_universe: Mapped[str] = mapped_column(String(50), default="large_cap")
+    execution_universe: Mapped[str] = mapped_column(String(50), default="csi300")
     execution_symbols: Mapped[List[str]] = mapped_column(JSON, default=list)
     source_backtest_run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

@@ -47,7 +47,7 @@ def seed_database(db: Session) -> None:
             holdings_count=10,
             max_weight=.15,
             rebalance_frequency="monthly",
-            universe="large_cap",
+            universe="csi300",
             research_start_date=date(2018, 1, 1),
             research_end_date=date(2025, 12, 31),
             cash_buffer=.02,
@@ -301,7 +301,7 @@ def _ensure_demo_backtest(db: Session, strategy: Strategy) -> None:
 
         spec = strategy_spec(strategy)
         market_data = MarketDataService(db)
-        symbols = market_data.universe_symbols(strategy.universe or "large_cap")
+        symbols = market_data.universe_symbols(strategy.universe or "csi300")
         config = _engine_config(spec, len(symbols))
         result = BacktestEngine(market_data).run(
             BacktestConfig(start_date=date(2018, 1, 1), end_date=date(2025, 12, 31), initial_capital=1_000_000,
@@ -314,7 +314,7 @@ def _ensure_demo_backtest(db: Session, strategy: Strategy) -> None:
                           config={
                               "seeded": True,
                               "risk_controls_version": 6,
-                              "universe": strategy.universe or "large_cap",
+                              "universe": strategy.universe or "csi300",
                               "strategy_config": _spec_summary(spec),
                               "risk_summary": result.risk_summary or {},
                           },

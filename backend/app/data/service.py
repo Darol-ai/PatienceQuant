@@ -264,7 +264,10 @@ class MarketDataService:
         }
 
     def universe_symbols(self, universe: str = "a_share") -> List[str]:
-        """Resolve a named product universe without leaking DB details to callers."""
+        """按股票池名字取股票代码（旧的代理股票池名字先映射到真实股票池，见 ADR-0051）。"""
+        from app.pipeline.library import FIXED_UNIVERSES, normalize_universe
+
+        universe = normalize_universe(universe)
         catalog = self.stocks()
         if catalog.empty:
             return []
@@ -275,16 +278,9 @@ class MarketDataService:
                 watchlist = None
             valid_symbols = set(catalog.symbol.tolist())
             return [symbol for symbol in (watchlist.symbols if watchlist else []) if symbol in valid_symbols]
-        if universe == "large_cap":
-            # The deterministic demo catalog starts with its research-grade
-            # large-cap basket; keep the rule explicit and reproducible.
-            return catalog.loc[catalog.exchange == "A股", "symbol"].head(300).tolist()
-        if universe == "hs300":
-            return catalog.loc[catalog.exchange == "A股", "symbol"].head(300).tolist()
-        if universe == "csi_a500":
-            return catalog.loc[catalog.exchange == "A股", "symbol"].head(500).tolist()
-        if universe == "all_assets":
-            return catalog.symbol.tolist()
+        if universe in FIXED_UNIVERSES:
+            return FIXED_UNIVERSES[universe][1]()
+        # "a_share"：通用目录里的全部 A 股
         return catalog.loc[catalog.exchange == "A股", "symbol"].tolist()
 
     # Dashboard/股票池这类展示型因子评分不需要对全市场每一支都打分，一个

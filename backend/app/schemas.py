@@ -16,7 +16,7 @@ class StrategyPayload(BaseModel):
     holdings_count: int = Field(10, ge=10, le=100)
     max_weight: float = Field(.15, gt=0, le=1)
     rebalance_frequency: str = "monthly"
-    universe: str = "large_cap"
+    universe: str = "csi300"
     research_start_date: date = date(2018, 1, 1)
     research_end_date: date = date(2025, 12, 31)
     cash_buffer: float = Field(.02, ge=0, lt=.5)
@@ -53,8 +53,11 @@ class StrategyPayload(BaseModel):
     @field_validator("universe")
     @classmethod
     def valid_strategy_universe(cls, value: str) -> str:
-        if value not in {"a_share", "large_cap", "all_assets"} and not value.startswith("custom:"):
-            raise ValueError("策略股票池仅支持大盘股、A股或自定义股票池")
+        from app.pipeline.library import is_valid_universe, normalize_universe
+
+        value = normalize_universe(value)
+        if not is_valid_universe(value) or value == "custom":
+            raise ValueError("策略股票池仅支持 a_share/csi300/broad30/custom:<编号>")
         return value
 
     @model_validator(mode="after")
@@ -78,6 +81,16 @@ class StrategySpecPayload(BaseModel):
     default_universe: str = "csi300"
     spec: Dict[str, Any]
 
+    @field_validator("default_universe")
+    @classmethod
+    def valid_default_universe(cls, value: str) -> str:
+        from app.pipeline.library import is_valid_universe, normalize_universe
+
+        value = normalize_universe(value)
+        if not is_valid_universe(value) or value == "custom":
+            raise ValueError("默认股票池仅支持 a_share/csi300/broad30/custom:<编号>")
+        return value
+
 
 class BacktestRequest(BaseModel):
     strategy_id: int = 1
@@ -98,8 +111,11 @@ class BacktestRequest(BaseModel):
     def valid_universe(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return value
-        if value not in {"a_share", "large_cap", "hs300", "csi_a500", "all_assets", "custom", "csi300", "broad30"} and not value.startswith("custom:"):
-            raise ValueError("股票池仅支持 a_share/large_cap/hs300/csi_a500/all_assets/csi300/broad30/custom")
+        from app.pipeline.library import is_valid_universe, normalize_universe
+
+        value = normalize_universe(value)
+        if not is_valid_universe(value):
+            raise ValueError("股票池仅支持 a_share/csi300/broad30/custom/custom:<编号>")
         return value
 
 
@@ -148,10 +164,6 @@ class ExplainRequest(BaseModel):
     use_llm: bool = False
 
 
-class StrategyAssistRequest(BaseModel):
-    description: str = Field(..., min_length=1, max_length=2000)
-
-
 class RecommendRequest(BaseModel):
     """智能体推荐的偏好：市场、能接受的最大回撤（0.25 表示 −25%，不填表示不限）、持仓周期。"""
 
@@ -166,6 +178,36 @@ class RecommendRequest(BaseModel):
         if value not in {"short", "medium", "long", "any"}:
             raise ValueError("持仓周期只能是 short/medium/long/any")
         return value
+
+
+class AgentPrefs(BaseModel):
+    market: str = "a_share"
+    max_drawdown: Optional[float] = Field(None, gt=0, le=1)
+    holding: str = "any"
+
+    @field_validator("holding")
+    @classmethod
+    def valid_holding(cls, value: str) -> str:
+        if value not in {"short", "medium", "long", "any"}:
+            raise ValueError("持仓周期只能是 short/medium/long/any")
+        return value
+
+
+class AgentAction(BaseModel):
+    type: str
+    max_drawdown: Optional[float] = None
+    holding: Optional[str] = None
+    strategy_id: Optional[int] = None
+    strategy_ids: Optional[List[int]] = None
+    term: Optional[str] = None
+
+
+class AgentTurnRequest(BaseModel):
+    """智能体对话的一轮：当前偏好 + 一个按钮动作或一句话（二选一）。"""
+
+    prefs: AgentPrefs = Field(default_factory=AgentPrefs)
+    action: Optional[AgentAction] = None
+    text: str = Field("", max_length=1000)
 
 
 class ScorecardRefreshRequest(BaseModel):

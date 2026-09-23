@@ -64,7 +64,7 @@ def is_model_strategy(row: Strategy) -> bool:
 
 
 def default_universe(row: Strategy) -> str:
-    return _DEFAULT_UNIVERSE.get(row.kind or "", row.universe or "large_cap")
+    return _DEFAULT_UNIVERSE.get(row.kind or "", normalize_universe(row.universe or "csi300"))
 
 
 def ensure_specs(db: Session) -> int:
@@ -143,6 +143,10 @@ def ensure_builtin_library(db: Session) -> None:
     rows = db.scalars(select(Strategy).order_by(Strategy.id)).all()
     first_v3 = next((r for r in rows if r.kind == "multifactor" and r.name == "沪深300增强趋势价值成长策略 V3"), None)
     for row in rows:
+        row.universe = normalize_universe(row.universe)
+        if row is first_v3:
+            # ADR-0051：原默认池是通用目录按代码顺序的前 300 支，名不副实，改为真实沪深300成分股
+            row.universe = "csi300"
         if row.kind in builtin_kinds or row is first_v3:
             row.origin = "builtin"
             if row.kind in _LEGACY_DESCRIPTIONS:
@@ -151,6 +155,10 @@ def ensure_builtin_library(db: Session) -> None:
             row.origin = "paper_snapshot"
         elif not row.origin:
             row.origin = "user"
+    from app.db.models import Portfolio
+
+    for portfolio in db.scalars(select(Portfolio)).all():
+        portfolio.execution_universe = normalize_universe(portfolio.execution_universe)
     db.commit()
 
 
@@ -172,6 +180,20 @@ def validate_date_range(strategy: PipelineStrategy, start: date, end: date) -> N
 
 
 # ---- 股票池 ----
+
+# ADR-0051：删除"按代码顺序取前 N 支"的代理股票池，旧名字映射到最接近的真实股票池，
+# 让旧回测记录、旧请求还能用，不会被误当成真实指数成分股。
+UNIVERSE_ALIASES = {"large_cap": "csi300", "hs300": "csi300", "csi_a500": "a_share", "all_assets": "a_share"}
+
+
+def normalize_universe(name: Optional[str]) -> str:
+    name = name or "csi300"
+    return UNIVERSE_ALIASES.get(name, name)
+
+
+def is_valid_universe(name: str) -> bool:
+    return name in ("a_share", "custom") or name in FIXED_UNIVERSES or name.startswith("custom:")
+
 
 def csi300_symbols() -> List[str]:
     """沪深300 成分股（离线准备时的最新名单，不是每个历史时点的名单——

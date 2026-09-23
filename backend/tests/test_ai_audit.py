@@ -1,6 +1,5 @@
 from fastapi.testclient import TestClient
 
-from app.ai.strategy_assistant import _sanitize
 from app.main import app
 
 
@@ -70,39 +69,3 @@ def test_ai_decision_on_missing_audit_id_is_404():
     with TestClient(app) as client:
         response = client.post("/api/ai/audit/999999/decision", json={"adopted": True})
         assert response.status_code == 404
-
-
-def test_strategy_assistant_falls_back_to_rules_without_an_api_key(monkeypatch):
-    """.env 文件里配了真实key，光 delenv 进程变量盖不掉它——直接把
-    strategy_assistant 模块看到的 get_ai_credentials 换成返回空key的假
-    实现，这样测试才是真的在测"没有 key 时的回退行为"。"""
-    import app.ai.strategy_assistant as module
-    from app.ai.credentials import AICredentials
-
-    monkeypatch.setattr(
-        module, "get_ai_credentials",
-        lambda db: AICredentials(api_key=None, base_url=None, model="unused", source="env"),
-    )
-    with TestClient(app) as client:
-        response = client.post("/api/ai/strategy-assistant", json={"description": "低波动、大盘股为主的月度调仓策略"})
-        assert response.status_code == 200
-        body = response.json()
-        assert body["provider"] == "rules"
-        assert isinstance(body["audit_id"], int)
-        assert body["suggested_params"]["holdings_count"] == 10
-
-
-def test_sanitize_drops_unknown_and_out_of_range_fields():
-    """策略助手不能让模型编造出参数表里没有的字段，也不能让越界的数字混进去
-    ——比如 max_weight 给到 0.9（远超允许的 0.05~0.5 上限）应该被丢弃，
-    而不是被悄悄接受。"""
-    raw = {
-        "holdings_count": 12,
-        "max_weight": 0.9,
-        "rebalance_frequency": "daily",  # 不在允许列表里
-        "made_up_field": "should be dropped",
-    }
-
-    clean = _sanitize(raw)
-
-    assert clean == {"holdings_count": 12}

@@ -41,7 +41,7 @@ class PaperTradingService:
         # scope.  A subsequent manual rebalance will use the selected
         # strategy's named universe unless a new backtest is applied.
         if hasattr(portfolio, "execution_universe"):
-            portfolio.execution_universe = "large_cap"
+            portfolio.execution_universe = "csi300"
         if hasattr(portfolio, "execution_symbols"):
             portfolio.execution_symbols = []
         if hasattr(portfolio, "source_backtest_run_id"):
@@ -166,7 +166,7 @@ class PaperTradingService:
             "strategy_id": portfolio.strategy_id,
             "strategy_name": strategy.name if strategy else None,
             "strategy_kind": strategy.kind if strategy else None,
-            "execution_universe": getattr(portfolio, "execution_universe", None) or (strategy.universe if strategy else "large_cap"),
+            "execution_universe": getattr(portfolio, "execution_universe", None) or (strategy.universe if strategy else "csi300"),
             "execution_symbols": execution_symbols,
             "source_backtest_run_id": getattr(portfolio, "source_backtest_run_id", None),
             "strategy_spec": strategy_spec(strategy).model_dump(mode="json") if strategy else None,
@@ -351,7 +351,7 @@ class PaperTradingService:
             "signals": strategy_result.ranking.head(20).to_dict(orient="records"),
             "notes": strategy_result.data_quality_notes,
             "execution_scope": {
-                "universe": getattr(portfolio, "execution_universe", None) or strategy.universe or "large_cap",
+                "universe": getattr(portfolio, "execution_universe", None) or strategy.universe or "csi300",
                 "symbols": symbols,
                 "source_backtest_run_id": getattr(portfolio, "source_backtest_run_id", None),
             },
