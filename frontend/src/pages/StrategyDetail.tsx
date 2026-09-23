@@ -44,7 +44,9 @@ export function StrategyDetail() {
   const toPaper = useMutation({
     mutationFn: async () => (await api.post('/paper/rebalance', { strategy_id: strategyId }, { timeout: 600_000 })).data,
     onSuccess: data => {
-      queryClient.invalidateQueries({ queryKey: ['paper-account'] })
+      // 调仓接口返回了新的账户快照：直接放进缓存，模拟盘页不会先显示调仓前的旧数据
+      if (data.snapshot) queryClient.setQueryData(['paper-account'], data.snapshot)
+      ;['paper-account', 'paper-equity', 'paper-orders', 'paper-automation'].forEach(key => queryClient.invalidateQueries({ queryKey: [key] }))
       setMessage(`已绑定到模拟盘并调仓：${data.orders?.length || 0} 笔订单`)
       navigate('/paper')
     },
@@ -83,7 +85,7 @@ export function StrategyDetail() {
       <Card>
         <PanelHeader title="策略规格" subtitle="保存后不再修改；要改请「基于它新建」" />
         <div className="spec-list">
-          <div><span>① 打分</span><b>{scorerText(spec, options)}</b></div>
+          <div><span>① 打分</span><b>{scorerText(spec, models ? { ...options, models } : options)}</b></div>
           <div><span>② 选股规则</span><b>{selectionText(spec)}</b></div>
           <div><span>③ 权重方案</span><b>{weightingText(spec)}</b></div>
           <div><span>④ 择时信号</span><b>{timingText(spec, options)}</b></div>
