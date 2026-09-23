@@ -58,7 +58,20 @@ def panels_from_store(store, symbols: List[str], start: date, end: date, benchma
     # 前复权比例（当天复权因子 / 区间最后一天的），给需要复权成交量、vwap 的因子用
     adj = wide["adj_factor"].ffill()
     panels["adj_ratio"] = (adj / adj.iloc[-1]).where(panels["close"].notna())
+    # 每日指标（ADR-0053）：估值、换手率、市值；库里没有时这些面板全是空值，对应因子没有值
+    basic = store.load_basic(start, end, list(code_to_symbol)) if hasattr(store, "load_basic") else pd.DataFrame()
+    traded = panels["suspended"] == 0
+    for column in BASIC_PANELS:
+        if basic.empty:
+            panels[column] = pd.DataFrame(np.nan, index=calendar, columns=panels["close"].columns)
+            continue
+        wide_basic = basic.assign(symbol=basic["ts_code"].map(code_to_symbol)).pivot_table(
+            index="trade_date", columns="symbol", values=column, aggfunc="last")
+        panels[column] = wide_basic.reindex(index=calendar, columns=panels["close"].columns).where(traded)
     return panels
+
+
+BASIC_PANELS = ("turnover_rate_f", "pe_ttm", "pb", "ps_ttm", "dv_ttm", "circ_mv")
 
 
 def panels_from_history(history: pd.DataFrame) -> Panels:
@@ -193,6 +206,43 @@ def _single_day(fn, lookback):
     return compute
 
 
+def _basic(p, column: str) -> pd.DataFrame:
+    frame = p.get(column)
+    return frame.where(frame > 0) if frame is not None else p["close"] * np.nan
+
+
+def _dividend_yield(p):
+    dv, mv = p.get("dv_ttm"), p.get("circ_mv")
+    if dv is None or mv is None:
+        return p["close"] * np.nan
+    return dv.fillna(0.0).where(mv.notna())
+
+
+def _turnover(window):
+    def compute(p):
+        turnover = p.get("turnover_rate_f")
+        if turnover is None:
+            return p["close"] * np.nan
+        return turnover.rolling(window, min_periods=window // 2).mean()
+    return compute
+
+
+def _log_circ_mv(p):
+    mv = p.get("circ_mv")
+    return np.log(mv.where(mv > 0)) if mv is not None else p["close"] * np.nan
+
+
+def _ubl_neutral(p):
+    """每天把 UBL 对流通市值对数做截面回归，取残差。"""
+    ubl = _single_day(price_factors.ubl, 30)(p)
+    size = _log_circ_mv(p).reindex_like(ubl)
+    valid = ubl.notna() & size.notna()
+    y, x = ubl.where(valid), size.where(valid)
+    x_c, y_c = x.sub(x.mean(axis=1), axis=0), y.sub(y.mean(axis=1), axis=0)
+    beta = (x_c * y_c).sum(axis=1) / (x_c ** 2).sum(axis=1)
+    return y_c - x_c.mul(beta, axis=0)
+
+
 _LEGACY_14 = [
     Factor("return_5d", "5 日收益", "价格动量", 1, "最近 5 个交易日涨跌幅", compute=_ret(5)),
     Factor("return_20d", "20 日收益", "价格动量", 1, "最近 20 个交易日涨跌幅", compute=_ret(20)),
@@ -224,6 +274,15 @@ FACTOR_LIBRARY: Dict[str, Factor] = {f.key: f for f in [
            compute=_single_day(price_factors.ubl, 30)),
     Factor("ideal_amplitude", "理想振幅", "形态", -1, price_factors.PRICE_FACTORS["ideal_amplitude"].description,
            compute=_single_day(price_factors.ideal_amplitude, 25)),
+    # ---- 每日指标类（ADR-0053，tushare daily_basic）----
+    Factor("pe", "市盈率", "估值组", -1, "市盈率 TTM（亏损公司没有值），越低越好", compute=lambda p: _basic(p, "pe_ttm")),
+    Factor("pb", "市净率", "估值组", -1, "市净率，越低越好", compute=lambda p: _basic(p, "pb")),
+    Factor("ps", "市销率", "估值组", -1, "市销率 TTM，越低越好", compute=lambda p: _basic(p, "ps_ttm")),
+    Factor("dividend_yield", "股息率", "估值组", 1, "股息率 TTM（没有分红记为 0），越高越好", compute=_dividend_yield),
+    Factor("turnover_20d", "20 日平均换手率", "量能", -1, "近 20 天自由流通换手率的均值，越低越好（低换手效应）", compute=_turnover(20)),
+    Factor("log_circ_mv", "流通市值（对数）", "规模", -1, "流通市值取对数，越小越好（小市值效应）", compute=_log_circ_mv),
+    Factor("ubl_neutral", "上下影线（市值中性）", "形态", -1,
+           "UBL 每天对流通市值对数做截面回归后取残差，即研报的市值中性化版本（东吴证券 2020）", compute=_ubl_neutral),
     Factor("salience_str", "凸显理论 STR", "行为金融", -1,
            "近 20 天按凸显度加权的收益协方差，越高越容易回落（招商证券 2022）", compute=playbook_factors.salience_str),
     Factor("terrified_score", "惊恐度", "行为金融", -1,
@@ -234,8 +293,6 @@ FACTOR_LIBRARY: Dict[str, Factor] = {f.key: f for f in [
         ("roe", "ROE", "基本面组", 1, "净资产收益率"), ("roa", "ROA", "基本面组", 1, "总资产收益率"),
         ("revenue_growth", "营收增长", "基本面组", 1, "营业收入同比增长"), ("profit_growth", "利润增长", "基本面组", 1, "净利润同比增长"),
         ("operating_cashflow", "经营现金流", "基本面组", 1, "经营活动现金流"),
-        ("pe", "市盈率", "估值组", -1, "PE"), ("pb", "市净率", "估值组", -1, "PB"), ("ps", "市销率", "估值组", -1, "PS"),
-        ("dividend_yield", "股息率", "估值组", 1, "股息率"),
         ("roe_stability", "ROE 稳定性", "盈利质量组", 1, "ROE 的稳定程度"), ("gross_margin", "毛利率", "盈利质量组", 1, "毛利率"),
         ("net_margin", "净利率", "盈利质量组", 1, "净利率"), ("cashflow_profit_ratio", "现金流/利润", "盈利质量组", 1, "经营现金流与净利润之比"),
     ]],

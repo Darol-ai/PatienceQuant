@@ -24,3 +24,6 @@ Tushare_api_guide.md
 
 # 系统内训练的模型：运行时产物，可按训练设置重训
 backend/data/models/
+
+# 每日指标（daily_basic）约 500MB，不随仓库分发：部署后服务启动时从 tushare 补齐（ADR-0053）
+backend/data/market/a_share/daily_basic/

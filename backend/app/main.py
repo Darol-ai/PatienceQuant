@@ -52,6 +52,10 @@ async def lifespan(_: FastAPI):
     from app.training.jobs import recover_interrupted
 
     recover_interrupted()
+    # 内置模型策略的模型不进仓库：新环境里缺了就自动排队训练（ADR-0053）
+    from app.pipeline.library import ensure_builtin_models
+
+    ensure_builtin_models()
     # 测试套件在tests/conftest.py里把这个环境变量设成"0"——5分钟的后台
     # 预热是给手动起的开发服务器用的，pytest的TestClient每个测试都会
     # 重新进一次lifespan，不需要也不应该跟着触发。同一个开关也用来控制

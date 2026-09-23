@@ -4,7 +4,7 @@ import { useMemo, useState } from 'react'
 // 滚动训练规则固定：给第 Y 年打分的模型只用 Y−1 年 6 月底前已揭晓的样本训练、Y−1 年下半年验证。
 
 export type TrainingConfig = {
-  framework: 'lightgbm' | 'xgboost'
+  framework: 'lightgbm' | 'xgboost' | 'lstm'
   factors: string[]
   horizon: number
   pool: string
@@ -49,7 +49,7 @@ export function TrainingForm({ value, onChange, options, strategies, pools }: {
   return <div className="training-form">
     <div className="form-grid">
       <label>算法<select value={value.framework} onChange={e => set({ framework: e.target.value as any })}>
-        <option value="lightgbm">LightGBM</option><option value="xgboost">XGBoost（用 GPU）</option>
+        <option value="lightgbm">LightGBM</option><option value="xgboost">XGBoost（用 GPU）</option><option value="lstm">LSTM（神经网络，用 GPU）</option>
       </select></label>
       <label>预测周期<select value={value.horizon} onChange={e => set({ horizon: Number(e.target.value) })}>
         <option value={20}>未来 20 个交易日收益</option><option value={60}>未来 60 个交易日收益</option><option value={90}>未来 90 个交易日收益</option>
@@ -77,10 +77,13 @@ export function TrainingForm({ value, onChange, options, strategies, pools }: {
           <input type="checkbox" checked={value.factors.includes(f.key)} onChange={() => toggle(f.key)}/>{f.label}
         </label>)}</div>
       </div>)}
-      <p className="muted-note">基本面、估值、盈利质量类因子需要财务数据，还没接入，不能用来训练。</p>
+      <p className="muted-note">基本面、盈利质量类因子需要财务报表数据，还没接入，不能用来训练；估值、换手率、市值类因子来自每日指标。</p>
     </div>
 
-    <div className="form-grid">
+    {value.framework === 'lstm' ? <div className="form-grid">
+      <label>随机种子个数（预测取平均）<input type="number" min={1} max={5} value={value.seeds} onChange={e => set({ seeds: Math.min(5, Math.max(1, Number(e.target.value))) })}/></label>
+      <p className="muted-note full">LSTM 的设置固定：输入每只股票过去 20 个交易日的因子序列，因子一律先换成当天的百分位；隐藏层 32；每 5 个交易日取一次训练样本；最多训练 15 轮，验证集连续 3 轮不再变好就停。</p>
+    </div> :     <div className="form-grid">
       <label>树的数量<input type="number" min={50} max={2000} step={50} value={value.n_estimators} onChange={e => set({ n_estimators: Number(e.target.value) })}/></label>
       <label>学习率<input type="number" min={0.001} max={0.5} step={0.01} value={value.learning_rate} onChange={e => set({ learning_rate: Number(e.target.value) })}/></label>
       {value.framework === 'lightgbm'
@@ -89,7 +92,7 @@ export function TrainingForm({ value, onChange, options, strategies, pools }: {
       <label>随机种子个数（预测取平均）<input type="number" min={1} max={5} value={value.seeds} onChange={e => set({ seeds: Math.min(5, Math.max(1, Number(e.target.value))) })}/></label>
       <label className="checkbox-row full"><span>因子先换成当天在股票池里的百分位（默认用原始值，和旧模型一致）</span>
         <input type="checkbox" checked={value.cs_rank} onChange={e => set({ cs_rank: e.target.checked })}/></label>
-    </div>
+    </div>}
     <p className="muted-note">滚动训练规则固定：给第 Y 年打分的模型，只用 Y−1 年 6 月底前已揭晓的样本训练、Y−1 年下半年的样本做验证，在第 Y 年上预测；数据从 2010 年开始，最早能给 2012 年打分。保存后在后台训练，训练好会自动算成绩卡。</p>
   </div>
 }

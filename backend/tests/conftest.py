@@ -35,6 +35,7 @@ os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB_PATH}"
 os.environ["DATA_MODE"] = "demo"
 
 os.environ["PATIENCEQUANT_WARM_CSI300"] = "0"
+os.environ["PATIENCEQUANT_AUTO_TRAIN"] = "0"
 
 # backend/.env 里配了真实的大模型 key——测试不能真的去调它（花钱、结果不确定）。
 # 需要测大模型分支的测试自己 monkeypatch get_ai_credentials。

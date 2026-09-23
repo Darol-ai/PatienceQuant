@@ -34,6 +34,10 @@ def _run() -> None:
         report = store.backfill(on_progress=progress)
         store.refresh_index(BENCHMARK_INDEX)
         store.refresh_index_members(BENCHMARK_INDEX)
+        # 每日指标跟着日线补（ADR-0053）
+        basic = store.backfill_basic(on_progress=progress)
+        if basic.stopped_reason and not report.stopped_reason:
+            report.stopped_reason = "每日指标：" + basic.stopped_reason
         _state.update(
             filled_days=len(report.filled_days),
             empty_days=[d.isoformat() for d in report.empty_days],

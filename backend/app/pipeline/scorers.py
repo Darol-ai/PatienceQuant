@@ -16,7 +16,7 @@ from app.data.service import MarketDataService
 from app.factors.engine import FactorEngine, GROUP_FACTORS
 from app.pipeline.bars import warmup_start
 from app.pipeline.price_factors import PRICE_FACTORS
-from app.pipeline.model_library import load_folds, model_exists, model_factors, model_uses_cs_rank, model_years
+from app.pipeline.model_library import load_folds, model_exists, model_factors, model_framework, model_uses_cs_rank, model_years
 from app.pipeline.spec import FactorWeightScorerSpec, ModelScorerSpec
 
 # 真实模式下只有日线行情是真的。财务/估值数据还没接入本地行情库，
@@ -24,6 +24,10 @@ from app.pipeline.spec import FactorWeightScorerSpec, ModelScorerSpec
 # 这些数不能进入真实模式的打分。
 PRICE_FACTOR_GROUPS = {"momentum", "risk"}
 FUNDAMENTAL_FACTOR_GROUPS = set(GROUP_FACTORS) - PRICE_FACTOR_GROUPS
+# 有了每日指标（ADR-0053）后，真实模式下估值组改用因子库里的真实市盈率/市净率/市销率/股息率；
+# 基本面组和盈利质量组仍然需要财务报表，继续不可用
+LIBRARY_FACTOR_GROUPS = {"valuation"}
+UNAVAILABLE_REAL_GROUPS = FUNDAMENTAL_FACTOR_GROUPS - LIBRARY_FACTOR_GROUPS
 
 
 @dataclass
@@ -73,14 +77,15 @@ class FactorWeightScorer(Scorer):
             raise ValueError("未知的因子：%s" % "、".join(unknown))
         self.requested = {k: float(v) for k, v in spec.weights.items() if float(v) > 0}
         self.real_mode = data.mode != "demo"
-        dropped = FUNDAMENTAL_FACTOR_GROUPS & set(self.requested) if self.real_mode else set()
+        dropped = UNAVAILABLE_REAL_GROUPS & set(self.requested) if self.real_mode else set()
         self.effective = {k: v for k, v in self.requested.items() if k not in dropped}
         self.dropped = sorted(dropped)
         if not self.effective:
             raise ValueError("真实模式下没有可用的因子：%s 需要财务数据，本地行情库还没有" % "、".join(self.dropped))
-        self.group_weights = {k: v for k, v in self.effective.items() if k in GROUP_FACTORS}
+        real_groups = LIBRARY_FACTOR_GROUPS if self.real_mode else set()
+        self.group_weights = {k: v for k, v in self.effective.items() if k in GROUP_FACTORS and k not in real_groups}
         self.price_weights = {k: v for k, v in self.effective.items() if k in PRICE_FACTORS}
-        self.library_weights = {k: v for k, v in self.effective.items() if k in library_keys}
+        self.library_weights = {k: v for k, v in self.effective.items() if k in library_keys or k in real_groups}
         if self.library_weights:
             self.warmup_days = 300  # 一年期因子（如 12 个月收益）要约 252 个交易日
         self._panel: Dict[str, pd.DataFrame] = {}
@@ -108,19 +113,32 @@ class FactorWeightScorer(Scorer):
         bench = store.load_index(BENCHMARK_INDEX, warm, end)
         bench_series = pd.Series(bench["close"].to_numpy(dtype=float), index=pd.to_datetime(bench["trade_date"])) if not bench.empty else None
         panels = panels_from_store(store, symbols, warm, end, benchmark=bench_series)
-        self._library_values = compute_factors(panels, list(self.library_weights))
+        from app.pipeline.factor_library import FACTOR_GROUPS
+
+        keys = [k for key in self.library_weights for k in (FACTOR_GROUPS[key] if key in LIBRARY_FACTOR_GROUPS else [key])]
+        self._library_values = compute_factors(panels, list(dict.fromkeys(keys)))
 
     def _library_factor_scores(self, as_of: date, symbols: List[str]) -> pd.DataFrame:
         from app.pipeline.factor_library import FACTOR_LIBRARY
 
+        from app.pipeline.factor_library import FACTOR_GROUPS
+
         result = pd.DataFrame(index=pd.Index(symbols, name="symbol"))
         day = pd.Timestamp(as_of)
-        for key in self.library_weights:
+
+        def single(key: str) -> pd.Series:
             values = self._library_values.get(key)
             raw = values.loc[day].reindex(symbols) if values is not None and day in values.index else pd.Series(np.nan, index=symbols)
             raw = raw.replace([np.inf, -np.inf], np.nan)
             result["factor_" + key] = raw
-            result["score_" + key] = raw.rank(pct=True, ascending=FACTOR_LIBRARY[key].direction > 0) * 100
+            return raw.rank(pct=True, ascending=FACTOR_LIBRARY[key].direction > 0) * 100
+
+        for key in self.library_weights:
+            if key in LIBRARY_FACTOR_GROUPS:
+                # 和 FactorEngine 的因子组一样：组内每个因子的池内百分位取平均
+                result["score_" + key] = pd.concat([single(k) for k in FACTOR_GROUPS[key]], axis=1).mean(axis=1)
+            else:
+                result["score_" + key] = single(key)
         return result
 
     def _price_factor_scores(self, as_of: date, symbols: List[str]) -> pd.DataFrame:
@@ -218,6 +236,14 @@ class ModelScorer(Scorer):
         panels = panels_from_store(self.store, symbols, warm, end, benchmark=bench_series)
         self._values = compute_factors(panels, self.factor_keys)
         self._cache = {}
+        # LSTM 的输入是每天的百分位序列（和训练时同一种做法，见 app/training/lstm.py）
+        self._sequences = {}
+        for model_id in self.model_ids:
+            if model_framework(model_id) == "lstm":
+                from app.training.lstm import ranked_array
+
+                keys = model_factors(model_id)
+                self._sequences[model_id] = ranked_array(self._values, keys, panels["suspended"])
 
     def _factors_on(self, as_of: date, symbols: List[str]) -> pd.DataFrame:
         day = pd.Timestamp(as_of)
@@ -236,6 +262,9 @@ class ModelScorer(Scorer):
                 inputs = factors[model_factors(model_id)].dropna()
                 if fold is None or inputs.empty:
                     continue
+                if model_id in self._sequences:
+                    self._score_lstm(model_id, fold, as_of, inputs.index, predictions)
+                    continue
                 if model_uses_cs_rank(model_id):
                     inputs = inputs.rank(pct=True)  # 和训练时一样：当天在股票池里的百分位
                 predictions.loc[inputs.index, "pred_" + model_id.split("/", 1)[-1]] = fold.predict(inputs)
@@ -247,6 +276,26 @@ class ModelScorer(Scorer):
         notes = (["部分股票在某些调仓日没有分数、不参与选股（上市不足 120 个交易日、当天停牌或该年没有模型）"]
                  if scores.isna().any() else [])
         return ScoreResult(scores=scores, detail=predictions.reindex(symbols), notes=notes)
+
+
+def _score_lstm_impl(self, model_id: str, fold, as_of: date, symbols, predictions: pd.DataFrame) -> None:
+    from app.training.lstm import sequences_on
+
+    frame = next(iter(self._values.values()))
+    day = pd.Timestamp(as_of)
+    if day not in frame.index:
+        return
+    position = {s: i for i, s in enumerate(frame.columns)}
+    names = [s for s in symbols if s in position]
+    batch = sequences_on(self._sequences[model_id], frame.index.get_loc(day), [position[s] for s in names])
+    if batch is None:
+        return
+    scores = np.mean([predict(batch) for predict in fold.predictors], axis=0)
+    predictions.loc[names, "pred_" + model_id.split("/", 1)[-1]] = scores
+
+
+ModelScorer._score_lstm = _score_lstm_impl
+ModelScorer._sequences = {}
 
 
 def build_scorer(spec, data: MarketDataService, store: AShareMarketStore) -> Scorer:

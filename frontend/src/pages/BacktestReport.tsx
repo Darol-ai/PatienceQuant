@@ -5,6 +5,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, dataModeLabel, formatMoney, formatPercent } from '../api'
 import { BarChart, DrawdownChart, EquityChart, StockTradeChart } from '../components/Charts'
 import { Card, ErrorState, LoadingState, PageHeader, PanelHeader } from '../components/UI'
+import { DataNote } from '../components/DataNote'
 import { describeSpec, timingText, universeLabel } from '../strategy'
 
 // 回测报告（ADR-0051）：每次回测一个固定地址。数据全部来自 GET /backtests/{id}/result，
@@ -99,6 +100,8 @@ export function BacktestReport() {
         description={`${result.start_date} ~ ${result.end_date} · ${universeLabel(result.universe, pools)} · 初始 ${formatMoney(initialCapital)} · 手续费 ${formatPercent(result.commission ?? 0, 2)}、滑点 ${formatPercent(result.slippage ?? 0, 2)} · ${describeSpec(result.strategy_config?.spec, options)}`}
         actions={<Link className="secondary-button" to={`/backtest?strategy_id=${result.strategy_id}`}>换个条件再回测</Link>}
       />
+      <DataNote strategyId={result.strategy_id} start={result.start_date} end={result.end_date} universe={result.universe}
+        totalReturn={result.metrics?.total_return} benchmarkReturn={result.metrics?.benchmark_return}/>
       {result.notes?.length > 0 && <div className="strategy-note" style={{ marginBottom: 16 }}><div><b>这次回测的说明</b>{result.notes.slice(0, 6).map((note: string) => <p key={note}>{note}</p>)}</div></div>}
 
           <div className="backtest-result-callout">

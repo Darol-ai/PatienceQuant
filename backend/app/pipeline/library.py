@@ -135,7 +135,70 @@ BUILTIN_STRATEGIES: List[dict] = [
           ("apb_20d", "买卖压力APB因子选股", "按均价偏差APB从高到低（东方证券2019：20日vwap算术平均相对成交量加权平均的对数，"
                                           "越高买压越大；研报的日度版需要30分钟K线，这里用月度版）"),
       ]],
+    # ---- 每日指标接入后（ADR-0053）----
+    {"kind": "pb_ubl_neutral", "name": "上下影线因子选股（市值中性）",
+     "description": "按市值中性化后的上下影线因子UBL从低到高选前30名等权，每月调仓（东吴证券2020；每天把UBL对流通市值对数做截面回归取残差，"
+                    "即研报的完整做法）。" + _PLAYBOOK,
+     "spec": {"scorer": {"type": "factor_weights", "weights": {"ubl_neutral": 1.0}}, "selection": {"type": "top_n", "n": 30}}},
+    {"kind": "valuation_value", "name": "估值因子选股（沪深300）",
+     "description": "估值组（市盈率、市净率、市销率越低越好，股息率越高越好，四个因子的池内百分位取平均）选前30名等权，每月调仓。"
+                    "数据来自每日指标（tushare daily_basic）。",
+     "spec": {"scorer": {"type": "factor_weights", "weights": {"valuation": 1.0}}, "selection": {"type": "top_n", "n": 30}}},
 ]
+
+
+# ---- 系统内训练的内置模型策略（ADR-0053）：只写训练设置，模型不进仓库；
+# 启动时按设置算出模型编号，缺了就自动排队训练（ensure_builtin_models）----
+
+_TRAINING_BASE = {"horizon": 90, "pool": "csi300", "membership": "historical", "n_estimators": 300, "learning_rate": 0.05,
+                  "num_leaves": 15, "max_depth": 4, "seeds": 5, "cs_rank": False}
+_LEGACY_14 = ["return_5d", "return_20d", "return_60d", "return_120d", "volatility_20d", "volatility_60d", "max_drawdown_60d",
+              "ma_deviation_20d", "ma_deviation_60d", "ma_deviation_120d", "atr_ratio_20d", "volume_ratio_20d",
+              "avg_amount_60d", "valid_trading_ratio_60d"]
+# "全部日线因子"固定为建这个策略时因子库里的 25 个；因子库以后再扩充，这个策略的输入不跟着变（否则就是另一个模型）
+_ALL_DAILY_25 = _LEGACY_14 + ["return_3m", "return_6m", "return_12m", "volatility", "max_drawdown", "beta", "ubl",
+                              "ideal_amplitude", "salience_str", "terrified_score", "apb_20d"]
+_MODEL_STRATEGY_SPEC = {"selection": {"type": "top_pct", "pct": 0.1}, "weighting": {"type": "equal", "max_weight": 1.0},
+                        "timing": {"type": "none"}, "rebalance": {"frequency": "monthly", "turnover_band": 0}}
+
+TRAINED_BUILTINS: List[dict] = [
+    {"kind": "trained_csi300_lightgbm", "name": "LightGBM沪深300策略（系统内训练）",
+     "description": "沪深300历史成分股，LightGBM 用旧模型同样的 14 个因子、90 日预测、5 个种子，在系统里按 2010 年起的本地行情库"
+                    "逐年滚动训练；选前 10% 等权，每月调仓，不择时。",
+     "training": {"framework": "lightgbm", "factors": _LEGACY_14, **_TRAINING_BASE}},
+    {"kind": "trained_csi300_xgboost", "name": "XGBoost沪深300策略（系统内训练）",
+     "description": "与上一个相同，算法换成 XGBoost。",
+     "training": {"framework": "xgboost", "factors": _LEGACY_14, **_TRAINING_BASE}},
+    {"kind": "trained_csi300_all_daily_lightgbm", "name": "全部日线因子LightGBM（沪深300）",
+     "description": "沪深300历史成分股，LightGBM 输入因子库里全部 25 个只用日线的因子，其余设置同旧模型；选前 10% 等权，每月调仓，不择时。",
+     "training": {"framework": "lightgbm", "factors": _ALL_DAILY_25, **_TRAINING_BASE}},
+    {"kind": "trained_csi300_lstm", "name": "LSTM沪深300策略（系统内训练）",
+     "description": "沪深300历史成分股，LSTM 输入旧模型同样 14 个因子过去 20 个交易日的序列（每天换成百分位），预测 90 日收益的"
+                    "池内排名，5 个种子平均，2010 年起逐年滚动训练；选前 10% 等权，每月调仓，不择时。",
+     "training": {"framework": "lstm", "factors": _LEGACY_14, **_TRAINING_BASE}},
+]
+
+
+def trained_builtin_config(item: dict):
+    from app.training.trainer import TrainingConfig
+
+    return TrainingConfig(**{**item["training"], "factors": list(item["training"]["factors"])}).validate()
+
+
+def ensure_builtin_models() -> List[str]:
+    """内置模型策略的模型缺失（新环境、或上次训练失败）时排队训练，返回排队的模型编号。"""
+    import os
+
+    from app.training import jobs
+
+    if os.environ.get("PATIENCEQUANT_AUTO_TRAIN", "1") == "0":
+        return []
+    queued = []
+    for item in TRAINED_BUILTINS:
+        model_id, _, is_new = jobs.ensure_model(trained_builtin_config(item), f"内置策略「{item['name']}」的模型")
+        if is_new:
+            queued.append(model_id)
+    return queued
 
 
 # 迁移前的内置策略描述里带着迁移前、口径不同的成绩数字（如"7年复合+611.9%"），
@@ -172,7 +235,19 @@ def ensure_builtin_library(db: Session) -> None:
             trend_filter=False, stop_loss=0, target_volatility=0, max_drawdown_budget=0, cash_buffer=0,
             research_start_date=_date(2019, 1, 1), research_end_date=_date(2025, 12, 31), is_default=False,
         ))
-    builtin_kinds = set(_MODEL_SPECS) | {item["kind"] for item in BUILTIN_STRATEGIES}
+    for item in TRAINED_BUILTINS:
+        if db.scalar(select(Strategy).where(Strategy.kind == item["kind"]).limit(1)):
+            continue
+        model_id = f"trained/{trained_builtin_config(item).fingerprint()}"
+        spec = StrategySpec.model_validate({**_MODEL_STRATEGY_SPEC, "scorer": {"type": "model", "models": [model_id]}})
+        db.add(Strategy(
+            name=item["name"], kind=item["kind"], version=1, description=item["description"],
+            spec=spec.model_dump(mode="json"), origin="builtin", universe="csi300", weights={},
+            holdings_count=0, max_weight=1.0, rebalance_frequency="monthly", turnover_band=0,
+            trend_filter=False, stop_loss=0, target_volatility=0, max_drawdown_budget=0, cash_buffer=0,
+            research_start_date=_date(2019, 1, 1), research_end_date=_date(2025, 12, 31), is_default=False,
+        ))
+    builtin_kinds = set(_MODEL_SPECS) | {item["kind"] for item in BUILTIN_STRATEGIES} | {item["kind"] for item in TRAINED_BUILTINS}
     rows = db.scalars(select(Strategy).order_by(Strategy.id)).all()
     first_v3 = (next((r for r in rows if r.kind == "multifactor" and r.origin == "builtin"), None)
                 or next((r for r in rows if r.kind == "multifactor" and r.name == OLD_V3_NAME), None))

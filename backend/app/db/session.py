@@ -48,6 +48,11 @@ def migrate_lightweight_schema() -> None:
         if "color" not in columns:
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE research_groups ADD COLUMN color VARCHAR(20) DEFAULT '#31d0aa'"))
+    if "watchlists" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("watchlists")}
+        if "notes" not in columns:
+            with engine.begin() as connection:
+                connection.execute(text("ALTER TABLE watchlists ADD COLUMN notes JSON DEFAULT '{}'"))
     if "portfolio" in inspector.get_table_names():
         columns = {column["name"] for column in inspector.get_columns("portfolio")}
         migrations = {

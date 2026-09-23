@@ -66,6 +66,8 @@ class Watchlist(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(80), unique=True)
     symbols: Mapped[List[str]] = mapped_column(JSON, default=list)
+    # 研究标注（ADR-0053）：{代码: {"sector": 所属板块/主题, "thesis": 研究理由}}
+    notes: Mapped[Dict[str, Dict[str, str]]] = mapped_column(JSON, default=dict)
 
 
 class ResearchAnnotation(Base):

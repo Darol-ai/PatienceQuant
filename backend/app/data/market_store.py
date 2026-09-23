@@ -29,6 +29,8 @@ DEFAULT_ROOT = Path(__file__).resolve().parents[2] / "data" / "market"
 STORE_START = date(2010, 1, 1)
 INDEX_START = date(2005, 1, 1)
 DAILY_COLUMNS = ["ts_code", "trade_date", "open", "high", "low", "close", "vol", "amount", "adj_factor"]
+# 每日指标：换手率(%)、市盈率/市净率/市销率(TTM)、股息率(TTM,%)、总市值/流通市值(万元)
+BASIC_COLUMNS = ["ts_code", "trade_date", "turnover_rate", "turnover_rate_f", "pe_ttm", "pb", "ps_ttm", "dv_ttm", "total_mv", "circ_mv"]
 _FLUSH_EVERY_DAYS = 20
 
 Runner = Callable[[Callable[[object], pd.DataFrame]], pd.DataFrame]
@@ -189,6 +191,79 @@ class AShareMarketStore:
             for column in ("open", "high", "low", "close"):
                 data[column] = data[column] * ratio
         return data
+
+    # ---- 每日指标（tushare daily_basic，ADR-0053）----
+
+    def _basic_path(self, year: int) -> Path:
+        return self.root / "daily_basic" / f"{year}.parquet"
+
+    def stored_basic_days(self) -> List[date]:
+        folder = self.root / "daily_basic"
+        if not folder.exists():
+            return []
+        days = set()
+        for path in folder.glob("*.parquet"):
+            days.update(pd.read_parquet(path, columns=["trade_date"])["trade_date"].dt.date.unique())
+        return sorted(days)
+
+    def missing_basic_days(self, until: date) -> List[date]:
+        """库里已有日线、但还没有每日指标的交易日（每日指标跟着日线补，不单独超前）。"""
+        stored = set(self.stored_basic_days())
+        return [day for day in self.stored_days() if day <= until and day not in stored]
+
+    def backfill_basic(self, until: Optional[date] = None, max_days: Optional[int] = None,
+                       on_progress: Optional[Callable[[date, int, int], None]] = None) -> BackfillReport:
+        """每个交易日一次 daily_basic 调用；可随时中断、下次续补。"""
+        until = until or self.latest_trading_day()
+        todo = self.missing_basic_days(until)
+        if max_days is not None:
+            todo = todo[:max_days]
+        report = BackfillReport(requested_days=len(todo))
+        buffer: List[pd.DataFrame] = []
+        try:
+            for index, day in enumerate(todo, start=1):
+                ds = _compact(day)
+                rows = self.runner(lambda pro: pro.daily_basic(trade_date=ds, fields=",".join(BASIC_COLUMNS)))
+                if rows is None or rows.empty:
+                    report.empty_days.append(day)
+                else:
+                    rows = rows.reindex(columns=BASIC_COLUMNS)
+                    rows["trade_date"] = pd.to_datetime(rows["trade_date"], format="%Y%m%d")
+                    buffer.append(rows)
+                    report.filled_days.append(day)
+                if len(buffer) >= _FLUSH_EVERY_DAYS:
+                    self._append_basic(buffer)
+                    buffer = []
+                if on_progress:
+                    on_progress(day, index, len(todo))
+        except TushareQueryFailed as exc:
+            report.stopped_reason = str(exc)
+        finally:
+            self._append_basic(buffer)
+        return report
+
+    def _append_basic(self, frames: List[pd.DataFrame]) -> None:
+        if not frames:
+            return
+        batch = pd.concat(frames, ignore_index=True)
+        for year, rows in batch.groupby(batch["trade_date"].dt.year):
+            path = self._basic_path(int(year))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                rows = pd.concat([pd.read_parquet(path), rows], ignore_index=True)
+            rows = rows.drop_duplicates(["ts_code", "trade_date"], keep="last").sort_values(["trade_date", "ts_code"])
+            rows.to_parquet(path, index=False, compression="zstd")
+
+    def load_basic(self, start: date, end: date, ts_codes: Optional[Iterable[str]] = None) -> pd.DataFrame:
+        """读 [start, end] 的每日指标（市值单位万元，换手率单位 %，与 tushare 相同）。"""
+        frames = [pd.read_parquet(self._basic_path(y)) for y in range(start.year, end.year + 1) if self._basic_path(y).exists()]
+        if not frames:
+            return pd.DataFrame(columns=BASIC_COLUMNS)
+        data = pd.concat(frames, ignore_index=True)
+        data = data[(data["trade_date"] >= pd.Timestamp(start)) & (data["trade_date"] <= pd.Timestamp(end))]
+        if ts_codes is not None:
+            data = data[data["ts_code"].isin(set(ts_codes))]
+        return data.reset_index(drop=True)
 
     # ---- 指数 ----
 

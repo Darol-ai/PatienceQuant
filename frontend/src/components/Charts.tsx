@@ -59,3 +59,30 @@ export function BarChart({ data, category = 'year', value = 'strategy', percent 
   const option = { tooltip: { trigger: 'axis' }, grid: { left: 15, right: 12, top: 20, bottom: 22, containLabel: true }, xAxis: { type: 'category', data: data.map(i => i[category]), ...axis }, yAxis: { type: 'value', axisLabel: { formatter: (v: number) => percent ? `${(v*100).toFixed(0)}%` : v, color: '#7890a8' }, splitLine: axis.splitLine }, series: [{ type: 'bar', barMaxWidth: 30, name: '策略', color: '#31d0aa', data: data.map(i => ({ value: i[value], itemStyle: { color: i[value] >= 0 ? '#31d0aa' : '#fb7185', borderRadius: i[value] >= 0 ? [4,4,0,0] : [0,0,4,4] } })) }, ...(compare ? [{ type: 'bar', barMaxWidth: 30, name: compare.label, data: data.map(i => i[compare.key]), itemStyle: { color: '#94a3b8' } }] : [])], ...(compare ? { legend: { top: 0, textStyle: { color: '#7890a8' } } } : {}) }
   return <ReactECharts option={option} style={{ height: 260 }} />
 }
+
+// 股票池分析（ADR-0053）：成员近一年收益-波动散点，按板块/行业着色
+export function PoolScatterChart({ points }: { points: any[] }) {
+  const groups = Array.from(new Set(points.map(p => p.group)))
+  const option = {
+    tooltip: { formatter: (p: any) => `<b>${p.data[3]} ${p.data[2]}</b><br/>${p.seriesName}<br/>近一年收益 ${(p.data[1] * 100).toFixed(1)}%<br/>年化波动 ${(p.data[0] * 100).toFixed(1)}%` },
+    legend: { type: 'scroll', bottom: 0, textStyle: { color: '#8ba0b5' } },
+    grid: { left: 15, right: 20, top: 30, bottom: 60, containLabel: true },
+    xAxis: { name: '年化波动', nameLocation: 'middle', nameGap: 26, ...axis, axisLabel: { color: '#7890a8', formatter: (v: number) => `${(v * 100).toFixed(0)}%` } },
+    yAxis: { name: '近一年收益', ...axis, axisLabel: { color: '#7890a8', formatter: (v: number) => `${(v * 100).toFixed(0)}%` } },
+    series: groups.map(g => ({ name: g, type: 'scatter', symbolSize: 10, data: points.filter(p => p.group === g).map(p => [p.volatility, p.return, p.name, p.symbol]) })),
+  }
+  return <ReactECharts option={option} style={{ height: 340 }} />
+}
+
+export function PoolCurveChart({ data }: { data: any[] }) {
+  const option = {
+    tooltip: { trigger: 'axis', valueFormatter: (v: number) => `${((v - 1) * 100).toFixed(1)}%` },
+    legend: { data: ['股票池等权', '沪深300'], top: 0, textStyle: { color: '#8ba0b5' } },
+    grid: { left: 15, right: 16, top: 34, bottom: 25, containLabel: true },
+    xAxis: { type: 'category', boundaryGap: false, data: data.map(i => i.date), ...axis },
+    yAxis: { type: 'value', scale: true, ...axis, axisLabel: { color: '#7890a8', formatter: (v: number) => `${((v - 1) * 100).toFixed(0)}%` } },
+    series: [{ name: '股票池等权', type: 'line', showSymbol: false, color: '#31d0aa', data: data.map(i => i.pool), lineStyle: { width: 2.2 } },
+             { name: '沪深300', type: 'line', showSymbol: false, color: '#6c8cff', data: data.map(i => i.benchmark), lineStyle: { width: 1.6 } }],
+  }
+  return <ReactECharts option={option} style={{ height: 280 }} />
+}

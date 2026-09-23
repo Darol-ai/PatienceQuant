@@ -75,3 +75,61 @@ def test_factor_weight_strategy_can_use_any_daily_library_factor():
         run = client.post("/api/backtests", json={"strategy_id": created.json()["id"], "start_date": "2024-01-01", "end_date": "2024-06-30"})
         assert run.status_code == 200, run.text
         assert run.json()["metrics"]["trade_count"] > 0
+
+
+def test_trained_builtins_rebuild_missing_models(monkeypatch, tmp_path):
+    """新环境里没有内置模型策略的模型：登记策略时模型编号由训练设置决定，启动时缺了就排队训练（ADR-0053）。"""
+    from app.pipeline import library
+    from app.training import jobs, trainer
+
+    monkeypatch.setattr(trainer, "MODELS_ROOT", tmp_path)
+    queued = []
+    monkeypatch.setattr(jobs, "enqueue", queued.append)
+    monkeypatch.setenv("PATIENCEQUANT_AUTO_TRAIN", "1")
+
+    ids = library.ensure_builtin_models()
+    expected = [f"trained/{library.trained_builtin_config(item).fingerprint()}" for item in library.TRAINED_BUILTINS]
+    assert ids == expected == queued
+    assert all(trainer.read_record(i)["status"] == "queued" for i in ids)
+    # 已经登记过（排队中或可用）的不会重复排队
+    assert library.ensure_builtin_models() == [] and len(queued) == len(library.TRAINED_BUILTINS)
+
+    monkeypatch.setenv("PATIENCEQUANT_AUTO_TRAIN", "0")
+    assert library.ensure_builtin_models() == []
+
+
+def test_lstm_trains_and_scores_consistently(monkeypatch, tmp_path):
+    """LSTM：训练时对样本外的预测，和回测打分时按同一天序列算出的预测一致（口径相同）。"""
+    import numpy as np
+    from datetime import date
+
+    from app.data.market_refresh import get_market_store
+    from app.pipeline.library import broad30_symbols
+    from app.pipeline.scorers import ModelScorer
+    from app.pipeline.spec import ModelScorerSpec
+    from app.training import lstm, trainer
+
+    monkeypatch.setattr(trainer, "MODELS_ROOT", tmp_path)
+    store = get_market_store()
+    until = date(2021, 12, 31)
+    config = trainer.TrainingConfig(framework="lstm", factors=["return_20d", "volatility_20d", "ma_deviation_20d"],
+                                    pool="broad30", seeds=1).validate()
+    metrics = trainer.train(config, "trained/lstm_test", until, progress=lambda _: None)
+    assert metrics["2021"]["ic"] is not None
+    trainer.write_record({"id": "trained/lstm_test", "status": "ready", "config": config.__dict__, "name": "lstm test"})
+
+    symbols = broad30_symbols()
+    scorer = ModelScorer(ModelScorerSpec(models=["trained/lstm_test"]), store)
+    scorer.prepare(symbols, date(2021, 3, 1), date(2021, 3, 31))
+    scores = scorer.score(date(2021, 3, 31), symbols).scores.dropna()
+    assert len(scores) >= 20
+
+    # 用训练时的整段面板重算同一天的序列，逐只比对
+    values, panels, _ = trainer._pool_panels(config, until, lambda _: None)
+    close = panels["close"]
+    ranked = lstm.ranked_array(values, config.factors, panels["suspended"])
+    day = close.index.get_loc(np.datetime64("2021-03-31"))
+    columns = [list(close.columns).index(s) for s in scores.index]
+    fold = __import__("app.pipeline.model_library", fromlist=["load_folds"]).load_folds("trained/lstm_test")[2021]
+    expected = np.mean([p(lstm.sequences_on(ranked, day, columns)) for p in fold.predictors], axis=0)
+    np.testing.assert_allclose(scores.to_numpy(), expected, rtol=1e-4, atol=1e-5)

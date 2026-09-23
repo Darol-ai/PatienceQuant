@@ -23,7 +23,7 @@ export function scorerText(spec: Spec | undefined, options?: any): string {
   if (!spec) return ''
   if (spec.scorer.type === 'model') {
     const name = (id: string) => options?.models?.find((m: any) => m.id === id)?.name || id
-    return `模型打分（${spec.scorer.models.map(name).join(' + ')}）`
+    return spec.scorer.models.length ? `模型打分（${spec.scorer.models.map(name).join(' + ')}）` : '模型打分（保存后按训练设置训练新模型）'
   }
   const label = (key: string) => options?.factors?.find((f: any) => f.key === key)?.label || key
   return `因子打分（${Object.entries(spec.scorer.weights).filter(([, w]) => Number(w) > 0).map(([k, w]) => `${label(k)} ${Math.round(Number(w) * 100)}%`).join('、')}）`

@@ -168,3 +168,33 @@ def test_apb_sign_follows_where_volume_trades():
     volume = pd.DataFrame({"A": np.linspace(5, 1, 20), "B": np.linspace(1, 5, 20)}, index=idx) * 1e6
     last = apb({"close": price, "volume": volume, "amount": price * volume}).iloc[-1]
     assert last["A"] > 0 > last["B"]
+
+
+def test_ubl_neutral_is_uncorrelated_with_size():
+    from app.pipeline.factor_library import FACTOR_LIBRARY
+
+    panels = _panels(days=80, stocks=40, seed=5)
+    rng = np.random.default_rng(6)
+    panels["circ_mv"] = panels["close"] * 0 + rng.uniform(1e5, 1e7, 40)
+    panels["suspended"] = panels["close"] * 0
+    neutral = FACTOR_LIBRARY["ubl_neutral"].compute(panels).iloc[-1]
+    size = np.log(panels["circ_mv"].iloc[-1])
+    assert neutral.notna().sum() == 40
+    assert abs(np.corrcoef(neutral, size)[0, 1]) < 1e-8
+
+
+def test_daily_basic_factors_handle_missing_data():
+    from app.pipeline.factor_library import FACTOR_LIBRARY
+
+    panels = _panels(days=30, stocks=3)
+    idx, cols = panels["close"].index, panels["close"].columns
+    panels["dv_ttm"] = pd.DataFrame([[1.5, np.nan, 2.0]] * 30, index=idx, columns=cols)
+    panels["circ_mv"] = pd.DataFrame([[1e6, 2e6, np.nan]] * 30, index=idx, columns=cols)
+    panels["pe_ttm"] = pd.DataFrame([[10.0, -5.0, np.nan]] * 30, index=idx, columns=cols)
+    dy = FACTOR_LIBRARY["dividend_yield"].compute(panels).iloc[-1]
+    assert dy["S00"] == 1.5 and dy["S01"] == 0.0 and np.isnan(dy["S02"])  # 有市值没分红记 0；没有每日指标不给值
+    pe = FACTOR_LIBRARY["pe"].compute(panels).iloc[-1]
+    assert pe["S00"] == 10.0 and np.isnan(pe["S01"])  # 亏损（负 PE）不给值
+    # 完全没有每日指标面板（如 demo 数据）时因子为空，而不是报错
+    bare = {k: v for k, v in panels.items() if k not in ("dv_ttm", "circ_mv", "pe_ttm")}
+    assert FACTOR_LIBRARY["turnover_20d"].compute(bare).isna().all().all()

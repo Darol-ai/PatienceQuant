@@ -117,3 +117,29 @@ def _after_ready(model_id: str) -> None:
             time.sleep(10)
 
     threading.Thread(target=retry, name="scorecard-after-training", daemon=True).start()
+
+
+def ensure_model(config: TrainingConfig, purpose: str) -> tuple:
+    """按训练设置找已有的同设置模型；没有（或上次失败/取消）就登记一个并排队训练。
+
+    返回 (model_id, record, queued)。模型归策略所有，只有训练设置完全相同时才复用（ADR-0052）。
+    """
+    from app.pipeline.library import FIXED_UNIVERSES
+    from app.training.trainer import DATA_START, find_by_fingerprint
+
+    fingerprint = config.fingerprint()
+    model_id = f"trained/{fingerprint}"
+    existing = find_by_fingerprint(fingerprint)
+    if existing and existing.get("status") not in ("failed", "cancelled"):
+        return existing["id"], existing, False
+    pool_label = FIXED_UNIVERSES[config.pool][0] if config.pool in FIXED_UNIVERSES else config.pool
+    algorithm = {"lightgbm": "LightGBM", "xgboost": "XGBoost", "lstm": "LSTM"}.get(config.framework, config.framework)
+    record = {
+        "id": model_id, "fingerprint": fingerprint, "status": "queued", "created_at": _now(),
+        "name": f"{algorithm} · {pool_label} · {len(config.factors)} 个因子 · {config.horizon} 日",
+        "pool_label": pool_label + ("（今天的名单）" if config.pool == "csi300" and config.membership == "latest" else ""),
+        "description": purpose, "config": config.__dict__, "data_start": DATA_START.isoformat(),
+    }
+    write_record(record)
+    enqueue(model_id)
+    return model_id, record, True

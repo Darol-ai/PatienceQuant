@@ -46,8 +46,8 @@ class TrainingConfig:
     def validate(self) -> "TrainingConfig":
         from app.pipeline.factor_library import trainable
 
-        if self.framework not in ("lightgbm", "xgboost"):
-            raise ValueError("算法只能是 LightGBM 或 XGBoost")
+        if self.framework not in ("lightgbm", "xgboost", "lstm"):
+            raise ValueError("算法只能是 LightGBM、XGBoost 或 LSTM")
         bad = [f for f in self.factors if not trainable(f)]
         if not self.factors or bad:
             raise ValueError("输入因子不能为空，且必须是因子库里有真实数据的因子：%s" % "、".join(bad))
@@ -107,8 +107,8 @@ def find_by_fingerprint(fingerprint: str) -> Optional[dict]:
 
 # ---- 样本 ----
 
-def build_samples(config: TrainingConfig, until: date, progress: Callable[[str], None] = lambda _: None) -> pd.DataFrame:
-    """每个交易日、每支（当天在股票池里的）股票一行：输入因子 + 未来 horizon 个交易日的收益。"""
+def _pool_panels(config: TrainingConfig, until: date, progress: Callable[[str], None]):
+    """训练股票池的日线面板和输入因子面板，返回 (因子面板, 日线面板, 历史成分股或 None)。"""
     from app.data.market_refresh import BENCHMARK_INDEX, get_market_store
     from app.pipeline.factor_library import compute_factors, panels_from_store
     from app.pipeline.library import broad30_symbols, csi300_membership, csi300_symbols
@@ -136,7 +136,12 @@ def build_samples(config: TrainingConfig, until: date, progress: Callable[[str],
     bench_series = pd.Series(bench["close"].to_numpy(dtype=float), index=pd.to_datetime(bench["trade_date"]))
     panels = panels_from_store(store, symbols, DATA_START, until, benchmark=bench_series)
     progress("计算因子")
-    values = compute_factors(panels, config.factors)
+    return compute_factors(panels, config.factors), panels, membership
+
+
+def build_samples(config: TrainingConfig, until: date, progress: Callable[[str], None] = lambda _: None) -> pd.DataFrame:
+    """每个交易日、每支（当天在股票池里的）股票一行：输入因子 + 未来 horizon 个交易日的收益。"""
+    values, panels, membership = _pool_panels(config, until, progress)
     close = panels["close"]
     label = close.shift(-config.horizon) / close - 1
     label_end = pd.Series(close.index, index=close.index).shift(-config.horizon)
@@ -224,6 +229,10 @@ def evaluate_year(frame: pd.DataFrame, predictions: np.ndarray) -> dict:
 def train(config: TrainingConfig, model_id: str, until: date, progress: Callable[[str], None],
           cancelled: Callable[[], bool] = lambda: False, frame: Optional[pd.DataFrame] = None) -> dict:
     """训练全部年份的折，保存到 data/models/<id>/<year>/seed<i>/，返回逐年样本外成绩。"""
+    if config.framework == "lstm":
+        from app.training.lstm import train_lstm
+
+        return train_lstm(config, model_id, until, progress, cancelled)
     frame = frame if frame is not None else build_samples(config, until, progress)
     root = model_dir(model_id)
     results = {}

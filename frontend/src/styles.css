@@ -254,3 +254,17 @@ nav { display: grid; gap: 5px; }.nav-item { display: flex; align-items: center; 
 .clickable-row { cursor: pointer; }.clickable-row:hover td { background: var(--hover-wash); }
 .add-factor { display: grid; gap: 6px; color: var(--text-muted); font-size: 10px; max-width: 320px; }
 .add-factor select, .training-factors-head select { min-height: 34px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-soft); color: var(--text); padding: 0 10px; outline: none; font-size: 11px; }
+/* 权重滑杆：统一细轨道，避免浏览器默认样式在 0% 时显示成粗黑条 */
+.weight-row input[type=range] { -webkit-appearance: none; appearance: none; height: 6px; border-radius: 999px; background: var(--border); outline: none; }
+.weight-row input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #31d0aa; border: 2px solid var(--surface, #fff); box-shadow: 0 0 0 1px rgba(49,208,170,.5); cursor: pointer; }
+.weight-row input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: #31d0aa; border: 2px solid var(--surface, #fff); cursor: pointer; }
+.weight-row input[type=range]:disabled { opacity: .45; }
+.weight-row input[type=range]:disabled::-webkit-slider-thumb { background: var(--text-faint); box-shadow: none; cursor: not-allowed; }
+.data-note { margin-bottom: 16px; } .data-note p { font-size: 10px; }
+.pool-analysis-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 16px; margin: 12px 0; }
+.pool-analysis-grid h4, .pool-analysis-grid + h4 { margin: 8px 0 4px; font-size: 11px; color: var(--text-muted); font-weight: 600; }
+.note-input { width: 100%; min-height: 30px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-soft); color: var(--text); padding: 4px 8px; font-size: 11px; }
+textarea.note-input { min-height: 54px; resize: vertical; }
+.note-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+@media (max-width: 900px) { .pool-analysis-grid { grid-template-columns: 1fr; } }
+.page-header-actions a, .page-header-actions button, .page-actions a, .page-actions button { white-space: nowrap; flex-shrink: 0; }

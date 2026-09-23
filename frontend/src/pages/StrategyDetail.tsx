@@ -6,6 +6,7 @@ import { api, formatMoney, formatPercent } from '../api'
 import { BarChart } from '../components/Charts'
 import { frameworkText, isTraining, meanOf, ModelStatus, ModelYears } from '../components/ModelBits'
 import { CardMetrics } from '../components/ScorecardBits'
+import { DataNote } from '../components/DataNote'
 import { Card, ErrorState, LoadingState, PageHeader, PanelHeader, Toast } from '../components/UI'
 import { frequencyLabel, originLabel, scorerText, selectionText, timingText, universeLabel, weightingText } from '../strategy'
 
@@ -74,6 +75,10 @@ export function StrategyDetail() {
         <Link className="primary-button" to={`/backtest?strategy_id=${strategyId}`}><Play size={15}/>回测它</Link>
       </>} />
 
+    <DataNote strategyId={strategyId} start={cards?.standard?.start_date} end={cards?.standard?.end_date}
+      totalReturn={card?.status === 'ready' ? card.metrics.total_return : undefined}
+      benchmarkReturn={card?.status === 'ready' ? card.metrics.benchmark_return : undefined}/>
+
     <div className="detail-grid-2">
       <Card>
         <PanelHeader title="策略规格" subtitle="保存后不再修改；要改请「基于它新建」" />
@@ -110,7 +115,8 @@ export function StrategyDetail() {
         <div><span>用到的因子（{m.factors.length} 个）</span><b>{m.factors.map((k: string) => factorLabel[k] || k).join('、') || '—'}</b></div>
         <div><span>可打分年份</span><b>{m.years.length ? `${m.years[0]}–${m.years[m.years.length - 1]}` : '—'}</b></div>
         {meanOf(m, 'ic') != null && <div><span>平均样本外 IC</span><b>{meanOf(m, 'ic')!.toFixed(4)}</b></div>}
-        {m.config && <div><span>训练设置</span><b>{m.config.n_estimators} 棵树 · 学习率 {m.config.learning_rate} · {m.framework === 'lightgbm' ? `叶子数 ${m.config.num_leaves}` : `树深度 ${m.config.max_depth}`} · {m.config.seeds} 个种子{m.config.cs_rank ? ' · 因子取池内百分位' : ''}{m.config.membership === 'latest' ? ' · 按今天的成分股名单' : ''}</b></div>}
+        {m.config && <div><span>训练设置</span><b>{m.framework === 'lstm' ? `过去 20 个交易日的因子序列（每天换成百分位）· 隐藏层 32 · 最多 15 轮早停 · ${m.config.seeds} 个种子`
+          : `${m.config.n_estimators} 棵树 · 学习率 ${m.config.learning_rate} · ${m.framework === 'lightgbm' ? `叶子数 ${m.config.num_leaves}` : `树深度 ${m.config.max_depth}`} · ${m.config.seeds} 个种子${m.config.cs_rank ? ' · 因子取池内百分位' : ''}`}{m.config.membership === 'latest' ? ' · 按今天的成分股名单' : ''}</b></div>}
       </div>
       {m.status === 'ready' && <ModelYears model={m}/>}
     </Card>)}

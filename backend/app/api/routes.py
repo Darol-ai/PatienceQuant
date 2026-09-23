@@ -31,7 +31,7 @@ from app.db.seed import DEFAULT_WEIGHTS
 from app.pipeline.library import FIXED_UNIVERSES, Pool, fixed_pool, normalize_universe, VALIDATED_KINDS, build_strategy, spec_from_legacy_row, data_service_for, default_universe, is_model_strategy, latest_market_day, strategy_spec, validate_date_range
 from app.pipeline.model_library import MODEL_LIBRARY, model_years
 from app.pipeline.price_factors import PRICE_FACTORS
-from app.pipeline.scorers import FUNDAMENTAL_FACTOR_GROUPS
+from app.pipeline.scorers import UNAVAILABLE_REAL_GROUPS
 from app.pipeline.spec import StrategySpec
 from pydantic import BaseModel, Field, ValidationError
 from app.pipeline.strategy import build_pipeline_strategy
@@ -292,13 +292,51 @@ def pool_members(pool_id: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
         raise HTTPException(404, "股票池不存在")
     catalog = data.stocks().set_index("symbol") if not data.stocks().empty else pd.DataFrame()
     names = _fixed_universe_names()
+    notes = (row.notes or {}) if pool_id.startswith("custom:") else {}
     members = []
     for symbol in symbols:
-        row = catalog.loc[symbol] if symbol in catalog.index else None
+        item = catalog.loc[symbol] if symbol in catalog.index else None
+        note = notes.get(symbol) or {}
         members.append({"symbol": symbol,
-                        "name": (row["name"] if row is not None else names.get(symbol)) or symbol,
-                        "industry": row["industry"] if row is not None else None})
-    return {"id": pool_id, "count": len(members), "members": members}
+                        "name": (item["name"] if item is not None else names.get(symbol)) or symbol,
+                        "industry": item["industry"] if item is not None else None,
+                        "sector": note.get("sector", ""), "thesis": note.get("thesis", "")})
+    return {"id": pool_id, "count": len(members), "members": members, "annotatable": pool_id.startswith("custom:")}
+
+
+class PoolNotePayload(BaseModel):
+    sector: str = Field("", max_length=40)
+    thesis: str = Field("", max_length=400)
+
+
+@router.put("/pools/{pool_id}/notes/{symbol}")
+def update_pool_note(pool_id: str, symbol: str, payload: PoolNotePayload, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """研究标注（ADR-0053）：自定义股票池里一只股票的所属板块/主题和研究理由。"""
+    row = db.get(Watchlist, int(pool_id.split(":", 1)[1])) if pool_id.startswith("custom:") and pool_id.split(":", 1)[1].isdigit() else None
+    if not row:
+        raise HTTPException(404, "只能标注自定义股票池")
+    if symbol not in row.symbols:
+        raise HTTPException(404, "这只股票不在股票池里")
+    notes = dict(row.notes or {})
+    note = {"sector": payload.sector.strip(), "thesis": payload.thesis.strip()}
+    if note["sector"] or note["thesis"]:
+        notes[symbol] = note
+    else:
+        notes.pop(symbol, None)
+    row.notes = notes  # 整个替换，JSON 列才会被识别为已修改
+    db.commit()
+    return {"symbol": symbol, **note}
+
+
+@router.get("/pools/{pool_id}/analysis")
+def pool_analysis(pool_id: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """股票池分析（ADR-0053）：行业/板块分布、成员近一年收益与波动、等权组合对沪深300。只读本地行情库。"""
+    from app.pipeline.pool_analysis import analyze
+
+    members = pool_members(pool_id, db)
+    if members["count"] > 600:
+        raise HTTPException(422, "股票池超过 600 只，不做成员级分析")
+    return _clean(analyze(members["members"]))
 
 
 @router.post("/pools")
@@ -331,6 +369,8 @@ def update_pool(pool_id: str, payload: PoolPayload, db: Session = Depends(get_db
         raise HTTPException(409, "股票池名称已存在")
     row.name = payload.name.strip()
     row.symbols = _clean_pool_symbols(db, payload.symbols)
+    # 移出股票池的股票，标注一起去掉
+    row.notes = {k: v for k, v in (row.notes or {}).items() if k in row.symbols}
     db.commit()
     return {"id": pool_id, "name": row.name, "count": len(row.symbols)}
 
@@ -501,8 +541,8 @@ def pipeline_options(db: Session = Depends(get_db)) -> Dict[str, Any]:
                     "quality": ("盈利质量", "稳定性 · 毛利 · 净利"), "momentum": ("动量", "3/6/12 个月收益"),
                     "risk": ("风险", "波动 · 回撤 · Beta，越低越好")}
     factors = [{"key": key, "label": label, "description": hint, "kind": "group",
-                "available": not (real and key in FUNDAMENTAL_FACTOR_GROUPS),
-                "unavailable_reason": "需要财务数据，本地行情库还没有" if real and key in FUNDAMENTAL_FACTOR_GROUPS else None}
+                "available": not (real and key in UNAVAILABLE_REAL_GROUPS),
+                "unavailable_reason": "需要财务报表数据，本地行情库还没有" if real and key in UNAVAILABLE_REAL_GROUPS else None}
                for key, (label, hint) in group_labels.items()]
     factors += [{"key": f.key, "label": f.label, "description": f.description, "kind": "price", "available": True,
                  "unavailable_reason": None} for f in PRICE_FACTORS.values()]
@@ -555,6 +595,20 @@ def pipeline_options(db: Session = Depends(get_db)) -> Dict[str, Any]:
     return {"data_mode": get_settings().data_mode, "factors": factors, "models": models, "timings": timings,
             "training_factors": training_factors, "training_defaults": training_defaults, "factor_groups": FACTOR_GROUPS,
             "universes": universes, "markets": [{"id": "a_share", "name": "A股"}]}
+
+
+@router.get("/strategies/{strategy_id}/data-note")
+def strategy_data_note(strategy_id: int, start_date: Optional[date] = None, end_date: Optional[date] = None,
+                       universe: Optional[str] = None, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """数据说明（ADR-0053）：这个策略在这段回测里用了哪几年的数据。不传区间时用成绩卡的标准区间。"""
+    from app.pipeline.data_note import data_note
+    from app.pipeline.scorecard import STANDARD
+
+    row = db.get(Strategy, strategy_id)
+    if row is None:
+        raise HTTPException(404, "策略不存在")
+    start, end = start_date or STANDARD["start_date"], end_date or STANDARD["end_date"]
+    return {"lines": data_note(strategy_spec(row), start, end, normalize_universe(universe) if universe else default_universe(row))}
 
 
 @router.get("/factors")
@@ -618,27 +672,15 @@ def cancel_model(model_id: str) -> Dict[str, Any]:
 def create_model_strategy(payload: ModelStrategyPayload, db: Session = Depends(get_db)) -> Dict[str, Any]:
     """制定模型选股策略（ADR-0052）：按训练设置找已有的同设置模型，没有就排队训练一个新模型；
     策略立即保存，模型训练好后自动算成绩卡。"""
-    from app.pipeline.library import FIXED_UNIVERSES as _pools
     from app.training import jobs
-    from app.training.trainer import DATA_START, TrainingConfig, find_by_fingerprint, write_record
+    from app.training.trainer import TrainingConfig
 
     try:
         config = TrainingConfig(**payload.training).validate()
     except (TypeError, ValueError) as exc:
         raise HTTPException(422, str(exc)) from exc
-    fingerprint = config.fingerprint()
-    existing = find_by_fingerprint(fingerprint)
-    if existing:
-        model_id, reused = existing["id"], True
-    else:
-        model_id, reused = f"trained/{fingerprint}", False
-        pool_label = _pools[config.pool][0] if config.pool in _pools else config.pool
-        write_record({
-            "id": model_id, "fingerprint": fingerprint, "status": "queued", "created_at": datetime.now().isoformat(timespec="seconds"),
-            "name": f"{'LightGBM' if config.framework == 'lightgbm' else 'XGBoost'} · {pool_label} · {len(config.factors)} 个因子 · {config.horizon} 日",
-            "pool_label": pool_label + ("（今天的名单）" if config.pool == "csi300" and config.membership == "latest" else ""),
-            "description": f"为策略「{payload.name}」训练", "config": config.__dict__, "data_start": DATA_START.isoformat(),
-        })
+    model_id, existing, queued = jobs.ensure_model(config, f"为策略「{payload.name}」训练")
+    reused = not queued
     try:
         spec = StrategySpec.model_validate({**payload.spec, "scorer": {"type": "model", "models": [model_id]}})
     except ValidationError as exc:
@@ -655,9 +697,7 @@ def create_model_strategy(payload: ModelStrategyPayload, db: Session = Depends(g
     db.add(strategy)
     db.commit()
     db.refresh(strategy)
-    if not reused:
-        jobs.enqueue(model_id)
-    elif existing.get("status") == "ready":
+    if reused and existing.get("status") == "ready":
         from app.pipeline import scorecard
         scorecard.start_refresh([strategy.id])
     return {"id": strategy.id, "name": strategy.name, "version": strategy.version, "model_id": model_id, "reused_model": reused,

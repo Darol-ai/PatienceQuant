@@ -88,7 +88,11 @@ class YearFold:
         return pd.Series(sum(predictions) / len(predictions), index=features.index, dtype=float)
 
 
-def _load_seed(framework: str, seed_dir: Path) -> Predictor:
+def _load_seed(framework: str, seed_dir: Path, n_features: int = 0) -> Predictor:
+    if framework == "lstm":
+        from app.training.lstm import load_predictor
+
+        return load_predictor(seed_dir, n_features)  # 输入是序列数组，不是 DataFrame
     if framework == "lightgbm":
         import lightgbm as lgb
 
@@ -132,7 +136,7 @@ def _folds_cached(model_id: str) -> Tuple[Tuple[int, YearFold], ...]:
             metadata = json.loads((seed_dir / "metadata.json").read_text(encoding="utf-8"))
             feature_columns = feature_columns or metadata["feature_columns"]
             categories = metadata["group_categories"]
-            predictors.append(_load_seed(framework, seed_dir))
+            predictors.append(_load_seed(framework, seed_dir, len(feature_columns)))
         if predictors and len(categories) <= 1:
             folds.append((int(year_dir.name), YearFold(feature_columns, categories[0] if categories else None, predictors)))
     return tuple(folds)
@@ -158,6 +162,14 @@ def model_factors(model_id: str) -> List[str]:
 
     record = read_record(model_id) or {}
     return list((record.get("config") or {}).get("factors") or [])
+
+
+def model_framework(model_id: str) -> str:
+    if model_id in MODEL_LIBRARY:
+        return MODEL_LIBRARY[model_id].framework
+    from app.training.trainer import read_record
+
+    return ((read_record(model_id) or {}).get("config") or {}).get("framework", "")
 
 
 def model_uses_cs_rank(model_id: str) -> bool:
