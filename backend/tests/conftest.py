@@ -40,6 +40,9 @@ os.environ["PATIENCEQUANT_WARM_CSI300"] = "0"
 # 需要测大模型分支的测试自己 monkeypatch get_ai_credentials。
 os.environ["OPENAI_API_KEY"] = ""
 
+# 训练出的模型写到临时目录，不碰 data/models
+os.environ["PATIENCEQUANT_MODELS_DIR"] = str(Path(tempfile.gettempdir()) / f"patience_quant_models_{os.getpid()}")
+
 import pytest
 
 

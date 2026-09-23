@@ -234,3 +234,21 @@ nav { display: grid; gap: 5px; }.nav-item { display: flex; align-items: center; 
 .sidebar-foot { padding: 10px 4px 2px; color: var(--text-faint); font-size: 9px; }
 .title-with-back { display: inline-flex; align-items: center; gap: 10px; }
 @media (max-width: 1100px) { .home-grid, .detail-grid-2, .pools-layout { grid-template-columns: 1fr; } .agent-chat { height: 70vh; } }
+
+/* 模型选股策略的训练设置（ADR-0052） */
+.training-form { display: grid; gap: 16px; }
+.training-factors { display: grid; gap: 12px; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-soft); }
+.training-factors-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; font-size: 11px; }
+.training-factors-head span { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.training-factors-head select { max-width: 220px; }
+.factor-group { display: grid; gap: 2px; }
+.factor-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.factor-chip { display: inline-flex; align-items: center; gap: 5px; padding: 5px 9px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-muted); font-size: 10px; cursor: pointer; user-select: none; }
+.factor-chip input { display: none; }
+.factor-chip.active { color: #31d0aa; border-color: rgba(49,208,170,.5); background: rgba(49,208,170,.1); }
+.model-status { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px; font-size: 9px; font-weight: 700; }
+.model-status.ready { color: #31d0aa; background: rgba(49,208,170,.12); }
+.model-status.queued, .model-status.training { color: #6c8cff; background: rgba(108,140,255,.12); }
+.model-status.failed, .model-status.cancelled { color: #fb7185; background: rgba(251,113,133,.12); }
+@media (max-width: 720px) { .training-factors-head select { max-width: 100%; } }
+.clickable-row { cursor: pointer; }.clickable-row:hover td { background: var(--hover-wash); }

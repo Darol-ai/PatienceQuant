@@ -5,6 +5,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { api } from '../api'
 import { Card, ErrorState, LoadingState, PageHeader, PanelHeader, Toast } from '../components/UI'
 import { describeSpec, originLabel, Spec } from '../strategy'
+import { TrainingConfig, TrainingForm } from '../components/TrainingForm'
 
 // 策略制定（ADR-0047 第 3 条、ADR-0051）：从策略库的「基于它新建」或「新建策略」进入的编辑器。
 // 策略 = 打分 → ① 选股 → ② 权重 → ③ × 择时 → ④ 调仓；保存一律另存为新策略，存完进入它的详情页。
@@ -37,6 +38,10 @@ export function StrategyEditor() {
   const [draft, setDraft] = useState<Draft>(blankDraft())
   const [loadedFrom, setLoadedFrom] = useState<number | null>(null)
   const [message, setMessage] = useState('')
+  // 模型选股策略：reuseModels 非空表示沿用起点策略的模型（训练设置没改）；否则按 training 训练新模型
+  const [training, setTraining] = useState<TrainingConfig | null>(null)
+  const [reuseModels, setReuseModels] = useState<string[] | null>(null)
+  const { data: pools } = useQuery({ queryKey: ['pools'], queryFn: async () => (await api.get('/pools')).data })
   const source = fromId ? (strategies || []).find((s: any) => s.id === fromId) : null
 
   useEffect(() => {
@@ -48,11 +53,26 @@ export function StrategyEditor() {
       default_universe: source.default_universe || 'csi300',
       spec: JSON.parse(JSON.stringify(source.spec)),
     })
+    setReuseModels(source.spec.scorer.type === 'model' ? source.spec.scorer.models : null)
   }, [source, loadedFrom])
+
+  function trainingFrom(modelIds: string[] | undefined): TrainingConfig {
+    const model = (options?.models || []).find((m: any) => m.id === modelIds?.[0])
+    if (model?.config) return { ...options.training_defaults, ...model.config }
+    // 旧模型没有训练记录：14 个因子、90 日，股票池按它训练时的池；改成用历史成分股训练
+    return { ...options.training_defaults, ...(model ? { framework: model.framework, pool: model.id.includes('broad30') ? 'broad30' : 'csi300' } : {}) }
+  }
 
   const setSpec = (patch: Partial<Spec>) => setDraft(d => ({ ...d, spec: { ...d.spec, ...patch } }))
   const save = useMutation({
-    mutationFn: async () => (await api.post('/strategies/spec', draft)).data,
+    mutationFn: async () => {
+      const { scorer, ...rest } = draft.spec
+      if (scorer.type === 'model' && !reuseModels) {
+        return (await api.post('/strategies/model', { name: draft.name, description: draft.description,
+          default_universe: draft.default_universe, training, spec: rest })).data
+      }
+      return (await api.post('/strategies/spec', draft)).data
+    },
     onSuccess: data => {
       queryClient.invalidateQueries({ queryKey: ['strategies'] })
       queryClient.invalidateQueries({ queryKey: ['scorecards'] })
@@ -71,12 +91,14 @@ export function StrategyEditor() {
   const unavailableUsed = spec.scorer.type === 'factor_weights'
     ? options.factors.filter((f: any) => !f.available && Number(weights[f.key] || 0) > 0)
     : []
-  const canSave = draft.name.trim() && (spec.scorer.type === 'model' ? spec.scorer.models.length > 0 : weightTotal > 0)
+  const canSave = draft.name.trim() && (spec.scorer.type === 'model'
+    ? (reuseModels ? reuseModels.length > 0 : !!training && training.factors.length > 0)
+    : weightTotal > 0)
 
   return <>
     <PageHeader eyebrow="策略库 · 新建" title={<span className="title-with-back"><Link to={fromId ? `/library/${fromId}` : '/library'} className="icon-button"><ArrowLeft size={16}/></Link>策略制定</span>}
       description={source ? `以「${source.name}」（${originLabel[source.origin] || source.origin}）为起点。按 打分 → 选股 → 权重 → 择时 → 调仓 五步配置，保存后是一个新策略，原策略不变。` : '从空白开始。按 打分 → 选股 → 权重 → 择时 → 调仓 五步配置，保存后进入策略库。'}
-      actions={<button className="primary-button" onClick={() => save.mutate()} disabled={!canSave || save.isPending}><Save size={16}/>{save.isPending ? '保存中…' : '另存为新策略'}</button>} />
+      actions={<button className="primary-button" onClick={() => save.mutate()} disabled={!canSave || save.isPending}><Save size={16}/>{save.isPending ? '保存中…' : spec.scorer.type === 'model' && !reuseModels ? '保存并训练' : '另存为新策略'}</button>} />
     <div className="strategy-layout">
       <div>
         <Card>
@@ -92,9 +114,13 @@ export function StrategyEditor() {
 
         <Card>
           <PanelHeader title="① 打分" subtitle="给股票池里每支股票一个分数；后面几步只认分数" action={
-            <select className="inline-select" value={spec.scorer.type} onChange={e => setSpec({ scorer: e.target.value === 'model'
-              ? { type: 'model', models: [options.models[0]?.id].filter(Boolean) }
-              : { type: 'factor_weights', weights: { momentum: 0.6, risk: 0.4 } } })}>
+            <select className="inline-select" value={spec.scorer.type} onChange={e => {
+              if (e.target.value === 'model') {
+                setReuseModels(null)
+                setTraining(options.training_defaults)
+                setSpec({ scorer: { type: 'model', models: [] } })
+              } else setSpec({ scorer: { type: 'factor_weights', weights: { momentum: 0.6, risk: 0.4 } } })
+            }}>
               <option value="factor_weights">因子权重</option><option value="model">模型预测</option>
             </select>} />
           {spec.scorer.type === 'factor_weights' ? <div className="weight-editor">
@@ -106,19 +132,17 @@ export function StrategyEditor() {
             </div>)}
             <p className="muted-note">权重会按合计自动归一（当前合计 {Math.round(weightTotal * 100)}%）。每个因子先换成股票池内的百分位，再按权重加总。</p>
             {unavailableUsed.length > 0 && <p className="muted-note warn">当前是真实行情模式，{unavailableUsed.map((f: any) => f.label).join('、')} 没有真实数据，回测时按 0 权重计算。</p>}
-          </div> : <div className="model-pick">
-            {options.models.map((m: any) => {
-              const checked = spec.scorer.type === 'model' && spec.scorer.models.includes(m.id)
-              return <label key={m.id} className={`model-option ${checked ? 'active' : ''}`}>
-                <input type="checkbox" checked={checked} onChange={() => {
-                  const current = spec.scorer.type === 'model' ? spec.scorer.models : []
-                  setSpec({ scorer: { type: 'model', models: checked ? current.filter(x => x !== m.id) : [...current, m.id] } })
-                }}/>
-                <div><b>{m.name}</b><span>{m.description}</span><small>训练股票池：{m.trained_on} · 可打分年份 {m.years[0]}–{m.years[m.years.length - 1]}</small></div>
-              </label>
-            })}
-            <p className="muted-note">选多个模型时取预测分数的平均。模型只能给有训练结果的年份打分，回测区间会被限制在这些年份内。</p>
-          </div>}
+          </div> : reuseModels ? <div className="model-pick">
+            <div className="strategy-note"><div>
+              <b>沿用起点策略的模型</b>
+              {reuseModels.map(id => {
+                const m = options.models.find((x: any) => x.id === id)
+                return <p key={id}>{m?.name || id}{m ? ` · ${m.factors.length} 个输入因子 · 预测 ${m.horizon_days} 日 · 可打分 ${m.years[0]}–${m.years[m.years.length - 1]}` : ''}</p>
+              })}
+              <p>只改选股、权重、择时、调仓时沿用同一个模型，不重新训练。</p>
+            </div></div>
+            <button className="secondary-button" onClick={() => { setTraining(trainingFrom(reuseModels)); setReuseModels(null) }}>改训练设置（会训练一个新模型）</button>
+          </div> : training && <TrainingForm value={training} onChange={setTraining} options={options} strategies={strategies || []} pools={pools || []}/>}
         </Card>
 
         <Card>
@@ -139,7 +163,7 @@ export function StrategyEditor() {
         </Card>
 
         <Card>
-          <PanelHeader title="④ 择时信号 与 ⑤ 调仓" subtitle="择时决定整体仓位（0～100%），不决定买哪些；只在调仓日判断" />
+          <PanelHeader title="④ 择时信号 与 ⑤ 调仓" subtitle="择时决定整体仓位（0～100%），不决定买哪些；每个交易日按收盘信号调整仓位" />
           <div className="form-grid">
             <label>择时信号<select value={spec.timing.type} onChange={e => {
               const option = options.timings.find((t: any) => t.type === e.target.value)

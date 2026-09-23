@@ -26,7 +26,7 @@ from app.quant_v3.research_notes import quant_v3_research_universe
 from app.db.models import AIExplanation, Industry, BacktestEquity, BacktestMetric, BacktestRun, DailyAccount, Order, Portfolio, Position, ResearchAnnotation, ResearchGroup, Stock, Strategy, StrategyFactor, Trade, Watchlist
 from app.db.session import get_db
 from app.portfolio.service import PaperTradingService
-from app.schemas import AIDecisionRequest, AISettingsRequest, ApplyBacktestPaperRequest, BacktestRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyPayload, StrategySpecPayload, RecommendRequest, ScorecardRefreshRequest, AgentTurnRequest
+from app.schemas import AIDecisionRequest, AISettingsRequest, ApplyBacktestPaperRequest, BacktestRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyPayload, StrategySpecPayload, RecommendRequest, ScorecardRefreshRequest, AgentTurnRequest, ModelStrategyPayload
 from app.db.seed import DEFAULT_WEIGHTS
 from app.pipeline.library import FIXED_UNIVERSES, Pool, fixed_pool, normalize_universe, VALIDATED_KINDS, build_strategy, spec_from_legacy_row, data_service_for, default_universe, is_model_strategy, latest_market_day, strategy_spec, validate_date_range
 from app.pipeline.model_library import MODEL_LIBRARY, model_years
@@ -506,9 +506,15 @@ def pipeline_options(db: Session = Depends(get_db)) -> Dict[str, Any]:
                for key, (label, hint) in group_labels.items()]
     factors += [{"key": f.key, "label": f.label, "description": f.description, "kind": "price", "available": True,
                  "unavailable_reason": None} for f in PRICE_FACTORS.values()]
-    models = [{"id": entry.id, "name": entry.name, "framework": entry.framework, "origin": entry.origin,
-               "trained_on": entry.trained_on, "horizon_days": entry.horizon_days, "description": entry.description,
-               "years": model_years(entry.id)} for entry in MODEL_LIBRARY.values()]
+    from app.pipeline.factor_library import FACTOR_GROUPS, FACTOR_LIBRARY, LEGACY_MODEL_FACTORS, trainable
+    from app.pipeline.model_library import all_models
+
+    models = [m for m in all_models() if m["status"] == "ready"]
+    training_factors = [{"key": f.key, "label": f.label, "group": f.group, "description": f.description}
+                        for f in FACTOR_LIBRARY.values() if trainable(f.key)]
+    training_defaults = {"framework": "lightgbm", "factors": LEGACY_MODEL_FACTORS, "horizon": 90, "pool": "csi300",
+                         "membership": "historical", "n_estimators": 300, "learning_rate": 0.05, "num_leaves": 15,
+                         "max_depth": 4, "seeds": 5, "cs_rank": False}
     timings = [
         {"type": "none", "label": "不择时（满仓）", "params": []},
         {"type": "index_trend", "label": "沪深300 均线趋势", "description": "跌破 50 日均线降仓，跌破 200 日均线降到设定仓位",
@@ -526,7 +532,115 @@ def pipeline_options(db: Session = Depends(get_db)) -> Dict[str, Any]:
     universes += [{"id": "custom:%s" % row.id, "name": row.name, "description": "自定义股票池"}
                   for row in db.scalars(select(Watchlist).order_by(Watchlist.id)).all()]
     return {"data_mode": get_settings().data_mode, "factors": factors, "models": models, "timings": timings,
+            "training_factors": training_factors, "training_defaults": training_defaults, "factor_groups": FACTOR_GROUPS,
             "universes": universes, "markets": [{"id": "a_share", "name": "A股"}]}
+
+
+@router.get("/factors")
+def factor_library(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
+    """因子库（ADR-0052）：每个因子的说明，以及哪些策略、模型在用它。"""
+    from app.pipeline.factor_library import FACTOR_GROUPS, FACTOR_LIBRARY, trainable
+    from app.pipeline.model_library import all_models
+
+    used_by: Dict[str, List[str]] = {key: [] for key in FACTOR_LIBRARY}
+    for row in db.scalars(select(Strategy)).all():
+        if (row.origin or "user") == "paper_snapshot":
+            continue
+        spec = strategy_spec(row)
+        if spec.scorer.type == "factor_weights":
+            keys = [k for group, weight in spec.scorer.weights.items() if weight > 0
+                    for k in (FACTOR_GROUPS.get(group) or [group])]
+        else:
+            from app.pipeline.model_library import model_factors
+            keys = [k for m in spec.scorer.models for k in model_factors(m)]
+        for key in dict.fromkeys(keys):
+            used_by.setdefault(key, []).append(f"策略「{row.name}」")
+    for model in all_models():
+        for key in model.get("factors", []):
+            used_by.setdefault(key, []).append(f"模型「{model['name']}」")
+    real = get_settings().data_mode.lower() == "real"
+    return [{"key": f.key, "label": f.label, "group": f.group, "direction": f.direction, "description": f.description,
+             "requires": f.requires, "trainable": trainable(f.key),
+             "available": f.requires == "daily" or not real, "used_by": used_by.get(f.key, [])}
+            for f in FACTOR_LIBRARY.values()]
+
+
+@router.get("/models")
+def list_models() -> List[Dict[str, Any]]:
+    from app.pipeline.model_library import all_models
+    from app.training import jobs
+
+    running = jobs.current()
+    return _clean([{**m, "running": m["id"] == running} for m in all_models()])
+
+
+@router.get("/models/{model_id:path}/detail")
+def model_detail(model_id: str) -> Dict[str, Any]:
+    from app.pipeline.model_library import all_models
+
+    model = next((m for m in all_models() if m["id"] == model_id), None)
+    if model is None:
+        raise HTTPException(404, "模型不存在")
+    return _clean(model)
+
+
+@router.post("/models/{model_id:path}/cancel")
+def cancel_model(model_id: str) -> Dict[str, Any]:
+    from app.training import jobs
+
+    if not jobs.cancel(model_id):
+        raise HTTPException(422, "这个模型不在排队或训练中")
+    return {"cancelled": model_id}
+
+
+@router.post("/strategies/model")
+def create_model_strategy(payload: ModelStrategyPayload, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """制定模型选股策略（ADR-0052）：按训练设置找已有的同设置模型，没有就排队训练一个新模型；
+    策略立即保存，模型训练好后自动算成绩卡。"""
+    from app.pipeline.library import FIXED_UNIVERSES as _pools
+    from app.training import jobs
+    from app.training.trainer import TrainingConfig, find_by_fingerprint, write_record
+
+    try:
+        config = TrainingConfig(**payload.training).validate()
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    fingerprint = config.fingerprint()
+    existing = find_by_fingerprint(fingerprint)
+    if existing:
+        model_id, reused = existing["id"], True
+    else:
+        model_id, reused = f"trained/{fingerprint}", False
+        pool_label = _pools[config.pool][0] if config.pool in _pools else config.pool
+        write_record({
+            "id": model_id, "fingerprint": fingerprint, "status": "queued", "created_at": datetime.now().isoformat(timespec="seconds"),
+            "name": f"{'LightGBM' if config.framework == 'lightgbm' else 'XGBoost'} · {pool_label} · {len(config.factors)} 个因子 · {config.horizon} 日",
+            "pool_label": pool_label + ("（今天的名单）" if config.pool == "csi300" and config.membership == "latest" else ""),
+            "description": f"为策略「{payload.name}」训练", "config": config.__dict__,
+        })
+    try:
+        spec = StrategySpec.model_validate({**payload.spec, "scorer": {"type": "model", "models": [model_id]}})
+    except ValidationError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    latest = db.scalar(select(Strategy).where(Strategy.name == payload.name).order_by(Strategy.version.desc()).limit(1))
+    strategy = Strategy(
+        name=payload.name, version=(latest.version + 1 if latest else 1), description=payload.description,
+        kind="custom", origin="user", spec=spec.model_dump(mode="json"), universe=payload.default_universe, weights={},
+        holdings_count=spec.selection.n or 0, max_weight=spec.weighting.max_weight,
+        rebalance_frequency=spec.rebalance.frequency, turnover_band=spec.rebalance.turnover_band,
+        trend_filter=spec.timing.type != "none", stop_loss=0, target_volatility=0, max_drawdown_budget=0, cash_buffer=0,
+        benchmark_enhancement=False, dip_buy_strength=0, profit_take_strength=0, is_default=False,
+    )
+    db.add(strategy)
+    db.commit()
+    db.refresh(strategy)
+    if not reused:
+        jobs.enqueue(model_id)
+    elif existing.get("status") == "ready":
+        from app.pipeline import scorecard
+        scorecard.start_refresh([strategy.id])
+    return {"id": strategy.id, "name": strategy.name, "version": strategy.version, "model_id": model_id, "reused_model": reused,
+            "message": "策略已保存，" + ("沿用已有的同设置模型" if reused else "模型已排队训练，训练好后自动计算成绩卡")}
 
 
 @router.post("/strategies/spec")

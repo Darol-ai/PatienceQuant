@@ -49,6 +49,9 @@ async def lifespan(_: FastAPI):
     migrate_lightweight_schema()
     with SessionLocal() as db:
         seed_database(db)
+    from app.training.jobs import recover_interrupted
+
+    recover_interrupted()
     # 测试套件在tests/conftest.py里把这个环境变量设成"0"——5分钟的后台
     # 预热是给手动起的开发服务器用的，pytest的TestClient每个测试都会
     # 重新进一次lifespan，不需要也不应该跟着触发。同一个开关也用来控制

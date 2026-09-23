@@ -92,6 +92,26 @@ class StrategySpecPayload(BaseModel):
         return value
 
 
+class ModelStrategyPayload(BaseModel):
+    """模型选股策略的制定：训练设置（见 app/training/trainer.TrainingConfig）+ 选股、权重、择时、调仓。"""
+
+    name: str = Field(min_length=1, max_length=120)
+    description: str = ""
+    default_universe: str = "csi300"
+    training: Dict[str, Any]
+    spec: Dict[str, Any]  # selection / weighting / timing / rebalance（打分部分由训练出的模型决定）
+
+    @field_validator("default_universe")
+    @classmethod
+    def valid_default_universe(cls, value: str) -> str:
+        from app.pipeline.library import is_valid_universe, normalize_universe
+
+        value = normalize_universe(value)
+        if not is_valid_universe(value) or value == "custom":
+            raise ValueError("默认股票池仅支持 a_share/csi300/broad30/custom:<编号>")
+        return value
+
+
 class BacktestRequest(BaseModel):
     strategy_id: int = 1
     # 不传时用策略自己的默认股票池（模型策略是训练时的股票池）

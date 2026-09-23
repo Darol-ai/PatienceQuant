@@ -21,3 +21,6 @@ Tushare_api_guide.md
 *.log
 *.db-shm
 *.db-wal
+
+# 系统内训练的模型：运行时产物，可按训练设置重训
+backend/data/models/

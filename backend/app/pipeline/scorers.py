@@ -14,11 +14,10 @@ import pandas as pd
 from app.data.market_store import AShareMarketStore
 from app.data.service import MarketDataService
 from app.factors.engine import FactorEngine, GROUP_FACTORS
-from app.pipeline.bars import load_bars, warmup_start
+from app.pipeline.bars import warmup_start
 from app.pipeline.price_factors import PRICE_FACTORS
-from app.pipeline.model_library import MODEL_LIBRARY, load_folds, model_years
+from app.pipeline.model_library import load_folds, model_exists, model_factors, model_uses_cs_rank, model_years
 from app.pipeline.spec import FactorWeightScorerSpec, ModelScorerSpec
-from app.quant_v3.dataset import compute_features
 
 # 真实模式下只有日线行情是真的。财务/估值数据还没接入本地行情库，
 # MarketDataService.fundamentals() 在库里没有时会用程序生成的数补上——
@@ -141,19 +140,22 @@ class FactorWeightScorer(Scorer):
 
 
 class ModelScorer(Scorer):
-    """模型库里一个或多个模型的预测分数取平均；某个模型当天没分数就只平均其余的。"""
+    """模型库里一个或多个模型的预测分数取平均；某个模型当天没分数就只平均其余的。
 
-    # compute_features 需要当天之前至少 120 个交易日
-    warmup_days = 130
+    输入因子用因子库的面板函数计算（和训练时同一套代码）。旧模型的 14 个因子要求
+    股票在行情里满 121 个交易日，所以取数时往前多留 300 个交易日。
+    """
+
+    warmup_days = 300
 
     def __init__(self, spec: ModelScorerSpec, store: AShareMarketStore):
-        missing = [m for m in spec.models if m not in MODEL_LIBRARY]
+        missing = [m for m in spec.models if not model_exists(m)]
         if missing:
             raise ValueError("模型库里没有这些模型：%s" % "、".join(missing))
         self.model_ids = list(spec.models)
         self.store = store
-        self._bars: Dict[str, List[dict]] = {}
-        self._index: Dict[str, Dict[date, int]] = {}
+        self.factor_keys = list(dict.fromkeys(k for m in self.model_ids for k in model_factors(m)))
+        self._values: Dict[str, pd.DataFrame] = {}
         self._cache: Dict[date, pd.DataFrame] = {}
         years = [y for m in self.model_ids for y in model_years(m)]
         self._years = (min(years), max(years)) if years else None
@@ -165,35 +167,38 @@ class ModelScorer(Scorer):
         return date(self._years[1], 12, 31) if self._years else None
 
     def prepare(self, symbols: List[str], start: date, end: date) -> None:
-        self._bars = load_bars(self.store, symbols, warmup_start(start, self.warmup_days), end)
-        self._index = {s: {bar["date"]: i for i, bar in enumerate(bars)} for s, bars in self._bars.items()}
+        from app.data.market_refresh import BENCHMARK_INDEX
+        from app.pipeline.factor_library import compute_factors, panels_from_store
+
+        warm = warmup_start(start, self.warmup_days)
+        bench = self.store.load_index(BENCHMARK_INDEX, warm, end)
+        bench_series = pd.Series(bench["close"].to_numpy(dtype=float), index=pd.to_datetime(bench["trade_date"])) if not bench.empty else None
+        panels = panels_from_store(self.store, symbols, warm, end, benchmark=bench_series)
+        self._values = compute_factors(panels, self.factor_keys)
         self._cache = {}
 
-    def _features(self, as_of: date, symbols: List[str]) -> pd.DataFrame:
-        rows = {}
-        for symbol in symbols:
-            i = self._index.get(symbol, {}).get(as_of)
-            if i is None:
-                continue
-            window = self._bars[symbol][max(0, i - 130): i + 1]
-            features = compute_features(window, len(window) - 1)
-            if features is not None:
-                rows[symbol] = features
-        return pd.DataFrame.from_dict(rows, orient="index")
+    def _factors_on(self, as_of: date, symbols: List[str]) -> pd.DataFrame:
+        day = pd.Timestamp(as_of)
+        rows = {key: frame.loc[day].reindex(symbols) if day in frame.index else pd.Series(np.nan, index=symbols)
+                for key, frame in self._values.items()}
+        return pd.DataFrame(rows, index=pd.Index(symbols, name="symbol"))
 
     def score(self, as_of: date, symbols: List[str]) -> ScoreResult:
-        if not self._bars:
+        if not self._values:
             self.prepare(symbols, as_of, as_of)
-        key = as_of
-        if key not in self._cache:
-            features = self._features(as_of, symbols)
-            predictions = pd.DataFrame(index=features.index)
+        if as_of not in self._cache:
+            factors = self._factors_on(as_of, symbols)
+            predictions = pd.DataFrame(index=factors.index)
             for model_id in self.model_ids:
                 fold = load_folds(model_id).get(as_of.year)
-                if fold is not None and not features.empty:
-                    predictions["pred_" + model_id.split("/", 1)[-1]] = fold.predict(features)
-            self._cache[key] = predictions
-        predictions = self._cache[key]
+                inputs = factors[model_factors(model_id)].dropna()
+                if fold is None or inputs.empty:
+                    continue
+                if model_uses_cs_rank(model_id):
+                    inputs = inputs.rank(pct=True)  # 和训练时一样：当天在股票池里的百分位
+                predictions.loc[inputs.index, "pred_" + model_id.split("/", 1)[-1]] = fold.predict(inputs)
+            self._cache[as_of] = predictions
+        predictions = self._cache[as_of]
         scores = predictions.mean(axis=1) if not predictions.empty else pd.Series(dtype=float)
         scores = scores.reindex(symbols)
         # 不带日期和数量，回测里每期一样的提示会被合并成一条

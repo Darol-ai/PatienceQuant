@@ -4,6 +4,7 @@ import { useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, formatMoney, formatPercent } from '../api'
 import { BarChart } from '../components/Charts'
+import { frameworkText, isTraining, meanOf, ModelStatus, ModelYears } from '../components/ModelBits'
 import { CardMetrics } from '../components/ScorecardBits'
 import { Card, ErrorState, LoadingState, PageHeader, PanelHeader, Toast } from '../components/UI'
 import { frequencyLabel, originLabel, scorerText, selectionText, timingText, universeLabel, weightingText } from '../strategy'
@@ -22,6 +23,11 @@ export function StrategyDetail() {
     queryKey: ['scorecards'],
     queryFn: async () => (await api.get('/scorecards')).data,
     refetchInterval: query => (query.state.data?.refresh?.running ? 4000 : false),
+  })
+  const { data: models } = useQuery({
+    queryKey: ['models'],
+    queryFn: async () => (await api.get('/models')).data,
+    refetchInterval: query => (isTraining(query.state.data) ? 3000 : false),
   })
   const { data: history } = useQuery({
     queryKey: ['backtest-history', strategyId],
@@ -50,6 +56,12 @@ export function StrategyDetail() {
   const card = (cards?.cards || []).find((c: any) => c.strategy_id === strategyId)
   const spec = strategy.spec
   const running = cards?.refresh?.running
+  const factorLabel: Record<string, string> = Object.fromEntries((options?.training_factors || []).map((f: any) => [f.key, f.label]))
+  const usedModels = spec.scorer.type === 'model' ? spec.scorer.models.map((mid: string) => (models || []).find((m: any) => m.id === mid) || { id: mid, name: mid, status: 'failed', error: '模型库里找不到这个模型', factors: [], years: [] }) : []
+  // 因子权重策略用到的因子：每个因子组按等权合成组内因子
+  const groupFactors = spec.scorer.type === 'factor_weights'
+    ? Object.entries(spec.scorer.weights).filter(([, w]) => Number(w) > 0).map(([g, w]) => ({ group: g, weight: Number(w), keys: options?.factor_groups?.[g] || [g] }))
+    : []
 
   return <>
     <PageHeader eyebrow={`策略库 · ${originLabel[strategy.origin] || strategy.origin}`} title={<span className="title-with-back"><Link to="/library" className="icon-button"><ArrowLeft size={16}/></Link>{strategy.name}{strategy.version > 1 ? ` · V${strategy.version}` : ''}</span>}
@@ -89,6 +101,28 @@ export function StrategyDetail() {
         </> : <p className="muted-note">{running ? `正在计算成绩卡：${cards.refresh.current || '…'}` : '这个策略还没有成绩卡。'}</p>}
       </Card>
     </div>
+
+    {spec.scorer.type === 'model' && usedModels.map((m: any) => <Card key={m.id}>
+      <PanelHeader title={`打分模型：${m.name}`} subtitle={m.origin === 'legacy' ? '旧模型，离线训练后原样导入' : `${frameworkText[m.framework] || m.framework} · ${m.trained_on || ''} · 预测未来 ${m.horizon_days} 个交易日收益`} action={<ModelStatus model={m}/>} />
+      {m.status === 'failed' && m.error && <p className="muted-note warn">{m.error}</p>}
+      {(m.status === 'queued' || m.status === 'training') && <p className="muted-note">模型在后台训练，训练好后会自动计算这个策略的成绩卡；进度也可以在「数据与模型」里看。</p>}
+      <div className="spec-list compact">
+        <div><span>用到的因子（{m.factors.length} 个）</span><b>{m.factors.map((k: string) => factorLabel[k] || k).join('、') || '—'}</b></div>
+        <div><span>可打分年份</span><b>{m.years.length ? `${m.years[0]}–${m.years[m.years.length - 1]}` : '—'}</b></div>
+        {meanOf(m, 'ic') != null && <div><span>平均样本外 IC</span><b>{meanOf(m, 'ic')!.toFixed(4)}</b></div>}
+        {m.config && <div><span>训练设置</span><b>{m.config.n_estimators} 棵树 · 学习率 {m.config.learning_rate} · {m.framework === 'lightgbm' ? `叶子数 ${m.config.num_leaves}` : `树深度 ${m.config.max_depth}`} · {m.config.seeds} 个种子{m.config.cs_rank ? ' · 因子取池内百分位' : ''}{m.config.membership === 'latest' ? ' · 按今天的成分股名单' : ''}</b></div>}
+      </div>
+      {m.status === 'ready' && <ModelYears model={m}/>}
+    </Card>)}
+
+    {groupFactors.length > 0 && <Card>
+      <PanelHeader title="用到的因子" subtitle="每个因子先换成当天池内百分位；因子组取组内百分位的平均；再按权重加总" />
+      <div className="spec-list compact">{groupFactors.map(g => {
+        const option = (options?.factors || []).find((f: any) => f.key === g.group)
+        return <div key={g.group}><span>{option?.label || g.group} · {formatPercent(g.weight, 0)}</span>
+          <b>{g.keys.map((k: string) => factorLabel[k] || k).join('、') || '—'}{option && !option.available ? `（${option.unavailable_reason}）` : ''}</b></div>
+      })}</div>
+    </Card>}
 
     {card?.status === 'ready' && <Card>
       <PanelHeader title="逐年收益" subtitle="策略 vs 沪深300" />

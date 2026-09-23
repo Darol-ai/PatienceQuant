@@ -14,7 +14,7 @@ dependencies = [
   "httpx>=0.27,<1",
   "openai>=1.52,<2",
   "lightgbm>=4.5,<5",
-  "xgboost>=2.1,<3",
+  "xgboost>=3.4,<4",
   "pypdf>=5,<7",
   "python-multipart>=0.0.9,<1",
 ]

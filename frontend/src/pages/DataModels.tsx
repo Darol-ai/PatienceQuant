@@ -1,10 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Boxes, Database, RefreshCw } from 'lucide-react'
-import { api } from '../api'
+import { Fragment, useState } from 'react'
+import { api, formatPercent } from '../api'
+import { frameworkText, isTraining, meanOf, ModelStatus, ModelYears } from '../components/ModelBits'
 import { Card, LoadingState, PageHeader, PanelHeader } from '../components/UI'
 
 const originText: Record<string, string> = { legacy: '旧模型（离线训练，原样导入）', trained: '系统内训练' }
-const frameworkText: Record<string, string> = { lightgbm: 'LightGBM', xgboost: 'XGBoost', lstm: 'LSTM', transformer: 'Transformer' }
 
 // 数据与模型（ADR-0051）：本地行情库的状态与补齐；模型库。
 export function DataModels() {
@@ -14,7 +15,18 @@ export function DataModels() {
     queryFn: async () => (await api.get('/data/market/status')).data,
     refetchInterval: query => (query.state.data?.refresh?.running ? 3000 : 60000),
   })
+  const [openModel, setOpenModel] = useState('')
+  const { data: models } = useQuery({
+    queryKey: ['models'],
+    queryFn: async () => (await api.get('/models')).data,
+    refetchInterval: query => (isTraining(query.state.data) ? 3000 : false),
+  })
   const { data: options } = useQuery({ queryKey: ['pipeline-options'], queryFn: async () => (await api.get('/pipeline/options')).data })
+  const cancel = useMutation({
+    mutationFn: async (id: string) => (await api.post(`/models/${id}/cancel`)).data,
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ['models'] }),
+  })
+  const factorLabel = Object.fromEntries((options?.training_factors || []).map((f: any) => [f.key, f.label]))
   const refresh = useMutation({
     mutationFn: async () => (await api.post('/data/market/refresh')).data,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['market-status'] }),
@@ -40,20 +52,33 @@ export function DataModels() {
       <p className="muted-note">服务启动时会自动补齐；当天的行情通常收盘后才发布，发布前会显示缺 1 个交易日。</p>
     </Card>
     <Card>
-      <PanelHeader title="模型库" subtitle="模型选股策略只能引用这里的模型；每个模型逐年滚动训练，只能给有训练结果的年份打分" action={<Boxes size={16}/>} />
+      <PanelHeader title="模型库" subtitle="模型属于制定它的策略；训练设置完全相同时系统自动复用，不需要在这里挑选。点一行看逐年样本外成绩" action={<Boxes size={16}/>} />
       <div className="table-wrap"><table>
-        <thead><tr><th>模型</th><th>类型</th><th>来源</th><th>训练股票池</th><th>预测周期</th><th>可打分年份</th><th>说明</th></tr></thead>
-        <tbody>{(options?.models || []).map((m: any) => <tr key={m.id}>
-          <td><b>{m.name}</b></td>
-          <td>{frameworkText[m.framework] || m.framework}</td>
-          <td>{originText[m.origin] || m.origin}</td>
-          <td>{m.trained_on}</td>
-          <td>{m.horizon_days} 个交易日</td>
-          <td>{m.years.length ? `${m.years[0]}–${m.years[m.years.length - 1]}` : '—'}</td>
-          <td className="wrap-cell">{m.description}</td>
-        </tr>)}</tbody>
+        <thead><tr><th>模型</th><th>状态</th><th>平均样本外 IC</th><th>平均前 10% 超额</th><th>训练股票池</th><th>预测</th><th>因子</th><th>可打分年份</th><th></th></tr></thead>
+        <tbody>{(models || []).map((m: any) => {
+          const ic = meanOf(m, 'ic'), excess = meanOf(m, 'top10_excess')
+          return <Fragment key={m.id}>
+            <tr className="clickable-row" onClick={() => setOpenModel(openModel === m.id ? '' : m.id)}>
+              <td><b>{m.name}</b><div className="muted-note">{frameworkText[m.framework] || m.framework} · {originText[m.origin] || m.origin} · {m.data}</div></td>
+              <td><ModelStatus model={m}/>{m.status === 'failed' && m.error && <div className="muted-note warn">{m.error}</div>}</td>
+              <td className={ic == null ? '' : ic > 0 ? 'text-mint' : 'text-rose'}>{ic == null ? '—' : ic.toFixed(4)}</td>
+              <td className={excess == null ? '' : excess > 0 ? 'text-mint' : 'text-rose'}>{excess == null ? '—' : formatPercent(excess)}</td>
+              <td>{m.trained_on}</td>
+              <td>{m.horizon_days} 日</td>
+              <td title={m.factors.map((k: string) => factorLabel[k] || k).join('、')}>{m.factors.length} 个{m.config?.cs_rank ? '（池内百分位）' : ''}</td>
+              <td>{m.years.length ? `${m.years[0]}–${m.years[m.years.length - 1]}` : '—'}</td>
+              <td>{(m.status === 'queued' || m.status === 'training') && <button className="secondary-button" disabled={cancel.isPending}
+                onClick={e => { e.stopPropagation(); if (window.confirm(`取消训练「${m.name}」？`)) cancel.mutate(m.id) }}>取消</button>}</td>
+            </tr>
+            {openModel === m.id && <tr><td colSpan={9}>
+              <p className="muted-note">输入因子：{m.factors.map((k: string) => factorLabel[k] || k).join('、')}</p>
+              {m.description && <p className="muted-note">{m.description}</p>}
+              <ModelYears model={m}/>
+            </td></tr>}
+          </Fragment>
+        })}</tbody>
       </table></div>
-      <p className="muted-note">系统内训练（LightGBM / XGBoost / LSTM / Transformer）暂未开放。</p>
+      <p className="muted-note">样本外 IC：每天模型分数与之后实际收益的秩相关，按天平均；前 10% 超额：每天分数最高的 10% 股票相对全池平均的未来收益。两者都只用该年模型没见过的数据。新模型在「策略制定」里选「模型预测」后填训练设置生成。</p>
     </Card>
   </>
 }
