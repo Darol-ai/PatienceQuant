@@ -126,9 +126,10 @@ def seed_database(db: Session) -> None:
     _ensure_quant_v3_strategy(db)
     _ensure_csi300_strategies(db)
     # 所有策略都按规格执行（ADR-0048）：给迁移前的策略补上规格
-    from app.pipeline.library import ensure_specs, migrate_paper_positions
+    from app.pipeline.library import ensure_builtin_library, ensure_specs, migrate_paper_positions
 
     ensure_specs(db)
+    ensure_builtin_library(db)
     migrate_paper_positions(db)
     # _ensure_demo_backtest对默认多因子策略的universe(large_cap)逐支调用
     # market_data.prices()——real模式下这会变成真的顺序调用tushare查

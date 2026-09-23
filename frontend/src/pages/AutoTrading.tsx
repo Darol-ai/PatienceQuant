@@ -10,11 +10,11 @@ export function AutoTrading() {
   const queryClient = useQueryClient()
   const [result, setResult] = useState<any>(null)
   const { data: allStrategies } = useQuery({ queryKey: ['strategies'], queryFn: async () => (await api.get('/strategies')).data })
-  // 和回测中心一样，只保留逐年回测验证过真实有效的策略——用?.保留
+  // 和回测中心一样，列出策略库里的策略（不含模拟盘冻结副本）——用?.保留
   // "还没加载完"时的undefined，不能默认成[]，否则下面`if (!strategies)
   // return <LoadingState/>`这个判断会被空数组绕过，页面在数据还没到
   // 的时候就先渲染出一个空列表。
-  const strategies = allStrategies?.filter((item: any) => item.validated)
+  const strategies = allStrategies?.filter((item: any) => item.origin !== 'paper_snapshot')
   const { data: paperAccount } = useQuery({
     queryKey: ['paper-account'],
     queryFn: async () => (await api.get('/paper/account')).data,

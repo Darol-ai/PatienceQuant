@@ -550,3 +550,25 @@ def test_csi300_strategy_drives_paper_trading_rebalance():
             assert signal["name"] != signal["symbol"], "必须查到真实股票名字，不能退化成显示代码本身"
 
         client.post("/api/paper/reset", json={"initial_capital": 1_000_000})
+
+
+def test_builtin_library_strategies_are_listed_and_run():
+    """策略库第一批（ADR-0047 第 9 条）：迁移的 5 个 + QuantsPlaybook 的 5 个都登记为内置策略，
+    并且都能通过同一个回测接口跑通。"""
+    with TestClient(app) as client:
+        rows = client.get("/api/strategies").json()
+        builtin = {row["kind"] for row in rows if row["origin"] == "builtin"}
+        assert {"multifactor", "quant_v3_regression", "csi300_lightgbm", "csi300_xgboost", "csi300_ensemble",
+                "pb_ens_rsrs", "pb_ens_alligator", "pb_ens_icu_ma", "pb_ubl", "pb_ideal_amplitude"} <= builtin
+        by_kind = {row["kind"]: row for row in rows if row["origin"] == "builtin"}
+        assert by_kind["pb_ens_rsrs"]["spec"]["timing"]["type"] == "rsrs"
+        assert by_kind["pb_ubl"]["default_universe"] == "csi300"
+
+        for kind in ("pb_ens_rsrs", "pb_ubl"):
+            response = client.post("/api/backtests", json={
+                "strategy_id": by_kind[kind]["id"], "start_date": "2025-01-01", "end_date": "2025-06-30"})
+            assert response.status_code == 200, response.text
+            result = response.json()
+            assert result["universe"] == "csi300" and result["universe_size"] == 300
+            assert result["metrics"]["trade_count"] >= 0
+            assert result["strategy_config"]["spec"] == by_kind[kind]["spec"]

@@ -512,6 +512,7 @@ def list_strategies(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
                        "is_default": row.is_default, "created_at": row.created_at.isoformat(),
                        "validated": row.kind in VALIDATED_KINDS,
                        "spec": strategy_spec(row).model_dump(mode="json"),
+                       "origin": row.origin or "user",
                        "default_universe": default_universe(row),
                        "study_period": {"start": latest.start_date.isoformat(), "end": latest.end_date.isoformat()} if latest else {"start": research_start.isoformat(), "end": research_end.isoformat()},
                        "backtest_run_id": latest.id if latest else None, "backtest_metrics": metrics})
@@ -547,6 +548,7 @@ def create_strategy(payload: StrategyPayload, db: Session = Depends(get_db)) -> 
         is_default=True,
     )
     strategy.kind = "multifactor"
+    strategy.origin = "user"
     strategy.spec = spec_from_legacy_row(strategy).model_dump(mode="json")
     db.add(strategy)
     db.commit()
@@ -1120,6 +1122,7 @@ def apply_backtest_to_paper(
         db.add(paper_strategy)
     paper_strategy.version = 1
     paper_strategy.kind = source_strategy.kind
+    paper_strategy.origin = "paper_snapshot"
     paper_strategy.description = "从回测 #%s 应用；冻结股票池和这次回测实际执行的策略规格" % run.id
     paper_strategy.spec = run_spec.model_dump(mode="json")
     paper_strategy.weights = dict(getattr(run_spec.scorer, "weights", {}) or {})

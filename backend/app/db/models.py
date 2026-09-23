@@ -112,6 +112,8 @@ class Strategy(Base):
     # 策略规格（app/pipeline/spec.py 的 StrategySpec，ADR-0047/0048）：打分、择时、
     # 选股、权重、调仓。回测和模拟盘只按它执行；上面那些旧字段只给旧表单用。
     spec: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    # 策略库里的来源：builtin 内置 / user 用户制定 / paper_snapshot 从回测应用到模拟盘时冻结的副本
+    origin: Mapped[str] = mapped_column(String(20), default="user")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

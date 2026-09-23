@@ -97,6 +97,7 @@ def migrate_lightweight_schema() -> None:
             "drawdown_brake_exposure": "ALTER TABLE strategies ADD COLUMN drawdown_brake_exposure FLOAT DEFAULT 0.50",
             "kind": "ALTER TABLE strategies ADD COLUMN kind VARCHAR(30) DEFAULT 'multifactor'",
             "spec": "ALTER TABLE strategies ADD COLUMN spec JSON",
+            "origin": "ALTER TABLE strategies ADD COLUMN origin VARCHAR(20) DEFAULT 'user'",
         }
         pending = [statement for name, statement in migrations.items() if name not in columns]
         if pending:

@@ -1,0 +1,29 @@
+PatienceQuant
+=============
+
+本项目的部分择时信号和选股因子移植自 QuantsPlaybook：
+
+  项目：QuantsPlaybook
+  作者：hugo2046（shen.lan123@gmail.com）
+  地址：https://github.com/hugo2046/QuantsPlaybook
+  参照版本：commit 1e4a231
+  许可：原仓库未附开源许可证；作者已同意本项目直接使用其代码。
+
+移植内容（原代码从聚宽/本地文件取数、依赖 talib/vectorbt/backtrader，
+这里改写为只读本地行情库、只依赖 pandas/numpy/scipy 的函数）：
+
+  backend/app/pipeline/index_signals.py
+    - rsrs_zscore / rsrs_state      ← C-择时类/RSRS择时指标/py/RSRS.ipynb
+                                       （光大证券《基于阻力支撑相对强度（RSRS）的市场择时》）
+    - icu_ma / icu_ma_state         ← C-择时类/ICU均线/src/icu_ma.py
+                                       （中泰证券《"均线"才是绝对收益利器-ICU均线下的择时策略》）
+    - alligator_state               ← C-择时类/基于鳄鱼线的指数择时及轮动策略/src/SignalMaker.py
+                                       （招商证券《基于鳄鱼线的指数择时及轮动策略》）
+
+  backend/app/pipeline/price_factors.py
+    - ubl                           ← B-因子构建类/上下影线因子/py/上下引线因子.ipynb
+                                       （东吴证券《上下影线，蜡烛好还是威廉好？》）
+    - ideal_amplitude               ← B-因子构建类/振幅因子的隐藏结构/notebook/振幅因子的隐藏结构.ipynb
+                                       （开源证券《振幅因子的隐藏结构》）
+
+与原实现的差异写在各函数的说明里（如 UBL 省略市值中性化、鳄鱼线组合不含北向资金信号）。

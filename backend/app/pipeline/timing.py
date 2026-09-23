@@ -12,7 +12,8 @@ import pandas as pd
 
 from app.data.service import MarketDataService
 from app.pipeline.bars import warmup_start
-from app.pipeline.spec import IndexTrendTimingSpec, NoTimingSpec
+from app.pipeline import index_signals
+from app.pipeline.spec import AlligatorTimingSpec, IcuMaTimingSpec, IndexTrendTimingSpec, NoTimingSpec, RsrsTimingSpec
 
 
 @dataclass
@@ -67,9 +68,51 @@ class IndexTrendTiming(TimingSignal):
         return TimingResult(1.0, "risk_on")
 
 
+class IndexStateTiming(TimingSignal):
+    """把"指数日线 → 每天 0/1 持仓状态"的纯函数包装成择时插槽。
+
+    指数日线直接读本地行情库里的沪深300（2005 年起），不管 DATA_MODE：这些信号
+    需要开高低收，demo 模式的模拟基准只有收盘价。整段状态序列只算一次。
+    """
+
+    def __init__(self, name: str, compute, label: str):
+        self.name = name
+        self.compute = compute
+        self.label_text = label
+        self._state: Optional[pd.Series] = None
+        self._prepared_until: Optional[date] = None
+
+    def prepare(self, start: date, end: date) -> None:
+        self._prepared_until = end
+        from app.data.market_refresh import BENCHMARK_INDEX, get_market_store
+
+        ohlc = get_market_store().load_index(BENCHMARK_INDEX, date(2005, 1, 1), end)
+        if ohlc.empty:
+            raise ValueError("本地行情库里没有沪深300指数日线，先补齐行情")
+        ohlc = ohlc.set_index(pd.to_datetime(ohlc["trade_date"])).sort_index()
+        self._state = self.compute(ohlc)
+
+    def exposure(self, as_of: date) -> TimingResult:
+        if self._state is None or as_of > self._prepared_until:
+            self.prepare(as_of, as_of)
+        state = self._state[self._state.index <= pd.Timestamp(as_of)]
+        if state.empty:
+            return TimingResult(1.0, "early_sample", f"{self.label_text}：指数历史不够，择时不生效，满仓")
+        value = float(state.iloc[-1])
+        if value > 0:
+            return TimingResult(value, "risk_on")
+        return TimingResult(0.0, "risk_off", f"{self.label_text}看空，空仓")
+
+
 def build_timing(spec, data: MarketDataService) -> TimingSignal:
     if isinstance(spec, NoTimingSpec):
         return NoTiming()
     if isinstance(spec, IndexTrendTimingSpec):
         return IndexTrendTiming(spec, data)
+    if isinstance(spec, RsrsTimingSpec):
+        return IndexStateTiming("rsrs", lambda o: index_signals.rsrs_state(o, spec.n, spec.m, spec.threshold), "RSRS 择时")
+    if isinstance(spec, IcuMaTimingSpec):
+        return IndexStateTiming("icu_ma", lambda o: index_signals.icu_ma_state(o, spec.n), "ICU 均线择时")
+    if isinstance(spec, AlligatorTimingSpec):
+        return IndexStateTiming("alligator", index_signals.alligator_state, "鳄鱼线择时")
     raise ValueError(f"未知的择时信号：{spec}")

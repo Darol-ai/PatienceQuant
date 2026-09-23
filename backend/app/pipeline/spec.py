@@ -46,7 +46,29 @@ class IndexTrendTimingSpec(BaseModel):
     risk_off_exposure: float = Field(0.75, ge=0, le=1)
 
 
-TimingSpec = Union[NoTimingSpec, IndexTrendTimingSpec]
+class RsrsTimingSpec(BaseModel):
+    """RSRS 标准分择时（光大证券 2017）：高于 threshold 满仓，跌破 −threshold 空仓。"""
+
+    type: Literal["rsrs"] = "rsrs"
+    n: int = Field(18, ge=5, le=60)
+    m: int = Field(600, ge=100, le=1200)
+    threshold: float = Field(0.7, gt=0, le=3)
+
+
+class IcuMaTimingSpec(BaseModel):
+    """ICU 均线择时（中泰证券 2023）：收盘价在 n 日稳健回归均线之上满仓，之下空仓。"""
+
+    type: Literal["icu_ma"] = "icu_ma"
+    n: int = Field(5, ge=3, le=250)
+
+
+class AlligatorTimingSpec(BaseModel):
+    """鳄鱼线组合择时（招商证券 2024）：鳄鱼线 + AO + 分形 + MACD，参数沿用原书/研报。"""
+
+    type: Literal["alligator"] = "alligator"
+
+
+TimingSpec = Union[NoTimingSpec, IndexTrendTimingSpec, RsrsTimingSpec, IcuMaTimingSpec, AlligatorTimingSpec]
 
 
 class SelectionSpec(BaseModel):

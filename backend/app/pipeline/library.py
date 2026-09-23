@@ -79,6 +79,68 @@ def ensure_specs(db: Session) -> int:
     return len(rows)
 
 
+# ---- 内置策略（ADR-0047 第 9 条第一批）----
+
+_ENSEMBLE = {"type": "model", "models": ["legacy/csi300_lightgbm", "legacy/csi300_xgboost"]}
+_PLAYBOOK = "来源：QuantsPlaybook（hugo2046，经作者同意使用，见仓库 NOTICE）。"
+_WEEKLY_NOTE = "择时信号只在调仓日判断，研报是每天判断，所以这里每周调仓。"
+
+BUILTIN_STRATEGIES: List[dict] = [
+    {"kind": "pb_ens_rsrs", "name": "集成模型 + RSRS择时",
+     "description": "沪深300集成模型选前10%等权，整体仓位由RSRS标准分择时决定（光大证券2017：18日最高价对最低价的斜率，"
+                    "600日标准分高于0.7满仓、跌破−0.7空仓）。" + _WEEKLY_NOTE + _PLAYBOOK,
+     "spec": {"scorer": _ENSEMBLE, "timing": {"type": "rsrs"}, "selection": {"type": "top_pct", "pct": 0.1},
+              "rebalance": {"frequency": "weekly"}}},
+    {"kind": "pb_ens_alligator", "name": "集成模型 + 鳄鱼线择时",
+     "description": "沪深300集成模型选前10%等权，整体仓位由鳄鱼线组合择时决定（招商证券2024：鳄鱼线+AO+分形+MACD，"
+                    "不含研报里的北向资金信号）。" + _WEEKLY_NOTE + _PLAYBOOK,
+     "spec": {"scorer": _ENSEMBLE, "timing": {"type": "alligator"}, "selection": {"type": "top_pct", "pct": 0.1},
+              "rebalance": {"frequency": "weekly"}}},
+    {"kind": "pb_ens_icu_ma", "name": "集成模型 + ICU均线择时",
+     "description": "沪深300集成模型选前10%等权，整体仓位由ICU均线择时决定（中泰证券2023：5日重复中位数稳健回归均线，"
+                    "收盘价在均线之上满仓、之下空仓）。" + _WEEKLY_NOTE + _PLAYBOOK,
+     "spec": {"scorer": _ENSEMBLE, "timing": {"type": "icu_ma"}, "selection": {"type": "top_pct", "pct": 0.1},
+              "rebalance": {"frequency": "weekly"}}},
+    {"kind": "pb_ubl", "name": "上下影线因子选股",
+     "description": "按上下影线综合因子UBL从低到高选前30名等权，每月调仓（东吴证券2020：蜡烛上影线波动+威廉下影线均值；"
+                    "研报先做市值中性化，市值数据还没接入，这里省略）。" + _PLAYBOOK,
+     "spec": {"scorer": {"type": "factor_weights", "weights": {"ubl": 1.0}}, "selection": {"type": "top_n", "n": 30}}},
+    {"kind": "pb_ideal_amplitude", "name": "理想振幅因子选股",
+     "description": "按理想振幅因子（高价日振幅−低价日振幅，λ=20%）从低到高选前30名等权，每月调仓（开源证券2020）。" + _PLAYBOOK,
+     "spec": {"scorer": {"type": "factor_weights", "weights": {"ideal_amplitude": 1.0}}, "selection": {"type": "top_n", "n": 30}}},
+]
+
+
+def ensure_builtin_library(db: Session) -> None:
+    """登记内置策略，并给已有策略标上来源（内置 / 用户 / 模拟盘快照）。"""
+    from datetime import date as _date
+
+    for item in BUILTIN_STRATEGIES:
+        if db.scalar(select(Strategy).where(Strategy.kind == item["kind"]).limit(1)):
+            continue
+        spec = StrategySpec.model_validate(item["spec"])
+        db.add(Strategy(
+            name=item["name"], kind=item["kind"], version=1, description=item["description"],
+            spec=spec.model_dump(mode="json"), origin="builtin", universe="csi300",
+            weights=dict(getattr(spec.scorer, "weights", {}) or {}),
+            holdings_count=spec.selection.n or 30, max_weight=spec.weighting.max_weight,
+            rebalance_frequency=spec.rebalance.frequency, turnover_band=spec.rebalance.turnover_band,
+            trend_filter=False, stop_loss=0, target_volatility=0, max_drawdown_budget=0, cash_buffer=0,
+            research_start_date=_date(2019, 1, 1), research_end_date=_date(2025, 12, 31), is_default=False,
+        ))
+    builtin_kinds = set(_MODEL_SPECS) | {item["kind"] for item in BUILTIN_STRATEGIES}
+    rows = db.scalars(select(Strategy).order_by(Strategy.id)).all()
+    first_v3 = next((r for r in rows if r.kind == "multifactor" and r.name == "沪深300增强趋势价值成长策略 V3"), None)
+    for row in rows:
+        if row.kind in builtin_kinds or row is first_v3:
+            row.origin = "builtin"
+        elif "回测 #" in (row.name or ""):
+            row.origin = "paper_snapshot"
+        elif not row.origin:
+            row.origin = "user"
+    db.commit()
+
+
 def data_service_for(db: Session, row: Strategy) -> MarketDataService:
     """模型选股策略只在真实行情上有意义，不管 DATA_MODE 怎么设都读本地行情库。"""
     return MarketDataService(db, real_market_data=is_model_strategy(row))

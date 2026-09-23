@@ -26,6 +26,7 @@ from app.data.tushare_client import TushareQueryFailed, run as run_tushare
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[2] / "data" / "market"
 STORE_START = date(2016, 1, 1)
+INDEX_START = date(2005, 1, 1)
 DAILY_COLUMNS = ["ts_code", "trade_date", "open", "high", "low", "close", "vol", "amount", "adj_factor"]
 _FLUSH_EVERY_DAYS = 20
 
@@ -197,12 +198,24 @@ class AShareMarketStore:
         until = until or self.latest_trading_day()
         path = self._index_path(ts_code)
         existing = pd.read_parquet(path) if path.exists() else pd.DataFrame(columns=["trade_date", "close"])
-        begin = self.start if existing.empty else existing["trade_date"].max().date() + timedelta(days=1)
-        if begin > until:
+        ranges = []
+        if existing.empty:
+            ranges.append((INDEX_START, until))
+        else:
+            first, last = existing["trade_date"].min().date(), existing["trade_date"].max().date()
+            # 指数比个股往前多存到 2005 年：择时信号（如 RSRS 要 600 多天预热）需要更长的历史，一只指数只多一次调用
+            if first > INDEX_START + timedelta(days=15):
+                ranges.append((INDEX_START, first - timedelta(days=1)))
+            if last + timedelta(days=1) <= until:
+                ranges.append((last + timedelta(days=1), until))
+        frames = []
+        for begin, end in ranges:
+            part = self.runner(lambda pro: pro.index_daily(ts_code=ts_code, start_date=_compact(begin), end_date=_compact(end)))
+            if part is not None and not part.empty:
+                frames.append(part)
+        if not frames:
             return 0
-        fetched = self.runner(lambda pro: pro.index_daily(ts_code=ts_code, start_date=_compact(begin), end_date=_compact(until)))
-        if fetched is None or fetched.empty:
-            return 0
+        fetched = pd.concat(frames, ignore_index=True)
         fetched = fetched[["trade_date", "open", "high", "low", "close", "vol", "amount"]].copy()
         fetched["trade_date"] = pd.to_datetime(fetched["trade_date"], format="%Y%m%d")
         merged = fetched if existing.empty else pd.concat([existing, fetched], ignore_index=True)

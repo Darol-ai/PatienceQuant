@@ -41,9 +41,8 @@ export function BacktestCenter() {
     queryKey: ['strategies'],
     queryFn: async () => (await api.get('/strategies')).data,
   })
-  // 只保留逐年回测验证过真实有效的策略——`validated`是后端按
-  // ACTIVE_CSI300_STRATEGIES算出来的，不在前端另外维护一份判断标准。
-  const strategies = allStrategies?.filter((item: any) => item.validated)
+  // 策略库里的内置策略和用户自己制定的策略；从回测冻结出来的模拟盘副本不在这里列出。
+  const strategies = allStrategies?.filter((item: any) => item.origin !== 'paper_snapshot')
   // 策略中心的"用当前配置运行回测"会带上具体策略id跳转过来——哪怕这个
   // 策略没在上面的已验证列表里(比如默认多因子策略)，既然是用户从策略
   // 中心点过来的明确意图，也应该按这个id选中，而不是被下拉框的默认筛选
