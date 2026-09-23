@@ -1,3 +1,4 @@
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
@@ -613,3 +614,14 @@ def test_define_strategy_then_practice_and_reload_history():
         reloaded = client.get(f"/api/backtests/{result['id']}/result").json()
         for key in ("metrics", "equity", "trades", "annual_returns", "selected_stocks", "notes", "strategy_config"):
             assert reloaded[key] == result[key], key
+
+
+def test_universe_analytics_without_fundamentals_returns_empty_valuation_chart():
+    """真实模式下财务因子被去掉后，"估值×成长"图不能报 500，也不能拿程序生成的数字凑。"""
+    from app.api.routes import _analytics_from_ranking
+
+    ranking = pd.DataFrame({"symbol": ["1", "2"], "name": ["a", "b"], "industry": ["x", "y"], "score": [60.0, 40.0],
+                            "return_12m": [0.1, -0.1], "target_weight": [0.5, 0.0]})
+    result = _analytics_from_ranking(ranking, "real")
+    assert result["valuation_growth"] == [] and "财务数据" in result["valuation_growth_note"]
+    assert len(result["portfolio_weights"]) == 1

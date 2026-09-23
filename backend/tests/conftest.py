@@ -36,6 +36,10 @@ os.environ["DATA_MODE"] = "demo"
 
 os.environ["PATIENCEQUANT_WARM_CSI300"] = "0"
 
+# backend/.env 里配了真实的大模型 key——测试不能真的去调它（花钱、结果不确定）。
+# 需要测大模型分支的测试自己 monkeypatch get_ai_credentials。
+os.environ["OPENAI_API_KEY"] = ""
+
 import pytest
 
 

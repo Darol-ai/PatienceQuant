@@ -29,7 +29,7 @@ from app.quant_v3.research_notes import quant_v3_research_universe
 from app.db.models import AIExplanation, BacktestEquity, BacktestMetric, BacktestRun, DailyAccount, Order, Portfolio, Position, ResearchAnnotation, ResearchGroup, Stock, Strategy, StrategyFactor, Trade, Watchlist
 from app.db.session import get_db
 from app.portfolio.service import PaperTradingService
-from app.schemas import AIDecisionRequest, AISettingsRequest, ApplyBacktestPaperRequest, BacktestRequest, ExplainRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyAssistRequest, StrategyPayload, StrategySpecPayload
+from app.schemas import AIDecisionRequest, AISettingsRequest, ApplyBacktestPaperRequest, BacktestRequest, ExplainRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyAssistRequest, StrategyPayload, StrategySpecPayload, RecommendRequest, ScorecardRefreshRequest
 from app.db.seed import DEFAULT_WEIGHTS
 from app.pipeline.library import FIXED_UNIVERSES, VALIDATED_KINDS, build_strategy, spec_from_legacy_row, data_service_for, default_universe, is_model_strategy, latest_market_day, strategy_spec, validate_date_range
 from app.pipeline.model_library import MODEL_LIBRARY, model_years
@@ -1480,7 +1480,9 @@ def _analytics_from_ranking(ranking: pd.DataFrame, data_mode: str) -> Dict[str, 
         remainder = industry.iloc[12:]["count"].sum()
         industry = pd.concat([industry.iloc[:12], pd.DataFrame([{"industry": "其他", "count": int(remainder), "avg_score": float(ranking.score.mean()), "avg_return": float(ranking.return_12m.mean())}])], ignore_index=True)
     bins = pd.cut(ranking.score, bins=[0, 40, 50, 60, 70, 80, 100], include_lowest=True).value_counts(sort=False)
-    return {"industry_distribution": _records(industry), "score_distribution": [{"range": str(key), "count": int(value)} for key, value in bins.items()], "valuation_growth": _records(ranking[["symbol", "name", "industry", "pe", "revenue_growth", "score"]]), "stock_returns": _records(ranking.sort_values("return_12m", ascending=False)[["symbol", "name", "return_12m"]].head(15)), "portfolio_weights": _records(ranking[ranking.target_weight > 0][["symbol", "name", "industry", "target_weight"]])}
+    return {"industry_distribution": _records(industry), "score_distribution": [{"range": str(key), "count": int(value)} for key, value in bins.items()], "valuation_growth": _records(ranking[["symbol", "name", "industry", "pe", "revenue_growth", "score"]]) if {"pe", "revenue_growth"} <= set(ranking.columns) else [],
+            # 真实模式下还没有财务数据，估值/成长不给数（不用程序生成的数字凑）
+            "valuation_growth_note": None if {"pe", "revenue_growth"} <= set(ranking.columns) else "需要财务数据（市盈率、营收增长），本地行情库还没有", "stock_returns": _records(ranking.sort_values("return_12m", ascending=False)[["symbol", "name", "return_12m"]].head(15)), "portfolio_weights": _records(ranking[ranking.target_weight > 0][["symbol", "name", "industry", "target_weight"]])}
 
 
 @router.get("/analytics/universe")
@@ -1543,6 +1545,61 @@ def strategy_assistant(payload: StrategyAssistRequest, db: Session = Depends(get
     db.commit()
     db.refresh(record)
     return {**result, "audit_id": record.id}
+
+
+@router.get("/scorecards")
+def scorecards(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """策略库里每个策略的成绩卡（标准条件下的回测事实），以及后台计算进度。"""
+    from app.pipeline import scorecard
+
+    return _clean({"standard": {k: str(v) for k, v in scorecard.STANDARD.items()},
+                   "cards": scorecard.all_cards(db), "refresh": scorecard.refresh_state()})
+
+
+@router.post("/scorecards/refresh")
+def refresh_scorecards(payload: Optional[ScorecardRefreshRequest] = None) -> Dict[str, Any]:
+    from app.pipeline import scorecard
+
+    options = payload or ScorecardRefreshRequest()
+    started = scorecard.start_refresh(options.strategy_ids, options.force)
+    return {"started": started, "refresh": scorecard.refresh_state()}
+
+
+@router.post("/ai/recommend")
+def recommend_strategy(payload: RecommendRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """智能体推荐：规则按偏好在成绩卡里选一个策略，大模型只负责解释；不下单。"""
+    from app.ai import recommender
+    from app.pipeline import scorecard
+
+    cards = scorecard.all_cards(db)
+    result = recommender.rank(cards, payload.market, payload.max_drawdown, payload.holding)
+    prefs_text = "市场 %s，能接受的最大回撤 %s，持仓周期 %s" % (
+        recommender.MARKET_LABEL.get(payload.market, payload.market),
+        "不限" if payload.max_drawdown is None else "−%.0f%%" % (payload.max_drawdown * 100),
+        recommender.HOLDING_LABEL[payload.holding])
+    if result["chosen"] is None:
+        return {"recommendation": None, "alternatives": [], "rules": result["rules"], "notes": result["notes"],
+                "preferences": prefs_text, "explanation": None}
+    explanation = recommender.explain(db, result, prefs_text, payload.question)
+    chosen = result["chosen"]
+    record = AIExplanation(
+        symbol="-", explanation_type="strategy_recommend", content=explanation["content"],
+        provider=explanation["provider"], model_version=explanation.get("model_version", "rules"), confidence=None,
+        context={"preferences": payload.model_dump(), "chosen_strategy_id": chosen["strategy_id"],
+                 "scorecard_run_id": chosen.get("run_id"), "rules": result["rules"], "notes": result["notes"],
+                 # 被数字核对拦下的大模型原文只进审计记录，不返回给页面
+                 "rejected_llm_content": explanation.pop("rejected_content", None)},
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return _clean({
+        "recommendation": chosen, "alternatives": result["alternatives"], "rules": result["rules"],
+        "notes": result["notes"], "preferences": prefs_text, "explanation": explanation, "audit_id": record.id,
+        # 智能体不能下单：只给出去策略实践回测的入口和建议的回测参数
+        "next_step": {"practice_url": f"/backtest?strategy_id={chosen['strategy_id']}", "universe": chosen["universe"],
+                      "start_date": chosen["standard"]["start_date"], "end_date": chosen["standard"]["end_date"]},
+    })
 
 
 @router.post("/ai/audit/{audit_id}/decision")

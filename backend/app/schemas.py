@@ -152,6 +152,27 @@ class StrategyAssistRequest(BaseModel):
     description: str = Field(..., min_length=1, max_length=2000)
 
 
+class RecommendRequest(BaseModel):
+    """智能体推荐的偏好：市场、能接受的最大回撤（0.25 表示 −25%，不填表示不限）、持仓周期。"""
+
+    market: str = "a_share"
+    max_drawdown: Optional[float] = Field(None, gt=0, le=1)
+    holding: str = "any"
+    question: str = Field("", max_length=1000)
+
+    @field_validator("holding")
+    @classmethod
+    def valid_holding(cls, value: str) -> str:
+        if value not in {"short", "medium", "long", "any"}:
+            raise ValueError("持仓周期只能是 short/medium/long/any")
+        return value
+
+
+class ScorecardRefreshRequest(BaseModel):
+    strategy_ids: Optional[List[int]] = None
+    force: bool = False
+
+
 class AIDecisionRequest(BaseModel):
     adopted: Optional[bool] = None
     rolled_back: Optional[bool] = None

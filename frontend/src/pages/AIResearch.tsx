@@ -3,6 +3,7 @@ import { BrainCircuit, FileText, Settings, Sparkles, UploadCloud, X } from 'luci
 import { useEffect, useRef, useState } from 'react'
 import { api, formatPercent } from '../api'
 import { Card, PageHeader, PanelHeader, Toast } from '../components/UI'
+import { StrategyRecommender } from '../components/StrategyRecommender'
 
 type AISettings = {
   has_api_key: boolean
@@ -107,15 +108,6 @@ type ExplainResult = {
   audit_id: number
 }
 
-type StrategyAssistResult = {
-  content: string
-  provider: string
-  model_version: string
-  confidence: number | null
-  audit_id: number
-  suggested_params: Record<string, unknown>
-}
-
 type ReportAnalysisResult = {
   summary: string
   key_points: string[]
@@ -188,12 +180,6 @@ export function AIResearch() {
   const [result, setResult] = useState<ExplainResult | null>(null)
   const mutation = useMutation({ mutationFn: async () => (await api.post('/ai/explain/trade', form)).data, onSuccess: setResult })
 
-  const [strategyDescription, setStrategyDescription] = useState('低波动、以沪深300大盘股为主、每月调仓一次的稳健策略，控制最大回撤')
-  const [strategyResult, setStrategyResult] = useState<StrategyAssistResult | null>(null)
-  const strategyMutation = useMutation({
-    mutationFn: async () => (await api.post('/ai/strategy-assistant', { description: strategyDescription })).data,
-    onSuccess: setStrategyResult,
-  })
 
   const [reportFile, setReportFile] = useState<File | null>(null)
   const [reportResult, setReportResult] = useState<ReportAnalysisResult | null>(null)
@@ -259,34 +245,7 @@ export function AIResearch() {
       </Card>
     </div>
 
-    <Card>
-      <PanelHeader title="策略助手" subtitle="自然语言 → 策略参数建议（只是建议，不会自动创建或修改策略）"/>
-      <textarea
-        className="strategy-assist-input"
-        rows={3}
-        value={strategyDescription}
-        onChange={e => setStrategyDescription(e.target.value)}
-        placeholder="用一段话描述你想要的策略风格、持仓数量、调仓频率、风险偏好……"
-      />
-      <button className="primary-button full-button" onClick={() => strategyMutation.mutate()} disabled={strategyMutation.isPending}>
-        <Sparkles size={16}/>{strategyMutation.isPending ? '正在生成建议…' : '生成策略参数建议'}
-      </button>
-      {strategyResult && (
-        <div className="ai-result">
-          <p>{strategyResult.content}</p>
-          {Object.keys(strategyResult.suggested_params).length > 0 && (
-            <div className="risk-box">
-              <b>建议参数（复制到策略中心手动创建）</b>
-              {Object.entries(strategyResult.suggested_params).map(([key, value]) => (
-                <span key={key}>• {key}: {String(value)}</span>
-              ))}
-            </div>
-          )}
-          <div className="provider-line"><span>建议来源</span><b>{strategyResult.provider} · {strategyResult.model_version}</b></div>
-          <AuditDecision auditId={strategyResult.audit_id}/>
-        </div>
-      )}
-    </Card>
+    <StrategyRecommender />
 
     <div className="ai-layout">
       <Card>
@@ -355,6 +314,6 @@ export function AIResearch() {
         <div><b>全程留痕</b><span>每次调用都记录模型版本、输入、输出，并支持人工标记采纳/回滚（AI 使用审计）。</span></div>
       </div>
     </Card>
-    {(mutation.isError || strategyMutation.isError || reportMutation.isError || factorMutation.isError) && <Toast message="AI 调用失败" type="error"/>}
+    {(mutation.isError || reportMutation.isError || factorMutation.isError) && <Toast message="AI 调用失败" type="error"/>}
   </>
 }
