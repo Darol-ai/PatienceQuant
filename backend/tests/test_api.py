@@ -572,3 +572,44 @@ def test_builtin_library_strategies_are_listed_and_run():
             assert result["universe"] == "csi300" and result["universe_size"] == 300
             assert result["metrics"]["trade_count"] >= 0
             assert result["strategy_config"]["spec"] == by_kind[kind]["spec"]
+
+
+def test_define_strategy_then_practice_and_reload_history():
+    """策略制定 → 策略实践 → 回测历史（ADR-0047 第 3 条）：按规格保存新策略，
+    回测后能在历史里找到，并且调出来的结果和刚跑完返回的一致。"""
+    with TestClient(app) as client:
+        options = client.get("/api/pipeline/options").json()
+        assert {"ubl", "ideal_amplitude", "momentum"} <= {f["key"] for f in options["factors"]}
+        assert {"rsrs", "icu_ma", "alligator"} <= {t["type"] for t in options["timings"]}
+        assert "legacy/csi300_lightgbm" in {m["id"] for m in options["models"]}
+
+        bad = client.post("/api/strategies/spec", json={"name": "坏策略", "spec": {"scorer": {"type": "factor_weights", "weights": {"nope": 1}},
+                                                                                  "selection": {"type": "top_n", "n": 10}}})
+        assert bad.status_code == 422
+
+        spec = {"scorer": {"type": "factor_weights", "weights": {"momentum": 0.5, "ubl": 0.5}},
+                "timing": {"type": "index_trend", "risk_off_exposure": 0.5},
+                "selection": {"type": "top_n", "n": 10}, "weighting": {"type": "equal", "max_weight": 0.2},
+                "rebalance": {"frequency": "monthly", "turnover_band": 0.02}}
+        created = client.post("/api/strategies/spec", json={"name": "测试·动量加影线", "description": "测试用",
+                                                            "default_universe": "large_cap", "spec": spec})
+        assert created.status_code == 200, created.text
+        strategy_id = created.json()["id"]
+        again = client.post("/api/strategies/spec", json={"name": "测试·动量加影线", "spec": spec}).json()
+        assert again["version"] == created.json()["version"] + 1  # 同名另存为新版本
+
+        row = next(r for r in client.get("/api/strategies").json() if r["id"] == strategy_id)
+        assert row["origin"] == "user" and row["default_universe"] == "large_cap"
+
+        run = client.post("/api/backtests", json={"strategy_id": strategy_id, "start_date": "2023-01-01", "end_date": "2024-12-31"})
+        assert run.status_code == 200, run.text
+        result = run.json()
+        assert result["strategy_config"]["spec"]["timing"]["type"] == "index_trend"
+
+        history = client.get("/api/backtests", params={"strategy_id": strategy_id}).json()
+        assert [h["id"] for h in history] == [result["id"]]
+        assert history[0]["metrics"]["annual_return"] == pytest.approx(result["metrics"]["annual_return"])
+
+        reloaded = client.get(f"/api/backtests/{result['id']}/result").json()
+        for key in ("metrics", "equity", "trades", "annual_returns", "selected_stocks", "notes", "strategy_config"):
+            assert reloaded[key] == result[key], key

@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { api, dataModeLabel, formatMoney, formatPercent } from '../api'
 import { BarChart, DrawdownChart, EquityChart, StockTradeChart } from '../components/Charts'
+import { describeSpec } from './StrategyCenter'
 import { Card, ErrorState, LoadingState, PageHeader, PanelHeader } from '../components/UI'
 
 type BacktestForm = {
@@ -136,9 +137,24 @@ export function BacktestCenter() {
   }, [strategies, linkedStrategy])
 
   const selectedStrategy = allStrategies?.find((item: any) => item.id === form.strategy_id)
-  const isQuantV3Strategy = selectedStrategy?.kind === 'quant_v3_regression' || Boolean(selectedStrategy?.kind?.startsWith('csi300_'))
+  const { data: pipelineOptions } = useQuery({ queryKey: ['pipeline-options'], queryFn: async () => (await api.get('/pipeline/options')).data })
+  const { data: history } = useQuery({
+    queryKey: ['backtest-history', form.strategy_id],
+    queryFn: async () => (await api.get('/backtests', { params: { strategy_id: form.strategy_id } })).data,
+    enabled: Boolean(form.strategy_id),
+  })
+  const loadHistory = useMutation({
+    mutationFn: async (runId: number) => (await api.get(`/backtests/${runId}/result`)).data,
+    onSuccess: data => {
+      setResult(data)
+      setTradePage(1)
+      setShowAllCharts(true)
+      setSelectedSymbol(data.selected_stocks?.[0]?.symbol || '')
+    },
+    onError: (error: any) => setBacktestError(error?.response?.data?.detail || '调出这次回测失败'),
+  })
   const selectedSymbols = form.custom_symbols
-  const manualUniverse = !isQuantV3Strategy && form.universe === 'custom'
+  const manualUniverse = form.universe === 'custom'
   const { data: stockSearchData, isFetching: stocksLoading } = useQuery({
     queryKey: ['backtest-stock-search', debouncedStockSearch, stockGroup, stockExchange, directoryMode],
     queryFn: async () =>
@@ -163,7 +179,7 @@ export function BacktestCenter() {
       : stockSearchData?.source === 'local_cache'
         ? '本地缓存目录'
         : '本地 Demo 目录；搜不到时自动回退真实目录'
-  const canRun = Boolean(form.strategy_id) && (isQuantV3Strategy || !manualUniverse || selectedSymbols.length >= 10)
+  const canRun = Boolean(form.strategy_id) && (!manualUniverse || selectedSymbols.length >= 10)
 
   const toggleSymbol = (stock: StockOption) => {
     const symbol = stock.symbol
@@ -240,10 +256,12 @@ export function BacktestCenter() {
     // 内存)时经常超过这个时间，请求被axios直接掐断、按钮却悄悄跳回
     // 可点击状态，没有任何提示——看起来像是"切了个浏览器标签页就断了"，
     // 实际是超时。这里单独给这个请求放宽到10分钟。
-    mutationFn: async () => (await api.post('/backtests', form, { timeout: 600_000 })).data,
+    mutationFn: async () => (await api.post('/backtests', { ...form, holdings_count: null, max_weight: null, rebalance_frequency: null }, { timeout: 600_000 })).data,
     onMutate: () => setBacktestError(''),
     onSuccess: data => {
       setResult(data)
+      queryClient.invalidateQueries({ queryKey: ['backtest-history', form.strategy_id] })
+      queryClient.invalidateQueries({ queryKey: ['strategies'] })
       setTradePage(1)
       setExportMessage('')
       setShowAllCharts(true)
@@ -343,8 +361,8 @@ export function BacktestCenter() {
     <>
       <PageHeader
         eyebrow="EVALUATION / 04"
-        title="回测中心"
-        description="选择股票池、手动选出至少 10 只股票并框定年份，验证低频买卖策略的真实收益。"
+        title="策略实践"
+        description="从策略库选一个策略，设定回测区间、资金、股票池和费用就能回测；每次回测都会保存，可以在「回测历史」里随时调出。"
         actions={
           <button className="primary-button" onClick={() => mutation.mutate()} disabled={mutation.isPending || !canRun}>
             <Play size={16} />
@@ -398,19 +416,15 @@ export function BacktestCenter() {
                   </div>
                 </div>
               )}
-              {isQuantV3Strategy && (
+              {selectedStrategy?.spec && (
                 <div className="strategy-note full">
                   <div>
-                    <b>{selectedStrategy?.kind?.startsWith('csi300_') ? '固定沪深300全部300支真实成分股 · 月度调仓' : '固定30支跨行业候选池 · 月度调仓'}</b>
-                    <p>
-                      由策略自动管理股票池和调仓周期，无需手动选择。只支持{' '}
-                      {selectedStrategy?.kind?.startsWith('csi300_') ? '2019-01-01 至 2026-12-31' : '2019-01-01 至 2025-12-31'}
-                      {' '}之间的回测区间（逐年滚动训练的模型覆盖范围）。
-                    </p>
+                    <b>策略怎么做（在「策略制定」里定好，回测时不改）</b>
+                    <p>{describeSpec(selectedStrategy.spec, pipelineOptions)}</p>
                   </div>
                 </div>
               )}
-              {!isQuantV3Strategy && (
+              {(
                 <label>
                   股票池
                   <select value={form.universe} onChange={event => setForm({ ...form, universe: event.target.value })}>
@@ -420,19 +434,6 @@ export function BacktestCenter() {
                       </option>
                     ))}
                     <option value="custom">手动选择股票 · {selectedSymbols.length}只</option>
-                  </select>
-                </label>
-              )}
-              {!isQuantV3Strategy && (
-                <label>
-                  调仓周期
-                  <select
-                    value={form.rebalance_frequency}
-                    onChange={event => setForm({ ...form, rebalance_frequency: event.target.value })}
-                  >
-                    <option value="weekly">每周</option>
-                    <option value="monthly">每月</option>
-                    <option value="quarterly">每季度</option>
                   </select>
                 </label>
               )}
@@ -465,35 +466,6 @@ export function BacktestCenter() {
                   onChange={event => setForm({ ...form, initial_capital: Number(event.target.value) })}
                 />
               </label>
-              {!isQuantV3Strategy && (
-                <label>
-                  最终选股 Top N（至少10只）
-                  <input
-                    type="number"
-                    min="10"
-                    max="100"
-                    value={form.holdings_count}
-                    onChange={event =>
-                      setForm({ ...form, holdings_count: Math.max(10, Number(event.target.value)) })
-                    }
-                  />
-                </label>
-              )}
-              {!isQuantV3Strategy && (
-                <label>
-                  单股最大权重
-                  <div className="input-with-suffix">
-                    <input
-                      type="number"
-                      min="1"
-                      max="100"
-                      value={form.max_weight * 100}
-                      onChange={event => setForm({ ...form, max_weight: Number(event.target.value) / 100 })}
-                    />
-                    <span>%</span>
-                  </div>
-                </label>
-              )}
               <label>
                 手续费
                 <div className="input-with-suffix">
@@ -536,6 +508,23 @@ export function BacktestCenter() {
                 模拟盘区间
               </button>
             </div>
+          </Card>
+
+          <Card>
+            <PanelHeader title="回测历史" subtitle={`这个策略保存下来的回测 · ${history?.length ?? 0} 次；点一条调出完整结果`} />
+            {history?.length ? (
+              <div className="history-list">
+                {history.map((run: any) => (
+                  <button key={run.id} className={`history-item ${result?.id === run.id ? 'active' : ''}`} disabled={run.status !== 'completed' || loadHistory.isPending}
+                    onClick={() => loadHistory.mutate(run.id)}>
+                    <b>#{run.id} · {run.start_date} ~ {run.end_date}</b>
+                    <span className="num">{run.status === 'completed' ? `年化 ${formatPercent(run.metrics?.annual_return ?? 0)}` : run.status === 'failed' ? '失败' : run.status}</span>
+                    <small>{run.universe || '—'}{run.universe_size ? ` · ${run.universe_size}只` : ''} · 初始 {formatMoney(run.initial_capital)}{run.seeded ? ' · 系统预置' : ''}</small>
+                    <small className="num">{run.status === 'completed' ? `回撤 ${formatPercent(run.metrics?.max_drawdown ?? 0)} · 夏普 ${Number(run.metrics?.sharpe ?? 0).toFixed(2)}` : (run.error_message || '').slice(0, 24)}</small>
+                  </button>
+                ))}
+              </div>
+            ) : <p className="muted-note">这个策略还没有回测过。</p>}
           </Card>
 
           {manualUniverse && (
@@ -690,18 +679,18 @@ export function BacktestCenter() {
               <span>
                 {manualUniverse
                   ? `本次已选择 ${selectedSymbols.length} 只股票`
-                  : '大盘股、A股或已保存自定义池'}
+                  : '股票池属于每次回测，默认用策略自己的股票池'}
               </span>
             </div>
             <div>
               <span className="timeline-dot blue" />
-              <b>综合评分选 Top N</b>
-              <span>五大因子横截面排名，至少 10 只，可提高到 100 只</span>
+              <b>打分 → 选股 → 权重 → 择时</b>
+              <span>按策略规格执行，规格在「策略制定」里定好，回测时不改</span>
             </div>
             <div>
               <span className="timeline-dot gold" />
-              <b>低频自动买卖</b>
-              <span>BUY / SELL / HOLD，下一交易日成交，费用进入净值</span>
+              <b>调仓只交易差额</b>
+              <span>收盘出信号、下一交易日成交，按手取整，手续费和滑点计入净值</span>
             </div>
           </div>
           <div className="method-note">
@@ -714,7 +703,7 @@ export function BacktestCenter() {
         </Card>
       </div>
 
-      {mutation.isError && <ErrorState text="回测失败，请检查日期、Top N 和股票池。" />}
+      {mutation.isError && <ErrorState text="回测失败，请检查日期和股票池。" />}
 
       {result && (
         <>

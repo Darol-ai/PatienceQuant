@@ -111,6 +111,17 @@ BUILTIN_STRATEGIES: List[dict] = [
 ]
 
 
+# 迁移前的内置策略描述里带着迁移前、口径不同的成绩数字（如"7年复合+611.9%"），
+# 和现在回测历史里的结果对不上；统一换成只讲方法的说明，成绩以回测历史/成绩卡为准。
+_LEGACY_DESCRIPTIONS = {
+    "csi300_lightgbm": "沪深300成分股，用 LightGBM 旧模型（14 项价格/量能特征，预测未来 90 个交易日收益，5 个种子平均，逐年滚动训练）打分，选前 10% 等权，每月调仓，不择时。",
+    "csi300_xgboost": "沪深300成分股，用 XGBoost 旧模型（与 LightGBM 旧模型同一套特征和训练规则）打分，选前 10% 等权，每月调仓，不择时。",
+    "csi300_ensemble": "沪深300成分股，LightGBM 和 XGBoost 两个旧模型的预测分数取平均，选前 10% 等权，每月调仓，不择时。",
+    "quant_v3_regression": "30 支跨行业候选池，用 LightGBM 旧模型打分，选前 40% 等权，每月调仓，不择时。迁移时去掉了原来的动量兜底和流动性资格两层（见 ADR-0048）。",
+    "multifactor": "因子权重策略：基本面/估值/盈利质量/动量/风险五组因子按权重合成综合分，选前 10 名按分数加权（单股 ≤15%），沪深300 均线趋势择时，每月调仓。真实行情下只有动量、风险两组有真实数据。",
+}
+
+
 def ensure_builtin_library(db: Session) -> None:
     """登记内置策略，并给已有策略标上来源（内置 / 用户 / 模拟盘快照）。"""
     from datetime import date as _date
@@ -134,6 +145,8 @@ def ensure_builtin_library(db: Session) -> None:
     for row in rows:
         if row.kind in builtin_kinds or row is first_v3:
             row.origin = "builtin"
+            if row.kind in _LEGACY_DESCRIPTIONS:
+                row.description = _LEGACY_DESCRIPTIONS[row.kind]
         elif "回测 #" in (row.name or ""):
             row.origin = "paper_snapshot"
         elif not row.origin:

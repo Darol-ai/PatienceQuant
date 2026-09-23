@@ -29,10 +29,14 @@ from app.quant_v3.research_notes import quant_v3_research_universe
 from app.db.models import AIExplanation, BacktestEquity, BacktestMetric, BacktestRun, DailyAccount, Order, Portfolio, Position, ResearchAnnotation, ResearchGroup, Stock, Strategy, StrategyFactor, Trade, Watchlist
 from app.db.session import get_db
 from app.portfolio.service import PaperTradingService
-from app.schemas import AIDecisionRequest, AISettingsRequest, ApplyBacktestPaperRequest, BacktestRequest, ExplainRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyAssistRequest, StrategyPayload
+from app.schemas import AIDecisionRequest, AISettingsRequest, ApplyBacktestPaperRequest, BacktestRequest, ExplainRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyAssistRequest, StrategyPayload, StrategySpecPayload
 from app.db.seed import DEFAULT_WEIGHTS
 from app.pipeline.library import FIXED_UNIVERSES, VALIDATED_KINDS, build_strategy, spec_from_legacy_row, data_service_for, default_universe, is_model_strategy, latest_market_day, strategy_spec, validate_date_range
+from app.pipeline.model_library import MODEL_LIBRARY, model_years
+from app.pipeline.price_factors import PRICE_FACTORS
+from app.pipeline.scorers import FUNDAMENTAL_FACTOR_GROUPS
 from app.pipeline.spec import StrategySpec
+from pydantic import ValidationError
 from app.pipeline.strategy import build_pipeline_strategy
 from app.strategies.base import StrategyConfig, StrategyResult
 
@@ -556,6 +560,66 @@ def create_strategy(payload: StrategyPayload, db: Session = Depends(get_db)) -> 
     return {"id": strategy.id, "version": strategy.version, "message": "策略版本已保存"}
 
 
+@router.get("/pipeline/options")
+def pipeline_options(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """策略制定表单的选项：每个插槽能选什么、各因子在当前数据模式下有没有真实数据。"""
+    real = get_settings().data_mode.lower() == "real"
+    group_labels = {"fundamental": ("基本面", "ROE · 成长 · 现金流"), "valuation": ("估值", "PE · PB · PS · 股息率"),
+                    "quality": ("盈利质量", "稳定性 · 毛利 · 净利"), "momentum": ("动量", "3/6/12 个月收益"),
+                    "risk": ("风险", "波动 · 回撤 · Beta，越低越好")}
+    factors = [{"key": key, "label": label, "description": hint, "kind": "group",
+                "available": not (real and key in FUNDAMENTAL_FACTOR_GROUPS),
+                "unavailable_reason": "需要财务数据，本地行情库还没有" if real and key in FUNDAMENTAL_FACTOR_GROUPS else None}
+               for key, (label, hint) in group_labels.items()]
+    factors += [{"key": f.key, "label": f.label, "description": f.description, "kind": "price", "available": True,
+                 "unavailable_reason": None} for f in PRICE_FACTORS.values()]
+    models = [{"id": entry.id, "name": entry.name, "framework": entry.framework, "origin": entry.origin,
+               "trained_on": entry.trained_on, "horizon_days": entry.horizon_days, "description": entry.description,
+               "years": model_years(entry.id)} for entry in MODEL_LIBRARY.values()]
+    timings = [
+        {"type": "none", "label": "不择时（满仓）", "params": []},
+        {"type": "index_trend", "label": "沪深300 均线趋势", "description": "跌破 50 日均线降仓，跌破 200 日均线降到设定仓位",
+         "params": [{"key": "risk_off_exposure", "label": "最低仓位", "default": 0.75, "min": 0, "max": 1, "step": 0.05, "percent": True}]},
+        {"type": "rsrs", "label": "RSRS 择时", "description": "光大证券 2017：阻力支撑相对强度标准分",
+         "params": [{"key": "n", "label": "斜率窗口 N", "default": 18, "min": 5, "max": 60, "step": 1},
+                    {"key": "m", "label": "标准分窗口 M", "default": 600, "min": 100, "max": 1200, "step": 50},
+                    {"key": "threshold", "label": "阈值 S", "default": 0.7, "min": 0.1, "max": 3, "step": 0.1}]},
+        {"type": "icu_ma", "label": "ICU 均线择时", "description": "中泰证券 2023：稳健回归均线",
+         "params": [{"key": "n", "label": "均线窗口", "default": 5, "min": 3, "max": 250, "step": 1}]},
+        {"type": "alligator", "label": "鳄鱼线择时", "description": "招商证券 2024：鳄鱼线 + AO + 分形 + MACD", "params": []},
+    ]
+    universes = [{"id": key, "name": name, "description": description} for key, (name, _, description) in FIXED_UNIVERSES.items()]
+    universes += [{"id": "large_cap", "name": "大盘股核心池", "description": "通用目录排在前面的 300 支"},
+                  {"id": "a_share", "name": "A股全市场", "description": "通用目录全部 A 股"}]
+    return {"data_mode": get_settings().data_mode, "factors": factors, "models": models, "timings": timings,
+            "universes": universes, "markets": [{"id": "a_share", "name": "A股"}]}
+
+
+@router.post("/strategies/spec")
+def create_strategy_from_spec(payload: StrategySpecPayload, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """策略制定：按规格保存一个新策略。策略保存后不再修改，改任何一项都另存为新版本（ADR-0047 第 3 条）。"""
+    try:
+        spec = StrategySpec.model_validate(payload.spec)
+        build_pipeline_strategy(spec, MarketDataService(db, real_market_data=spec.scorer.type == "model"))
+    except (ValueError, ValidationError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    latest = db.scalar(select(Strategy).where(Strategy.name == payload.name).order_by(Strategy.version.desc()).limit(1))
+    strategy = Strategy(
+        name=payload.name, version=(latest.version + 1 if latest else 1), description=payload.description,
+        kind="custom", origin="user", spec=spec.model_dump(mode="json"), universe=payload.default_universe,
+        weights=dict(getattr(spec.scorer, "weights", {}) or {}),
+        holdings_count=spec.selection.n or 0, max_weight=spec.weighting.max_weight,
+        rebalance_frequency=spec.rebalance.frequency, turnover_band=spec.rebalance.turnover_band,
+        trend_filter=spec.timing.type != "none", risk_off_exposure=getattr(spec.timing, "risk_off_exposure", 1.0),
+        stop_loss=0, target_volatility=0, max_drawdown_budget=0, cash_buffer=0, benchmark_enhancement=False,
+        dip_buy_strength=0, profit_take_strength=0, is_default=False,
+    )
+    db.add(strategy)
+    db.commit()
+    db.refresh(strategy)
+    return {"id": strategy.id, "name": strategy.name, "version": strategy.version, "message": "策略已保存到策略库"}
+
+
 @router.put("/strategies/{strategy_id}")
 def update_strategy(strategy_id: int, payload: StrategyPayload, db: Session = Depends(get_db)) -> Dict[str, Any]:
     strategy = db.get(Strategy, strategy_id)
@@ -648,6 +712,9 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
             "selected_stocks": selected_stocks,
             "risk_summary": result.risk_summary or {},
             "strategy_config": _spec_summary(spec),
+            "notes": result.notes,
+            "universe_size": len(symbols),
+            "strategy_name": strategy.name,
         }
         db.add_all([BacktestMetric(backtest_run_id=run.id, name=name, value=value) for name, value in result.metrics.items()])
         for name, value in (result.risk_summary or {}).items():
@@ -658,30 +725,7 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
         run.status = "completed"
         run.completed_at = datetime.utcnow()
         db.commit()
-        return {
-            "id": run.id,
-            "status": run.status,
-            "start_date": payload.start_date.isoformat(),
-            "end_date": payload.end_date.isoformat(),
-            "initial_capital": payload.initial_capital,
-            "final_assets": float(result.metrics["final_assets"]),
-            "total_profit": float(result.metrics["total_profit"]),
-            "overall_return": float(result.metrics["overall_return"]),
-            "strategy_name": strategy.name,
-            "metrics": result.metrics,
-            "equity": _backtest_equity_records(result.equity, payload.initial_capital),
-            "trades": _records(result.trades),
-            "trade_markers": _chart_trade_markers(result.equity, result.trades),
-            "annual_returns": _annual_returns(result.equity),
-            "selected_stocks": selected_stocks,
-            "universe_size": len(symbols),
-            "custom_symbols": symbols if payload.universe == "custom" else [],
-            "notes": result.notes,
-            "risk_summary": result.risk_summary or {},
-            "strategy_config": _spec_summary(spec),
-            "data_mode": run.data_mode,
-            "universe": payload.universe,
-        }
+        return _clean(_backtest_result_payload(run, db))
     except HTTPException:
         run.status = "failed"
         run.error_message = "股票池与组合约束不匹配"
@@ -736,6 +780,89 @@ def _chart_trade_markers(equity: pd.DataFrame, trades: pd.DataFrame) -> List[Dic
             "reason": row["reason"],
         })
     return markers
+
+
+def _backtest_result_payload(run: BacktestRun, db: Session) -> Dict[str, Any]:
+    """一次回测的完整结果，全部从数据库读——刚跑完返回的和之后从回测历史里
+    调出来的是同一份内容（ADR-0047 第 3 条：每次回测结果都保存、可随时调出）。"""
+    config = run.config or {}
+    metrics = {m.name: m.value for m in db.scalars(select(BacktestMetric).where(BacktestMetric.backtest_run_id == run.id)).all()}
+    equity_rows = db.scalars(select(BacktestEquity).where(BacktestEquity.backtest_run_id == run.id).order_by(BacktestEquity.trade_date)).all()
+    equity = pd.DataFrame([{"trade_date": r.trade_date, "equity": r.equity, "benchmark": r.benchmark, "drawdown": r.drawdown} for r in equity_rows],
+                          columns=["trade_date", "equity", "benchmark", "drawdown"])
+    trade_rows = db.scalars(select(Trade).where(Trade.backtest_run_id == run.id).order_by(Trade.trade_date, Trade.id)).all()
+    trades = pd.DataFrame([{"trade_date": r.trade_date, "symbol": r.symbol, "side": r.side, "quantity": r.quantity, "price": r.price,
+                            "amount": r.amount, "fee": r.fee, "reason": r.reason} for r in trade_rows],
+                          columns=["trade_date", "symbol", "side", "quantity", "price", "amount", "fee", "reason"])
+    initial = float(run.initial_capital)
+    final_assets = float(metrics.get("final_assets", initial))
+    strategy = db.get(Strategy, run.strategy_id)
+    return {
+        "id": run.id,
+        "strategy_id": run.strategy_id,
+        "status": run.status,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+        "start_date": run.start_date.isoformat(),
+        "end_date": run.end_date.isoformat(),
+        "initial_capital": initial,
+        "final_assets": final_assets,
+        "total_profit": float(metrics.get("total_profit", final_assets - initial)),
+        "overall_return": float(metrics.get("overall_return", final_assets / initial - 1)),
+        "strategy_name": config.get("strategy_name") or (strategy.name if strategy else ""),
+        "metrics": metrics,
+        "equity": _backtest_equity_records(equity, initial),
+        "trades": _records(trades),
+        "trade_markers": _chart_trade_markers(equity, trades),
+        "annual_returns": _annual_returns(equity) if not equity.empty else [],
+        "selected_stocks": config.get("selected_stocks", []),
+        "universe_size": config.get("universe_size") or len(config.get("custom_symbols") or []),
+        "custom_symbols": config.get("custom_symbols") or [],
+        "notes": config.get("notes", []),
+        "risk_summary": config.get("risk_summary", {}),
+        "strategy_config": config.get("strategy_config", {}),
+        "data_mode": run.data_mode,
+        "universe": config.get("universe"),
+        "commission": config.get("commission"),
+        "slippage": config.get("slippage"),
+        "error_message": run.error_message,
+    }
+
+
+_HISTORY_METRICS = ("annual_return", "total_return", "max_drawdown", "sharpe", "benchmark_return", "excess_return", "trade_count")
+
+
+@router.get("/backtests")
+def list_backtests(strategy_id: Optional[int] = None, limit: int = 50, db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
+    """回测历史：某个策略（或全部策略）保存下来的每一次回测，新的在前。"""
+    query = select(BacktestRun).order_by(BacktestRun.id.desc()).limit(max(1, min(limit, 500)))
+    if strategy_id is not None:
+        query = query.where(BacktestRun.strategy_id == strategy_id)
+    runs = db.scalars(query).all()
+    names = {row.id: row.name for row in db.scalars(select(Strategy)).all()}
+    result = []
+    for run in runs:
+        metrics = {m.name: m.value for m in db.scalars(select(BacktestMetric).where(
+            BacktestMetric.backtest_run_id == run.id, BacktestMetric.name.in_(_HISTORY_METRICS))).all()}
+        config = run.config or {}
+        result.append({
+            "id": run.id, "strategy_id": run.strategy_id, "strategy_name": names.get(run.strategy_id, ""),
+            "status": run.status, "created_at": run.created_at.isoformat() if run.created_at else None,
+            "start_date": run.start_date.isoformat(), "end_date": run.end_date.isoformat(),
+            "initial_capital": run.initial_capital, "universe": config.get("universe"),
+            "universe_size": config.get("universe_size"), "data_mode": run.data_mode,
+            "seeded": bool(config.get("seeded")), "error_message": run.error_message, "metrics": metrics,
+        })
+    return result
+
+
+@router.get("/backtests/{run_id}/result")
+def get_backtest_result(run_id: int, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    run = db.get(BacktestRun, run_id)
+    if not run:
+        raise HTTPException(404, "回测不存在")
+    if run.status != "completed":
+        raise HTTPException(422, "这次回测没有完成：%s" % (run.error_message or run.status))
+    return _clean(_backtest_result_payload(run, db))
 
 
 @router.get("/backtests/{run_id}")

@@ -7,8 +7,8 @@ import { api } from '../api'
 const navigation = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard },
   { to: '/stocks', label: '股票池', icon: Search },
-  { to: '/strategy', label: '策略中心', icon: FlaskConical },
-  { to: '/backtest', label: '回测中心', icon: BarChart3 },
+  { to: '/strategy', label: '策略制定', icon: FlaskConical },
+  { to: '/backtest', label: '策略实践', icon: BarChart3 },
   { to: '/paper', label: '模拟盘', icon: BriefcaseBusiness },
   { to: '/trading', label: '自动交易', icon: Bot },
   { to: '/ai', label: 'AI 投研', icon: BrainCircuit },

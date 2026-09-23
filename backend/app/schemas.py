@@ -70,6 +70,15 @@ class StrategyPayload(BaseModel):
         return self
 
 
+class StrategySpecPayload(BaseModel):
+    """策略制定表单：名称、说明、回测时默认用的股票池，以及策略规格（app/pipeline/spec.py）。"""
+
+    name: str = Field(min_length=1, max_length=120)
+    description: str = ""
+    default_universe: str = "csi300"
+    spec: Dict[str, Any]
+
+
 class BacktestRequest(BaseModel):
     strategy_id: int = 1
     # 不传时用策略自己的默认股票池（模型策略是训练时的股票池）
