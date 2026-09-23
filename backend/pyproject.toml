@@ -21,6 +21,10 @@ dependencies = [
 
 [project.optional-dependencies]
 real-data = ["tushare==1.4.24", "akshare>=1.16"]
+# 系统内训练 LSTM/Transformer 用（ADR-0047 第 6 条）；不装也能运行平台，只是不能训练这两类模型。
+# GPU 版按显卡驱动从 PyTorch 官方源装，例如：
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+training = ["torch>=2.7"]
 dev = [
   "pytest>=8.3,<9",
   "pytest-cov>=6,<7",
