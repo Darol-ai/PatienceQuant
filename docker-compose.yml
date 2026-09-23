@@ -13,11 +13,9 @@ services:
       TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
       TUSHARE_HTTP_URL: ${TUSHARE_HTTP_URL:-https://tuaremax.top}
     volumes:
-      # 绑定宿主机目录而不是具名卷：沪深300/30支候选池策略依赖的真实
-      # parquet数据和训练好的模型文件(几百MB)不在git里，也不在Docker
-      # 镜像构建过程中生成——首次部署前需要在宿主机/训练环境跑
-      # backend/scripts下的对应脚本生成这些文件到 ./backend/data，再
-      # 启动容器；具体清单见 docs/部署-真实数据准备.md。
+      # 绑定宿主机目录而不是具名卷：沪深300/30支候选池策略依赖的
+      # parquet数据和训练好的模型文件经Git LFS随仓库分发在
+      # ./backend/data，容器直接使用；清单见 docs/部署-真实数据准备.md。
       - ./backend/data:/app/data
     ports:
       - "8000:8000"

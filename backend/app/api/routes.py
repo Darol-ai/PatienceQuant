@@ -1629,7 +1629,7 @@ async def generate_factor_from_report(
                 "trades": _records(backtest_result.trades.head(50)),
             }
         except FileNotFoundError:
-            backtest_error = "本地 A 阶段历史数据不存在，运行 scripts/fetch_a_phase_history.py 后再试"
+            backtest_error = "本地 A 阶段历史数据不存在（data/a_phase_history.parquet），无法回测"
         except Exception as exc:
             backtest_error = str(exc)
 

@@ -25,15 +25,7 @@ docker compose up --build
 
 **这一步不需要任何前置准备就能起来**：沪深300策略集、30支候选池策略依赖的真实历史数据和训练好的模型文件通过 Git LFS 跟仓库一起分发（`git clone` 会自动带上，需要本机装了 git-lfs），万一这批文件因为某种原因缺失，这几个策略会被自动跳过注册，服务照常启动，通用股票目录（实时连 tushare）、AI 投研、Dashboard 等其它功能都正常可用（ADR-0046）。
 
-**想要这几个真实策略可用，跑一条命令**（详细说明见 [`docs/部署-真实数据准备.md`](docs/部署-真实数据准备.md)）：
-
-```bash
-cd backend
-pip install -e '.[real-data]'          # 装tushare，如果make setup没装过
-bash scripts/prepare_real_data.sh      # 抓真实行情 + 训练模型，几十分钟到数小时不等
-```
-
-跑完之后正常重启服务（或者 `docker compose up`——数据目录绑定的是宿主机 `backend/data/`，不需要 `docker cp`）即可让这几个策略生效；生成一次之后长期有效，不用每次部署都重跑。
+**实时行情需要 tushare token**：在 `backend/.env` 里填 `TUSHARE_TOKEN`（参照 `.env.example`），详见 [`docs/部署-真实数据准备.md`](docs/部署-真实数据准备.md)。此前用于重新生成数据和模型的离线脚本已停用（ADR-0047），改由系统内的本地行情库和训练功能承担，这两部分正在开发中。
 
 默认 `DATA_MODE=real`：通用股票目录运行时直接连tushare查询全市场真实代码/名称/行业（`backend/app/data/tushare_provider.py`），不需要预生成任何文件；tushare 连不上时自动回退到本地 50 支真实公司的离线数据（Demo Provider），页面会标记"通用目录 · DEMO MODE"，这个标记只描述这个兜底状态，不影响沪深300策略集和30支候选池策略——它们走独立的真实数据管道，不受这个开关影响。如果想强制离线：
 
