@@ -29,9 +29,6 @@ class StrategyConfig:
     target_volatility: float = .22
     max_drawdown_budget: float = .15
     drawdown_brake_exposure: float = .50
-    model_enabled: bool = True
-    model_buy_threshold: float = .60
-    model_down_threshold: float = .25
 
 
 @dataclass
@@ -58,6 +55,10 @@ class DailyRiskResult:
 
 
 class BaseStrategy:
+    def prepare(self, symbols: List[str], start: date, end: date) -> None:
+        """回测/模拟盘开始前调用一次，让策略一次性取好 [start, end] 需要的数据。默认不做事。"""
+        return None
+
     def generate_weights(self, as_of: date, symbols: List[str]) -> StrategyResult:
         raise NotImplementedError
 

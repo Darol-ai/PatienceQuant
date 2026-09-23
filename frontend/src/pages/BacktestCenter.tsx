@@ -122,7 +122,7 @@ export function BacktestCenter() {
         : {
             ...current,
             strategy_id: defaultStrategy.id,
-            universe: defaultStrategy.universe || current.universe,
+            universe: defaultStrategy.default_universe || defaultStrategy.universe || current.universe,
             rebalance_frequency: defaultStrategy.rebalance_frequency || current.rebalance_frequency,
             holdings_count: Math.max(10, defaultStrategy.holdings_count || current.holdings_count),
             max_weight: defaultStrategy.max_weight || current.max_weight,
@@ -374,6 +374,7 @@ export function BacktestCenter() {
                     setForm(current => ({
                       ...current,
                       strategy_id: nextId,
+                      universe: next?.default_universe || next?.universe || current.universe,
                       // 每个策略支持的回测区间不一样(比如LightGBM策略只有
                       // 2019-2025年的滚动训练模型)，切换策略时把日期范围
                       // 同步过去，避免用着上一个策略的区间跑出422报错。
@@ -777,18 +778,13 @@ export function BacktestCenter() {
             />
             {paperMessage && <div className="export-message">{paperMessage}</div>}
             <div className="risk-summary-grid">
-              <div><span>现金缓冲</span><b>{formatPercent(result.strategy_config?.cash_buffer || 0)}</b></div>
-              <div><span>风险关闭暴露</span><b>{formatPercent(result.strategy_config?.risk_off_exposure || 0)}</b></div>
-              <div><span>换手忽略带</span><b>{formatPercent(result.strategy_config?.turnover_band || 0)}</b></div>
-              <div><span>保护性止损</span><b>{formatPercent(result.strategy_config?.stop_loss || 0)}</b></div>
-              <div><span>目标年化波动率</span><b>{formatPercent(result.strategy_config?.target_volatility || 0)}</b></div>
-              <div><span>最大回撤预算</span><b>{formatPercent(result.strategy_config?.max_drawdown_budget || 0)}</b></div>
-              <div><span>回撤刹车暴露</span><b>{formatPercent(result.strategy_config?.drawdown_brake_exposure || 0)}</b></div>
-              <div><span>趋势闸门</span><b>{result.strategy_config?.trend_filter ? '沪深300 50/200日均线' : '关闭'}</b></div>
-              <div><span>风险闸门调仓</span><b>{Number(result.risk_summary?.risk_gate_rebalances || 0)} 次</b></div>
-              <div><span>回撤刹车调仓</span><b>{Number(result.risk_summary?.drawdown_brake_rebalances || 0)} 次</b></div>
-              <div><span>波动率缩放调仓</span><b>{Number(result.risk_summary?.volatility_scaled_rebalances || 0)} 次</b></div>
-              <div><span>平均股票暴露</span><b>{formatPercent(result.risk_summary?.average_target_exposure || 0)}</b></div>
+              <div><span>打分方式</span><b>{result.strategy_config?.scorer === 'model' ? `模型 · ${(result.strategy_config?.models || []).length} 个` : '因子权重'}</b></div>
+              <div><span>选股规则</span><b>{result.strategy_config?.top_pct ? `前 ${formatPercent(result.strategy_config.top_pct)}` : `前 ${result.strategy_config?.holdings_count ?? '—'} 名`}</b></div>
+              <div><span>权重方案</span><b>{result.strategy_config?.weighting === 'score' ? '按分数加权' : '等权'} · 单股上限 {formatPercent(result.strategy_config?.max_weight ?? 1)}</b></div>
+              <div><span>择时信号</span><b>{result.strategy_config?.trend_filter ? `沪深300 50/200日均线 · 最低 ${formatPercent(result.strategy_config?.risk_off_exposure ?? 1)}` : '不择时（满仓）'}</b></div>
+              <div><span>换手阈值</span><b>{formatPercent(result.strategy_config?.turnover_band || 0)}</b></div>
+              <div><span>择时降仓调仓</span><b>{Number(result.risk_summary?.risk_gate_rebalances || 0)} 次</b></div>
+              <div><span>平均股票仓位</span><b>{formatPercent(result.risk_summary?.average_target_exposure || 0)}</b></div>
               <div><span>数据模式</span><b>{dataModeLabel(result.data_mode)}</b></div>
             </div>
           </Card>

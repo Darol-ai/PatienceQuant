@@ -33,9 +33,6 @@ class StrategyPayload(BaseModel):
     target_volatility: float = Field(.22, ge=0, le=1)
     max_drawdown_budget: float = Field(.15, ge=0, le=.95)
     drawdown_brake_exposure: float = Field(.50, gt=0, le=1)
-    model_enabled: bool = True
-    model_buy_threshold: float = Field(.60, ge=0, le=1)
-    model_down_threshold: float = Field(.25, ge=0, le=1)
 
     @field_validator("weights")
     @classmethod
@@ -75,7 +72,8 @@ class StrategyPayload(BaseModel):
 
 class BacktestRequest(BaseModel):
     strategy_id: int = 1
-    universe: str = "a_share"
+    # 不传时用策略自己的默认股票池（模型策略是训练时的股票池）
+    universe: Optional[str] = None
     custom_symbols: List[str] = Field(default_factory=list)
     start_date: date = date(2018, 1, 1)
     end_date: date = date(2025, 12, 31)
@@ -85,15 +83,14 @@ class BacktestRequest(BaseModel):
     max_weight: Optional[float] = Field(None, gt=0, le=1)
     commission: float = Field(.001, ge=0, le=.05)
     slippage: float = Field(.0005, ge=0, le=.05)
-    model_enabled: bool = True
-    model_buy_threshold: float = Field(.60, ge=0, le=1)
-    model_down_threshold: float = Field(.25, ge=0, le=1)
 
     @field_validator("universe")
     @classmethod
-    def valid_universe(cls, value: str) -> str:
-        if value not in {"a_share", "large_cap", "hs300", "csi_a500", "all_assets", "custom"} and not value.startswith("custom:"):
-            raise ValueError("股票池仅支持 a_share/large_cap/hs300/csi_a500/all_assets/custom")
+    def valid_universe(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        if value not in {"a_share", "large_cap", "hs300", "csi_a500", "all_assets", "custom", "csi300", "broad30"} and not value.startswith("custom:"):
+            raise ValueError("股票池仅支持 a_share/large_cap/hs300/csi_a500/all_assets/csi300/broad30/custom")
         return value
 
 

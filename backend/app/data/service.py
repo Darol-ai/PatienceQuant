@@ -28,8 +28,12 @@ def get_real_provider() -> TushareDataProvider:
 
 
 class MarketDataService:
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, real_market_data: bool = False):
+        """real_market_data=True：不管 DATA_MODE 怎么设，行情和指数都读本地行情库。
+        模型选股策略用它——模型是在真实行情上训练的，拿 demo 模拟价格去
+        打分和成交没有意义。"""
         self.db = db
+        self.real_market_data = real_market_data
         self.demo = get_demo_provider()
         self.real = get_real_provider()
         # real模式下、重试3次后仍拿不到真实价格的symbol(ADR-0045：不能
@@ -42,8 +46,13 @@ class MarketDataService:
     def provider(self):
         return self.real if get_settings().data_mode.lower() == "real" else self.demo
 
+    def _real_market(self) -> bool:
+        return self.real_market_data or get_settings().data_mode.lower() == "real"
+
     @property
     def mode(self) -> str:
+        if self.real_market_data:
+            return "real"
         if self.provider is self.demo:
             return "demo"
         return "real" if self.real.catalog_cached else "real_or_demo_fallback"
@@ -362,7 +371,7 @@ class MarketDataService:
         self.last_price_fetch_failures = []
         if not symbols:
             return pd.DataFrame()
-        if get_settings().data_mode.lower() != "real":
+        if not self._real_market():
             return self.demo.fetch_prices(symbols, start, end)
         code_by_symbol = {symbol: _to_ts_code(symbol) for symbol in symbols}
         symbol_by_code = {code: symbol for symbol, code in code_by_symbol.items()}
@@ -409,7 +418,7 @@ class MarketDataService:
 
     def benchmark(self, start: date, end: date) -> pd.DataFrame:
         """沪深300指数。real 模式只读本地行情库，没有就返回空表，不拿 demo 曲线顶替。"""
-        if get_settings().data_mode.lower() != "real":
+        if not self._real_market():
             return self.provider.fetch_benchmark(start, end)
         frame = get_market_store().load_index(BENCHMARK_INDEX, start, end)
         if frame.empty:

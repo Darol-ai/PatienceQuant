@@ -109,6 +109,9 @@ class Strategy(Base):
     max_drawdown_budget: Mapped[float] = mapped_column(Float, default=.15)
     drawdown_brake_exposure: Mapped[float] = mapped_column(Float, default=.50)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 策略规格（app/pipeline/spec.py 的 StrategySpec，ADR-0047/0048）：打分、择时、
+    # 选股、权重、调仓。回测和模拟盘只按它执行；上面那些旧字段只给旧表单用。
+    spec: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

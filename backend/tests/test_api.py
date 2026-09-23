@@ -165,11 +165,14 @@ def test_backtest_exposes_risk_controls_and_all_stock_chart_bundle():
         result = response.json()
         assert result["risk_summary"]["average_target_exposure"] <= 1
         assert result["strategy_config"]["turnover_band"] >= 0
-        assert 0 < result["strategy_config"]["target_volatility"] <= 1
-        assert 0 < result["strategy_config"]["max_drawdown_budget"] <= 1
-        assert 0 < result["strategy_config"]["drawdown_brake_exposure"] <= 1
-        assert "drawdown_brake_rebalances" in result["risk_summary"]
-        assert "volatility_scaled_rebalances" in result["risk_summary"]
+        # 回测按策略规格执行（ADR-0048）：择时插槽是指数趋势，引擎层的
+        # 止损/目标波动率/回撤刹车叠加层已经去掉，不再出现在配置里
+        spec = result["strategy_config"]["spec"]
+        assert spec["timing"]["type"] == "index_trend"
+        assert spec["selection"] == {"type": "top_n", "n": 10, "pct": None}
+        assert "target_volatility" not in result["strategy_config"]
+        assert result["risk_summary"]["drawdown_brake_rebalances"] == 0
+        assert result["risk_summary"]["volatility_scaled_rebalances"] == 0
         bundle = client.get(f"/api/backtests/{result['id']}/stocks/charts")
         assert bundle.status_code == 200
         items = bundle.json()["items"]
@@ -340,7 +343,8 @@ def test_quant_v3_backtest_stock_charts_use_the_parquet_data_pipeline():
         assert run_response.status_code == 200
         run_id = run_response.json()["id"]
         a_selected_symbol = run_response.json()["selected_stocks"][0]["symbol"]
-        assert a_selected_symbol.endswith((".SH", ".SZ"))
+        # 行情统一读本地行情库，全平台都用不带后缀的代码（ADR-0048）
+        assert a_selected_symbol.isdigit() and len(a_selected_symbol) == 6
 
         chart = client.get(f"/api/backtests/{run_id}/stocks/{a_selected_symbol}/chart")
         assert chart.status_code == 200
@@ -411,10 +415,9 @@ def test_quant_v3_strategy_drives_paper_trading_rebalance():
         # 单，不能让这种情况又被"如果有持仓才检查"的写法悄悄放过去。
         assert result["orders"], "调仓当天必须真的下单，不能悄悄跑出空结果"
         assert result["execution_scope"]["symbols"]
-        # 我们的股票是"600519.SH"这种带交易所后缀的格式，不是SQLite通用
-        # 目录里的裸代码——确认真的用了我们自己的股票池，不是误落回默认
-        # 策略的large_cap通用池。
-        assert all(symbol.endswith((".SH", ".SZ")) for symbol in result["execution_scope"]["symbols"])
+        # 确认真的用了策略自己的 30 支候选池，不是误落回默认策略的 large_cap 通用池
+        assert result["execution_scope"]["universe"] == "broad30"
+        assert len(result["execution_scope"]["symbols"]) == 30
 
         snapshot = client.get("/api/paper/account")
         assert snapshot.status_code == 200
@@ -503,12 +506,14 @@ def test_csi300_research_universe_endpoint_shows_real_data_not_demo():
         data = response.json()
         assert data["total"] == 300
         assert len(data["items"]) == 300
-        ranks = [item["lightgbm_rank"] for item in data["items"]]
-        assert sorted(ranks) == list(range(1, 301)), "全部300支都应该有真实排名，不能有编造/缺失"
+        ranks = [item["lightgbm_rank"] for item in data["items"] if item["lightgbm_rank"] is not None]
+        # 停牌到最新交易日的股票当天没有行情、不打分（也买不了），其余名次连续
+        assert len(ranks) >= 290
+        assert sorted(ranks) == list(range(1, len(ranks) + 1))
         for item in data["items"]:
-            assert item["symbol"].endswith((".SH", ".SZ"))
             assert item["name"]
-            assert item["latest_price"] and item["latest_price"] > 0
+            if item["lightgbm_rank"] is not None:
+                assert item["latest_price"] and item["latest_price"] > 0
 
 
 def test_csi300_strategy_drives_paper_trading_rebalance():
@@ -524,7 +529,7 @@ def test_csi300_strategy_drives_paper_trading_rebalance():
         assert response.status_code == 200
         result = response.json()
         assert result["orders"], "调仓当天必须真的下单，不能悄悄跑出空结果"
-        assert all(symbol.endswith((".SH", ".SZ")) for symbol in result["execution_scope"]["symbols"])
+        assert result["execution_scope"]["universe"] == "csi300"
         assert len(result["execution_scope"]["symbols"]) == 300
 
         snapshot = client.get("/api/paper/account")
@@ -541,7 +546,7 @@ def test_csi300_strategy_drives_paper_trading_rebalance():
         dashboard_data = dashboard.json()
         assert dashboard_data["signals"], "绑定了真实策略后信号列表不能是空的"
         for signal in dashboard_data["signals"]:
-            assert signal["symbol"].endswith((".SH", ".SZ"))
+            assert signal["symbol"] in result["execution_scope"]["symbols"]
             assert signal["name"] != signal["symbol"], "必须查到真实股票名字，不能退化成显示代码本身"
 
         client.post("/api/paper/reset", json={"initial_capital": 1_000_000})

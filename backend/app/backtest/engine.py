@@ -9,8 +9,6 @@ import pandas as pd
 
 from app.data.service import MarketDataService
 from app.strategies.base import BaseStrategy, StrategyConfig
-from app.strategies.multifactor import MultiFactorStrategy
-from app.factors.engine import FactorEngine
 
 
 @dataclass
@@ -177,14 +175,13 @@ class BacktestEngine:
         allow_network: bool = False,
         strategy: Optional[BaseStrategy] = None,
     ) -> BacktestResult:
+        """strategy 必须给出（app/pipeline 构造的流水线策略）；strategy_config
+        只提供④调仓相关的参数（换手阈值等）。"""
+        if strategy is None:
+            raise ValueError("回测需要传入策略对象")
         catalog = self.data.stocks()
         symbols = symbols or catalog.symbol.tolist()
-        factor_prices = self.data.prices(
-            symbols,
-            date(2018, 1, 1),
-            config.end_date,
-            allow_network=allow_network,
-        )
+        factor_prices = self.data.prices(symbols, config.start_date, config.end_date)
         prices = factor_prices[
             (factor_prices.trade_date >= config.start_date) & (factor_prices.trade_date <= config.end_date)
         ].copy()
@@ -194,15 +191,7 @@ class BacktestEngine:
         wide = prices.pivot_table(index="trade_date", columns="symbol", values="adj_close", aggfunc="last").ffill().dropna(how="all")
         dates = wide.index
         rebalance_dates = self._rebalance_dates(dates, config.rebalance_frequency)
-        if strategy is None:
-            # 默认路径：和改动前完全一样，构造内置的通用多因子策略。
-            factor_engine = FactorEngine(self.data)
-            factor_engine.prime(
-                factor_prices,
-                self.data.fundamentals(symbols, config.end_date),
-                self.data.benchmark(date(2018, 1, 1), config.end_date),
-            )
-            strategy = MultiFactorStrategy(factor_engine, strategy_config)
+        strategy.prepare(symbols, config.start_date, config.end_date)
         prices_by_date = wide.ffill()
         cash = config.initial_capital
         quantities: Dict[str, int] = {symbol: 0 for symbol in symbols}
@@ -336,7 +325,8 @@ class BacktestEngine:
                 stop_out_symbols = set()
                 for symbol, weight in target.items():
                     mark_price = float(price_row.get(symbol, 0) or 0)
-                    if mark_price <= 0:
+                    # 还没上市/当天没有行情的股票价格是 NaN（`or 0` 挡不住 NaN）
+                    if not np.isfinite(mark_price) or mark_price <= 0:
                         continue
                     current_qty = quantities.get(symbol, 0)
                     current_weight = current_qty * mark_price / current_value

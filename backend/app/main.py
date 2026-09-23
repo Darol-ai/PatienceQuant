@@ -30,14 +30,13 @@ def _sync_real_catalog_in_background() -> None:
 
 
 def _warm_csi300_signal_sources() -> None:
-    """沪深300策略第一次被用到时，要从磁盘读35个LightGBM+35个XGBoost
-    模型文件、并各自建一份90万行历史的按symbol索引——实测冷启动要
-    5分多钟。这个成本只在进程生命周期内付一次(之后靠lru_cache命中)，
-    但不能让"刚好第一个点这个策略的用户"承担这5分钟——服务启动时就在
-    后台预热，而不是等第一次真实请求才触发。"""
+    """模型库里的旧模型（每个 8 年 × 5 个种子）第一次用到时要从磁盘加载，
+    进程内只加载一次；服务启动时在后台先加载好，不让第一个用户等。"""
     try:
-        from app.quant_v3.csi300_strategies import build_csi300_ensemble_strategy
-        build_csi300_ensemble_strategy()  # 这一句同时把LightGBM+XGBoost两个信号源都建好并缓存
+        from app.pipeline.model_library import MODEL_LIBRARY, load_folds
+
+        for model_id in MODEL_LIBRARY:
+            load_folds(model_id)
     except Exception:
         # 预热失败不能让整个服务起不来——退化成"第一个真实请求慢"，
         # 而不是服务直接挂掉。

@@ -8,7 +8,8 @@ import pytest
 from app.backtest.engine import BacktestEngine
 from app.data.akshare_provider import AKShareDataProvider
 from app.data.demo import STOCK_SPECS, DemoDataProvider
-from app.strategies.multifactor import MultiFactorStrategy
+from app.pipeline.portfolio import weigh
+from app.pipeline.spec import WeightingSpec
 
 
 def test_demo_catalog_has_five_groups_and_broad_coverage():
@@ -31,7 +32,8 @@ def test_demo_generation_is_reproducible():
 
 
 def test_capped_weights_sum_to_one_and_respect_cap():
-    weights = MultiFactorStrategy.capped_weights({"A": .4, "B": .3, "C": .2, "D": .1}, .3)
+    scores = pd.Series({"A": 40.0, "B": 30.0, "C": 20.0, "D": 10.0})
+    weights = weigh(scores, scores, WeightingSpec(type="score", max_weight=.3))
     assert abs(sum(weights.values()) - 1) < 1e-8
     assert max(weights.values()) <= .3 + 1e-8
 

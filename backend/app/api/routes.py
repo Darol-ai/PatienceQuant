@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import time
+from functools import lru_cache
 from datetime import date, datetime
 from io import StringIO
 from typing import Any, Dict, List, Optional
@@ -24,22 +25,16 @@ from app.backtest.engine import BacktestConfig, BacktestEngine
 from app.config import get_settings
 from app.data.market_refresh import market_status, start_refresh
 from app.data.service import MarketDataService
-from app.quant_v3.a_phase_data_service import APhaseDataService
-from app.quant_v3.broad_universe import BROAD_STOCKS
-from app.quant_v3.csi300_strategies import ACTIVE_CSI300_STRATEGIES, BUILDERS as CSI300_STRATEGY_BUILDERS, TOP_K_RATIO as CSI300_TOP_K_RATIO
-from app.quant_v3.csi300_strategies import build_csi300_lightgbm_strategy, csi300_history, validate_csi300_date_range
-from app.quant_v3.csi300_strategies import latest_csi300_trading_day_on_or_before
-from app.quant_v3.csi300_universe import csi300_stocks
-from app.quant_v3.final_strategy import build_final_strategy, final_strategy_history, latest_trading_day_on_or_before, validate_backtest_date_range
-from app.quant_v3.real_benchmark import csi300_return
 from app.quant_v3.research_notes import quant_v3_research_universe
 from app.db.models import AIExplanation, BacktestEquity, BacktestMetric, BacktestRun, DailyAccount, Order, Portfolio, Position, ResearchAnnotation, ResearchGroup, Stock, Strategy, StrategyFactor, Trade, Watchlist
 from app.db.session import get_db
-from app.factors.engine import FactorEngine
 from app.portfolio.service import PaperTradingService
 from app.schemas import AIDecisionRequest, AISettingsRequest, ApplyBacktestPaperRequest, BacktestRequest, ExplainRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyAssistRequest, StrategyPayload
-from app.strategies.base import StrategyConfig
-from app.strategies.multifactor import MultiFactorStrategy
+from app.db.seed import DEFAULT_WEIGHTS
+from app.pipeline.library import FIXED_UNIVERSES, VALIDATED_KINDS, build_strategy, spec_from_legacy_row, data_service_for, default_universe, is_model_strategy, latest_market_day, strategy_spec, validate_date_range
+from app.pipeline.spec import StrategySpec
+from app.pipeline.strategy import build_pipeline_strategy
+from app.strategies.base import StrategyConfig, StrategyResult
 
 
 router = APIRouter()
@@ -115,12 +110,9 @@ def _latest_selection(ranking: pd.DataFrame, limit: int) -> List[Dict[str, Any]]
 
 def _default_multifactor_strategy(db: Session) -> Optional[Strategy]:
     """展示型端点(/api/stocks、/api/research/coverage、/api/signals、
-    /api/analytics/universe、Dashboard的analytics兜底)要的是"随便一个
-    可以用MultiFactorStrategy打分展示的策略"——`Strategy.is_default`
-    这个标记现在可能落在训练好的模型策略上(比如csi300_ensemble，见
-    set_default_strategy)，那类策略没有"因子权重"这个概念，
-    weights/holdings_count这些字段就算有值也是没意义的占位——直接拿去
-    喂MultiFactorStrategy会算出一堆无意义的"评分"，不是真的因子打分。
+    /api/analytics/universe、Dashboard的analytics兜底)要的是一个因子权重
+    策略——`Strategy.is_default` 可能落在模型选股策略上(比如csi300_ensemble，
+    见set_default_strategy)，那类策略没有"因子"可以展示。
     这里优先找同时是is_default又是multifactor的，找不到就退到随便一个
     multifactor策略——不能因为平台默认换成了训练好的模型，这些通用
     展示页面就跟着悄悄坏掉。"""
@@ -130,28 +122,80 @@ def _default_multifactor_strategy(db: Session) -> Optional[Strategy]:
     return db.scalar(select(Strategy).where(Strategy.kind == "multifactor").order_by(Strategy.created_at.desc()).limit(1))
 
 
-def _strategy_config(strategy: Strategy, request: Optional[BacktestRequest] = None) -> StrategyConfig:
+def _factor_ranking(db: Session, data: MarketDataService, symbols: List[str], as_of: date) -> "StrategyResult":
+    """展示型端点用默认因子权重策略给一批股票打分排名。"""
+    row = _default_multifactor_strategy(db)
+    spec = strategy_spec(row) if row else StrategySpec.model_validate(
+        {"scorer": {"type": "factor_weights", "weights": dict(DEFAULT_WEIGHTS)}, "selection": {"type": "top_n", "n": 10}})
+    strategy = build_pipeline_strategy(spec, data)
+    strategy.prepare(symbols, as_of, as_of)
+    return strategy.generate_weights(as_of, symbols)
+
+
+def _spec_for_run(strategy: Strategy, request: BacktestRequest) -> StrategySpec:
+    """这次回测实际执行的规格。回测表单上的持仓数量/单股上限/调仓频率
+    （旧表单遗留）只覆盖这一次，不改策略本身。"""
+    spec = strategy_spec(strategy).model_copy(deep=True)
+    if request.holdings_count and spec.selection.type == "top_n":
+        spec.selection.n = request.holdings_count
+    if request.max_weight:
+        spec.weighting.max_weight = request.max_weight
+    if request.rebalance_frequency:
+        spec.rebalance.frequency = request.rebalance_frequency
+    return spec
+
+
+def _engine_config(spec: StrategySpec, universe_size: int) -> StrategyConfig:
+    """回测引擎只负责④调仓：换手阈值 + 按手取整。引擎里旧的止损/目标波动率/
+    回撤刹车叠加层不属于流水线（ADR-0048），全部关闭。"""
+    holdings = spec.selection.n if spec.selection.type == "top_n" else max(1, round(universe_size * spec.selection.pct))
     return StrategyConfig(
-        name=strategy.name,
-        weights=strategy.weights,
-        holdings_count=request.holdings_count if request and request.holdings_count else strategy.holdings_count,
-        max_weight=request.max_weight if request and request.max_weight else strategy.max_weight,
-        rebalance_frequency=request.rebalance_frequency if request and request.rebalance_frequency else strategy.rebalance_frequency,
-        cash_buffer=float(strategy.cash_buffer if strategy.cash_buffer is not None else .02),
-        trend_filter=bool(strategy.trend_filter if strategy.trend_filter is not None else True),
-        risk_off_exposure=float(strategy.risk_off_exposure if strategy.risk_off_exposure is not None else .75),
-        turnover_band=float(strategy.turnover_band if strategy.turnover_band is not None else .03),
-        stop_loss=float(strategy.stop_loss if strategy.stop_loss is not None else .18),
-        benchmark_enhancement=bool(strategy.benchmark_enhancement if strategy.benchmark_enhancement is not None else True),
-        dip_buy_strength=float(strategy.dip_buy_strength if strategy.dip_buy_strength is not None else .06),
-        profit_take_strength=float(strategy.profit_take_strength if strategy.profit_take_strength is not None else .05),
-        target_volatility=float(strategy.target_volatility if strategy.target_volatility is not None else .22),
-        max_drawdown_budget=float(strategy.max_drawdown_budget if strategy.max_drawdown_budget is not None else .15),
-        drawdown_brake_exposure=float(strategy.drawdown_brake_exposure if strategy.drawdown_brake_exposure is not None else .50),
-        model_enabled=bool(request.model_enabled if request else True),
-        model_buy_threshold=float(request.model_buy_threshold if request else .60),
-        model_down_threshold=float(request.model_down_threshold if request else .25),
+        holdings_count=holdings, max_weight=spec.weighting.max_weight,
+        rebalance_frequency=spec.rebalance.frequency, turnover_band=spec.rebalance.turnover_band,
+        cash_buffer=0, trend_filter=spec.timing.type != "none", stop_loss=0,
+        target_volatility=0, max_drawdown_budget=0, drawdown_brake_exposure=1.0,
+        benchmark_enhancement=False, dip_buy_strength=0, profit_take_strength=0,
     )
+
+
+def _spec_summary(spec: StrategySpec) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "spec": spec.model_dump(mode="json"),
+        "scorer": spec.scorer.type,
+        "rebalance_frequency": spec.rebalance.frequency,
+        "turnover_band": spec.rebalance.turnover_band,
+        "max_weight": spec.weighting.max_weight,
+        "weighting": spec.weighting.type,
+        "trend_filter": spec.timing.type == "index_trend",
+        "risk_off_exposure": getattr(spec.timing, "risk_off_exposure", 1.0),
+    }
+    if spec.scorer.type == "factor_weights":
+        summary["weights"] = spec.scorer.weights
+    else:
+        summary["models"] = spec.scorer.models
+    if spec.selection.type == "top_n":
+        summary["holdings_count"] = spec.selection.n
+    else:
+        summary["top_pct"] = spec.selection.pct
+    return summary
+
+
+def _strategy_symbols(data: MarketDataService, strategy: Strategy) -> List[str]:
+    """模拟盘/看板用的股票池：策略自己记的默认股票池。"""
+    universe = default_universe(strategy)
+    if universe in FIXED_UNIVERSES:
+        return FIXED_UNIVERSES[universe][1]()
+    return _universe_symbols(data, universe)
+
+
+def _backtest_symbols(data: MarketDataService, payload: BacktestRequest) -> List[str]:
+    if payload.universe in FIXED_UNIVERSES:
+        return FIXED_UNIVERSES[payload.universe][1]()
+    if payload.universe == "custom":
+        catalog_sync = data.ensure_symbols(payload.custom_symbols)
+        if catalog_sync.get("missing"):
+            raise HTTPException(422, "以下股票代码无法从本地目录或真实数据源解析: %s" % ", ".join(catalog_sync["missing"]))
+    return _universe_symbols(data, payload.universe, payload.custom_symbols)
 
 
 def _universe_symbols(data: MarketDataService, universe: str, custom_symbols: Optional[List[str]] = None) -> List[str]:
@@ -215,7 +259,8 @@ def universes(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
         {"id": "hs300", "name": "沪深300（目录代理）", "count": min(300, len(a_share)), "description": "通用目录里排在前面的300只股票，仅作代理；沪深300策略实际使用的是独立的真实成分股名单"},
         {"id": "csi_a500", "name": "中证A500（目录代理）", "count": min(500, len(a_share)), "description": "通用目录里排在前面的500只股票，仅作代理"},
         {"id": "all_assets", "name": "A股全部", "count": len(catalog), "description": "统一 Data Adapter 下的全部可研究资产"},
-    ] + [{"id": "custom:%s" % row.id, "name": row.name, "count": len(row.symbols), "description": "自定义研究股票池"} for row in watchlists]
+    ] + [{"id": key, "name": name, "count": len(symbols_fn()), "description": description}
+         for key, (name, symbols_fn, description) in FIXED_UNIVERSES.items()] + [{"id": "custom:%s" % row.id, "name": row.name, "count": len(row.symbols), "description": "自定义研究股票池"} for row in watchlists]
 
 
 @router.get("/research/quant-v3-universe")
@@ -239,33 +284,36 @@ def quant_v3_research_coverage() -> Dict[str, Any]:
 
 
 @router.get("/research/csi300-universe")
-def csi300_research_universe() -> Dict[str, Any]:
+def csi300_research_universe(db: Session = Depends(get_db)) -> Dict[str, Any]:
     """对齐主流做法后universe换成沪深300全部300支真实成分股——这个端点
     直接返回真实的股票名字/最新真实收盘价/LightGBM策略最近一次真实打分
     排名，不是脚手架自带的Demo通用目录也不是编出来的研究文案。300支
     没法像30支候选池那样每支手写研究依据，这里给的是可验证的真实数据
     （价格、模型分数），不用编内容凑数。
     """
-    history = csi300_history()
-    stocks = csi300_stocks()
-    latest_day = pd.to_datetime(history["date"]).max().date()
-    latest_prices = (
-        history[pd.to_datetime(history["date"]).dt.date == latest_day]
-        .set_index("symbol")["close"]
-        .to_dict()
-    )
-    ranking = build_csi300_lightgbm_strategy().generate_weights(latest_day, [s["symbol"] for s in stocks]).ranking
-    score_by_symbol = ranking.set_index("symbol")["score"].to_dict() if not ranking.empty else {}
-    rank_by_symbol = ranking.set_index("symbol")["rank"].to_dict() if not ranking.empty else {}
+    data = MarketDataService(db, real_market_data=True)
+    symbols = FIXED_UNIVERSES["csi300"][1]()
+    latest_day = latest_market_day(date.today())
+    spec = StrategySpec.model_validate({"scorer": {"type": "model", "models": ["legacy/csi300_lightgbm"]},
+                                        "selection": {"type": "top_pct", "pct": 0.1}})
+    pipeline = build_pipeline_strategy(spec, data)
+    pipeline.prepare(symbols, latest_day, latest_day)
+    ranking = pipeline.generate_weights(latest_day, symbols).ranking
+    prices = data.prices(symbols, latest_day, latest_day)
+    latest_prices = prices.set_index("symbol")["close"].to_dict() if not prices.empty else {}
+    scored = ranking.dropna(subset=["score"]).set_index("symbol")
+    score_by_symbol = scored["score"].to_dict()
+    rank_by_symbol = scored["rank"].astype(int).to_dict()
+    names = _fixed_universe_names()
     items = [
         {
-            "symbol": stock["symbol"],
-            "name": stock["name"],
-            "latest_price": latest_prices.get(stock["symbol"]),
-            "lightgbm_score": score_by_symbol.get(stock["symbol"]),
-            "lightgbm_rank": rank_by_symbol.get(stock["symbol"]),
+            "symbol": symbol,
+            "name": names.get(symbol, symbol),
+            "latest_price": latest_prices.get(symbol),
+            "lightgbm_score": score_by_symbol.get(symbol),
+            "lightgbm_rank": rank_by_symbol.get(symbol),
         }
-        for stock in stocks
+        for symbol in symbols
     ]
     items.sort(key=lambda row: (row["lightgbm_rank"] is None, row["lightgbm_rank"] or 0))
     return {
@@ -282,11 +330,8 @@ def research_coverage(db: Session = Depends(get_db)) -> Dict[str, Any]:
     """Return the user's clearly annotated, cross-market low-frequency research list."""
     data = MarketDataService(db)
     catalog = data.stocks()
-    strategy_row = _default_multifactor_strategy(db)
     ranking_symbols = data.analysis_symbols(catalog.symbol.tolist())
-    ranking = MultiFactorStrategy(FactorEngine(data), _strategy_config(strategy_row)).generate_weights(
-        get_settings().demo_as_of, ranking_symbols
-    ).ranking
+    ranking = _factor_ranking(db, data, ranking_symbols, get_settings().demo_as_of).ranking
     annotations = db.scalars(select(ResearchAnnotation).order_by(ResearchAnnotation.id)).all()
     annotation_by_symbol = {item.symbol: item for item in annotations}
     rows = ranking[ranking.symbol.isin(annotation_by_symbol)].copy()
@@ -386,12 +431,7 @@ def search_stocks(
 def stocks(search: str = "", group: str = "", industry: str = "", exchange: str = "", universe: str = "all_assets", signal: str = "", sort: str = "score", order: str = "desc", db: Session = Depends(get_db)) -> Dict[str, Any]:
     data = MarketDataService(db)
     catalog = data.stocks()
-    strategy_row = _default_multifactor_strategy(db)
-    strategy = MultiFactorStrategy(FactorEngine(data), _strategy_config(strategy_row))
-    ranking = strategy.generate_weights(
-        get_settings().demo_as_of,
-        data.analysis_symbols(catalog.symbol.tolist()),
-    ).ranking
+    ranking = _factor_ranking(db, data, data.analysis_symbols(catalog.symbol.tolist()), get_settings().demo_as_of).ranking
     held = {position.symbol for position in db.scalars(select(Position).where(Position.portfolio_id == db.scalar(select(Portfolio.id).limit(1)))).all()}
     ranking["action"] = ranking.apply(lambda row: "HOLD" if row.symbol in held and row.target_weight > 0 else ("SELL" if row.symbol in held else row.action), axis=1)
     frame = ranking
@@ -419,14 +459,10 @@ def stock_detail(symbol: str, range: str = "all", interval: str = "monthly", db:
     catalog = data.stocks()
     if symbol not in set(catalog.symbol):
         raise HTTPException(404, "股票不存在")
-    strategy = _default_multifactor_strategy(db)
     ranking_symbols = data.analysis_symbols(catalog.symbol.tolist())
     if symbol not in ranking_symbols:
         ranking_symbols.append(symbol)
-    result = MultiFactorStrategy(FactorEngine(data), _strategy_config(strategy)).generate_weights(
-        get_settings().demo_as_of,
-        ranking_symbols,
-    )
+    result = _factor_ranking(db, data, ranking_symbols, get_settings().demo_as_of)
     row = result.ranking[result.ranking.symbol == symbol].iloc[0].to_dict()
     end_date = get_settings().demo_as_of
     range_years = {"1y": 1, "3y": 3, "5y": 5}
@@ -473,11 +509,10 @@ def list_strategies(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
                        "target_volatility": float(row.target_volatility if row.target_volatility is not None else .22),
                        "max_drawdown_budget": float(row.max_drawdown_budget if row.max_drawdown_budget is not None else .15),
                        "drawdown_brake_exposure": float(row.drawdown_brake_exposure if row.drawdown_brake_exposure is not None else .50),
-                       "model_enabled": bool(getattr(row, "model_enabled", True)),
-                       "model_buy_threshold": float(getattr(row, "model_buy_threshold", .60)),
-                       "model_down_threshold": float(getattr(row, "model_down_threshold", .25)),
                        "is_default": row.is_default, "created_at": row.created_at.isoformat(),
-                       "validated": row.kind in ACTIVE_CSI300_STRATEGIES,
+                       "validated": row.kind in VALIDATED_KINDS,
+                       "spec": strategy_spec(row).model_dump(mode="json"),
+                       "default_universe": default_universe(row),
                        "study_period": {"start": latest.start_date.isoformat(), "end": latest.end_date.isoformat()} if latest else {"start": research_start.isoformat(), "end": research_end.isoformat()},
                        "backtest_run_id": latest.id if latest else None, "backtest_metrics": metrics})
     return result
@@ -511,6 +546,8 @@ def create_strategy(payload: StrategyPayload, db: Session = Depends(get_db)) -> 
         drawdown_brake_exposure=payload.drawdown_brake_exposure,
         is_default=True,
     )
+    strategy.kind = "multifactor"
+    strategy.spec = spec_from_legacy_row(strategy).model_dump(mode="json")
     db.add(strategy)
     db.commit()
     db.refresh(strategy)
@@ -531,7 +568,9 @@ def update_strategy(strategy_id: int, payload: StrategyPayload, db: Session = De
         # 管理，不通过这个通用编辑端点改。
         raise HTTPException(422, f"策略类型「{strategy.kind}」的参数由代码固定管理，不支持通过通用编辑接口修改")
     for field, value in payload.model_dump().items():
-        setattr(strategy, field, value)
+        if hasattr(strategy, field):
+            setattr(strategy, field, value)
+    strategy.spec = spec_from_legacy_row(strategy).model_dump(mode="json")
     db.commit()
     return {"id": strategy.id, "message": "策略已更新"}
 
@@ -560,123 +599,45 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
         raise HTTPException(404, "策略不存在")
     if payload.start_date >= payload.end_date:
         raise HTTPException(422, "结束日期必须晚于开始日期")
-    holdings_count = payload.holdings_count or strategy.holdings_count
-    max_weight = payload.max_weight or strategy.max_weight
-    if holdings_count * max_weight < 1:
-        raise HTTPException(422, "持仓数量与单股最大权重无法构建满仓组合")
+    if payload.universe is None:
+        payload.universe = default_universe(strategy)
+    spec = _spec_for_run(strategy, payload)
     run = BacktestRun(strategy_id=strategy.id, status="running", start_date=payload.start_date, end_date=payload.end_date, initial_capital=payload.initial_capital, config=payload.model_dump(mode="json"), data_mode=get_settings().data_mode)
     db.add(run)
     db.commit()
     db.refresh(run)
     try:
-        sc = _strategy_config(strategy, payload)
-        if strategy.kind == "quant_v3_regression":
-            # 自由探索阶段最终确定的LightGBM量化策略（docs/adr/0013~0037）：
-            # 固定30支跨行业候选池，走独立的parquet数据管道（不经过SQLite/
-            # MarketDataService），不接受universe/custom_symbols这类通用
-            # 股票池参数。sc.stop_loss/turnover_band/target_volatility/
-            # max_drawdown_budget 在seed.py里都已经置0（ADR-0037已证明
-            # 引擎级风控叠加层是净拖累，这里保持策略设计文档描述的行为）。
-            try:
-                validate_backtest_date_range(payload.start_date, payload.end_date)
-            except ValueError as exc:
-                raise HTTPException(422, str(exc)) from exc
-            history = final_strategy_history()
-            symbols = [stock["symbol"] for stock in BROAD_STOCKS]
-            sc.holdings_count = len(symbols)
-            result = BacktestEngine(APhaseDataService(history)).run(
-                BacktestConfig(
-                    start_date=payload.start_date,
-                    end_date=payload.end_date,
-                    initial_capital=payload.initial_capital,
-                    rebalance_frequency="monthly",
-                    holdings_count=len(symbols),
-                    max_weight=1.0,
-                    commission=payload.commission,
-                    slippage=payload.slippage,
-                ),
-                sc,
-                symbols,
-                strategy=build_final_strategy(),
-                allow_network=False,
-            )
-            run.data_mode = result.data_mode
-            # `result.metrics["benchmark_return"]` 是候选池自己的等权买入
-            # 持有对照（隔离"选股/择时"本身的增量），不是真实沪深300指数
-            # 点位——额外附上一条真实指数的收益率，回答"整体有没有跑赢
-            # 大盘"这个不同的问题。指数历史范围之外/查不到时诚实返回
-            # None，不编数字。
-            real_csi300 = csi300_return(payload.start_date, payload.end_date)
-            if real_csi300 is not None:
-                result.metrics["csi300_index_return"] = real_csi300
-                result.metrics["excess_return_vs_csi300_index"] = result.metrics["total_return"] - real_csi300
-        elif strategy.kind in CSI300_STRATEGY_BUILDERS:
-            # 对齐主流做法：universe换成沪深300全部300支真实成分股（不是
-            # 自选30支候选池），逐年回测验证过真实有效才纳入
-            # ACTIVE_CSI300_STRATEGIES（app/quant_v3/csi300_strategies.py）。
-            # 固定universe，不接受universe/custom_symbols这类通用参数。
-            try:
-                validate_csi300_date_range(payload.start_date, payload.end_date)
-            except ValueError as exc:
-                raise HTTPException(422, str(exc)) from exc
-            history = csi300_history()
-            symbols = [stock["symbol"] for stock in csi300_stocks()]
-            sc.holdings_count = round(len(symbols) * CSI300_TOP_K_RATIO)
-            result = BacktestEngine(APhaseDataService(history)).run(
-                BacktestConfig(
-                    start_date=payload.start_date,
-                    end_date=payload.end_date,
-                    initial_capital=payload.initial_capital,
-                    rebalance_frequency="monthly",
-                    holdings_count=sc.holdings_count,
-                    max_weight=1.0,
-                    commission=payload.commission,
-                    slippage=payload.slippage,
-                ),
-                sc,
-                symbols,
-                strategy=CSI300_STRATEGY_BUILDERS[strategy.kind](),
-                allow_network=False,
-            )
-            run.data_mode = result.data_mode
-            real_csi300 = csi300_return(payload.start_date, payload.end_date)
-            if real_csi300 is not None:
-                result.metrics["csi300_index_return"] = real_csi300
-                result.metrics["excess_return_vs_csi300_index"] = result.metrics["total_return"] - real_csi300
-        else:
-            market_data = MarketDataService(db)
-            run.data_mode = market_data.mode
-            if payload.universe == "custom":
-                catalog_sync = market_data.ensure_symbols(payload.custom_symbols)
-                if catalog_sync.get("missing"):
-                    raise HTTPException(
-                        422,
-                        "以下股票代码无法从本地目录或真实数据源解析: %s"
-                        % ", ".join(catalog_sync["missing"]),
-                    )
-            symbols = _universe_symbols(market_data, payload.universe, payload.custom_symbols)
-            if sc.holdings_count > len(symbols):
-                sc.holdings_count = len(symbols)
-            if sc.holdings_count * sc.max_weight < 1:
-                raise HTTPException(422, "当前股票池标的数量不足以满足单股最大权重限制，请增加股票或提高上限")
-            result = BacktestEngine(market_data).run(
-                BacktestConfig(
-                    start_date=payload.start_date,
-                    end_date=payload.end_date,
-                    initial_capital=payload.initial_capital,
-                    rebalance_frequency=sc.rebalance_frequency,
-                    holdings_count=sc.holdings_count,
-                    max_weight=sc.max_weight,
-                    commission=payload.commission,
-                    slippage=payload.slippage,
-                ),
-                sc,
-                symbols,
-                # A manually selected pool is an explicit user request for
-                # current tushare data. Named full-market universes remain
-                # offline-safe unless DATA_MODE=real is enabled.
-                allow_network=payload.universe == "custom",
-            )
+        market_data = data_service_for(db, strategy)
+        run.data_mode = market_data.mode
+        symbols = _backtest_symbols(market_data, payload)
+        try:
+            pipeline = build_pipeline_strategy(spec, market_data)
+            validate_date_range(pipeline, payload.start_date, payload.end_date)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        sc = _engine_config(spec, len(symbols))
+        result = BacktestEngine(market_data).run(
+            BacktestConfig(
+                start_date=payload.start_date,
+                end_date=payload.end_date,
+                initial_capital=payload.initial_capital,
+                rebalance_frequency=spec.rebalance.frequency,
+                holdings_count=sc.holdings_count,
+                max_weight=spec.weighting.max_weight,
+                commission=payload.commission,
+                slippage=payload.slippage,
+            ),
+            sc,
+            symbols,
+            strategy=pipeline,
+        )
+        if market_data.last_price_fetch_failures:
+            result.notes.insert(0, "本地行情库中缺少 %d 支股票在该区间的行情，已从回测中排除：%s"
+                                % (len(market_data.last_price_fetch_failures), "、".join(market_data.last_price_fetch_failures[:10])))
+        if result.data_mode == "real":
+            # real 模式下基准就是本地行情库里的沪深300指数
+            result.metrics["csi300_index_return"] = result.metrics["benchmark_return"]
+            result.metrics["excess_return_vs_csi300_index"] = result.metrics["excess_return"]
         run.data_mode = result.data_mode
         selected_stocks = _latest_selection(result.ranking, sc.holdings_count)
         run.config = {
@@ -684,22 +645,7 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
             "risk_controls_version": 5,
             "selected_stocks": selected_stocks,
             "risk_summary": result.risk_summary or {},
-            "strategy_config": {
-                "cash_buffer": sc.cash_buffer,
-                "trend_filter": sc.trend_filter,
-                "risk_off_exposure": sc.risk_off_exposure,
-                "turnover_band": sc.turnover_band,
-                "stop_loss": sc.stop_loss,
-                "benchmark_enhancement": sc.benchmark_enhancement,
-                "dip_buy_strength": sc.dip_buy_strength,
-                "profit_take_strength": sc.profit_take_strength,
-                "target_volatility": sc.target_volatility,
-                "max_drawdown_budget": sc.max_drawdown_budget,
-                "drawdown_brake_exposure": sc.drawdown_brake_exposure,
-                "model_enabled": sc.model_enabled,
-                "model_buy_threshold": sc.model_buy_threshold,
-                "model_down_threshold": sc.model_down_threshold,
-            },
+            "strategy_config": _spec_summary(spec),
         }
         db.add_all([BacktestMetric(backtest_run_id=run.id, name=name, value=value) for name, value in result.metrics.items()])
         for name, value in (result.risk_summary or {}).items():
@@ -730,26 +676,7 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
             "custom_symbols": symbols if payload.universe == "custom" else [],
             "notes": result.notes,
             "risk_summary": result.risk_summary or {},
-            "strategy_config": {
-                "weights": sc.weights,
-                "holdings_count": sc.holdings_count,
-                "max_weight": sc.max_weight,
-                "rebalance_frequency": sc.rebalance_frequency,
-                "cash_buffer": sc.cash_buffer,
-                "trend_filter": sc.trend_filter,
-                       "risk_off_exposure": sc.risk_off_exposure,
-                       "turnover_band": sc.turnover_band,
-                       "stop_loss": sc.stop_loss,
-                       "benchmark_enhancement": sc.benchmark_enhancement,
-                       "dip_buy_strength": sc.dip_buy_strength,
-                       "profit_take_strength": sc.profit_take_strength,
-                       "target_volatility": sc.target_volatility,
-                       "max_drawdown_budget": sc.max_drawdown_budget,
-                       "drawdown_brake_exposure": sc.drawdown_brake_exposure,
-                       "model_enabled": sc.model_enabled,
-                       "model_buy_threshold": sc.model_buy_threshold,
-                       "model_down_threshold": sc.model_down_threshold,
-            },
+            "strategy_config": _spec_summary(spec),
             "data_mode": run.data_mode,
             "universe": payload.universe,
         }
@@ -991,49 +918,44 @@ def get_backtest_stocks(run_id: int, db: Session = Depends(get_db)) -> List[Dict
     stored = (run.config or {}).get("selected_stocks", [])
     if stored:
         return stored
+    # 早期回测没存入选名单：按策略现在的规格在回测结束日重新打一次分
     strategy = db.get(Strategy, run.strategy_id)
-    data = MarketDataService(db)
-    universe = (run.config or {}).get("universe", "a_share")
-    symbols = _universe_symbols(data, universe, (run.config or {}).get("custom_symbols"))
-    config = _strategy_config(strategy)
-    config.holdings_count = int((run.config or {}).get("holdings_count") or strategy.holdings_count)
-    ranking = MultiFactorStrategy(FactorEngine(data), config).generate_weights(run.end_date, symbols).ranking
-    return _latest_selection(ranking.assign(signal_date=run.end_date), config.holdings_count)
+    data = data_service_for(db, strategy)
+    request = BacktestRequest.model_validate({**(run.config or {}), "strategy_id": strategy.id})
+    symbols = _backtest_symbols(data, request)
+    spec = _spec_for_run(strategy, request)
+    pipeline = build_pipeline_strategy(spec, data)
+    pipeline.prepare(symbols, run.end_date, run.end_date)
+    ranking = pipeline.generate_weights(run.end_date, symbols).ranking
+    return _latest_selection(ranking.assign(signal_date=run.end_date), _engine_config(spec, len(symbols)).holdings_count)
 
 
-def _quant_v3_stock_prices(symbol: str, start: date, end: date) -> pd.DataFrame:
-    """`APhaseDataService.prices()` strips the frame down to just
-    trade_date/symbol/adj_close for the backtest engine's own needs — the
-    per-stock chart also wants volume, so this reads the raw history frame
-    directly instead of going through that narrower interface.
-    """
-    history = final_strategy_history()
-    frame = history[history.symbol == symbol].copy()
-    frame["trade_date"] = pd.to_datetime(frame["date"]).dt.date
-    frame["adj_close"] = frame["close"]
-    return frame[(frame.trade_date >= start) & (frame.trade_date <= end)].sort_values("trade_date")
+@lru_cache(maxsize=1)
+def _fixed_universe_names() -> Dict[str, str]:
+    from app.quant_v3.broad_universe import BROAD_STOCKS
+    from app.quant_v3.csi300_universe import csi300_stocks
+
+    names = {}
+    for stock in [*BROAD_STOCKS, *csi300_stocks()]:
+        names[stock["symbol"].split(".")[0]] = stock["name"]
+    return names
 
 
-def _csi300_stock_prices(symbol: str, start: date, end: date) -> pd.DataFrame:
-    """沪深300 universe版本，和 `_quant_v3_stock_prices` 同样的理由——
-    读原始history保留volume列，不走 `APhaseDataService.prices()` 那个
-    为回测引擎砍掉了volume的窄接口。"""
-    history = csi300_history()
-    frame = history[history.symbol == symbol].copy()
-    frame["trade_date"] = pd.to_datetime(frame["date"]).dt.date
-    frame["adj_close"] = frame["close"]
-    return frame[(frame.trade_date >= start) & (frame.trade_date <= end)].sort_values("trade_date")
+def _stock_name(db: Session, symbol: str) -> Optional[str]:
+    """股票名称：先查通用目录，查不到再查固定股票池名单（demo 模式的目录只有 50 支）。
+    迁移前的模型策略回测记录里代码带 .SH/.SZ 后缀，这里一并兼容。"""
+    bare = symbol.split(".")[0]
+    stock = db.scalar(select(Stock).where(Stock.symbol == bare, Stock.active.is_(True)))
+    if stock:
+        return stock.name
+    try:
+        return _fixed_universe_names().get(bare)
+    except FileNotFoundError:
+        return None
 
 
-def _parquet_pipeline_lookup(kind: Optional[str]):
-    """返回(name_by_symbol, prices_fn)给走独立parquet数据管道的策略kind
-    （symbol带交易所后缀，和SQLite通用目录的裸代码天生不兼容）；通用
-    SQLite策略(含默认的multifactor)返回None，走原来的`Stock`表查询。"""
-    if kind == "quant_v3_regression":
-        return {stock["symbol"]: stock["name"] for stock in BROAD_STOCKS}, _quant_v3_stock_prices
-    if kind in CSI300_STRATEGY_BUILDERS:
-        return {stock["symbol"]: stock["name"] for stock in csi300_stocks()}, _csi300_stock_prices
-    return None
+def _backtest_chart_prices(data: MarketDataService, symbol: str, start: date, end: date) -> pd.DataFrame:
+    return data.prices([symbol.split(".")[0]], start, end)
 
 
 @router.get("/backtests/{run_id}/stocks/{symbol}/chart")
@@ -1042,26 +964,12 @@ def get_backtest_stock_chart(run_id: int, symbol: str, db: Session = Depends(get
     if not run:
         raise HTTPException(404, "回测不存在")
     strategy = db.get(Strategy, run.strategy_id)
-    parquet_lookup = _parquet_pipeline_lookup(strategy.kind if strategy else None)
-    if parquet_lookup is not None:
-        # 我们自己的策略走独立的parquet数据管道，symbol格式("600519.SH"
-        # 带交易所后缀)和SQLite通用目录("600519"裸代码)本来就对不上——
-        # 用通用`Stock`表查这些symbol必然查不到，是两套数据源天生不
-        # 兼容，不是这支股票真的不存在。
-        name_by_symbol, prices_fn = parquet_lookup
-        if symbol not in name_by_symbol:
-            raise HTTPException(404, "股票不存在")
-        prices = prices_fn(symbol, run.start_date, run.end_date)
-        price_data_mode = "real"
-        name = name_by_symbol[symbol]
-    else:
-        stock = db.scalar(select(Stock).where(Stock.symbol == symbol, Stock.active.is_(True)))
-        if not stock:
-            raise HTTPException(404, "股票不存在")
-        data = MarketDataService(db)
-        prices = data.prices([symbol], run.start_date, run.end_date, allow_network=True)
-        price_data_mode = data.frame_data_mode(prices)
-        name = stock.name
+    name = _stock_name(db, symbol)
+    if name is None:
+        raise HTTPException(404, "股票不存在")
+    data = data_service_for(db, strategy) if strategy else MarketDataService(db)
+    prices = _backtest_chart_prices(data, symbol, run.start_date, run.end_date)
+    price_data_mode = data.frame_data_mode(prices)
     if prices.empty:
         return {"symbol": symbol, "name": name, "prices": [], "trade_markers": [], "data_mode": price_data_mode}
     prices = prices.sort_values("trade_date")
@@ -1086,29 +994,17 @@ def get_backtest_stock_charts(run_id: int, db: Session = Depends(get_db)) -> Dic
     if not run:
         raise HTTPException(404, "回测不存在")
     strategy = db.get(Strategy, run.strategy_id)
-    parquet_lookup = _parquet_pipeline_lookup(strategy.kind if strategy else None)
-    is_parquet_pipeline = parquet_lookup is not None
     stored = (run.config or {}).get("selected_stocks", [])
     symbols = [str(item.get("symbol")) for item in stored if item.get("symbol")]
     if not symbols:
         symbols = [str(item.get("symbol")) for item in get_backtest_stocks(run_id, db) if item.get("symbol")]
-    data = MarketDataService(db)
-    name_by_symbol, prices_fn = parquet_lookup if parquet_lookup is not None else ({}, None)
+    data = data_service_for(db, strategy) if strategy else MarketDataService(db)
     result: List[Dict[str, Any]] = []
     for symbol in symbols[:100]:
-        if is_parquet_pipeline:
-            # 同一套symbol格式不兼容问题（600519.SH vs 通用目录的裸代码），
-            # 见上面单支股票接口的说明——这里也不能用`Stock`表查名字/价格。
-            name = name_by_symbol.get(symbol)
-            if name is None:
-                continue
-            prices = prices_fn(symbol, run.start_date, run.end_date)
-        else:
-            stock = db.scalar(select(Stock).where(Stock.symbol == symbol, Stock.active.is_(True)))
-            if not stock:
-                continue
-            name = stock.name
-            prices = data.prices([symbol], run.start_date, run.end_date, allow_network=True)
+        name = _stock_name(db, symbol)
+        if name is None:
+            continue
+        prices = _backtest_chart_prices(data, symbol, run.start_date, run.end_date)
         if prices.empty:
             result.append({
                 "symbol": symbol,
@@ -1148,7 +1044,7 @@ def get_backtest_stock_charts(run_id: int, db: Session = Depends(get_db)) -> Dic
             "end_date": run.end_date.isoformat(),
             "prices": _records(prices[["trade_date", "adj_close", "volume"]]),
             "trade_markers": markers,
-            "data_mode": "real" if is_parquet_pipeline else data.frame_data_mode(prices),
+            "data_mode": data.frame_data_mode(prices),
             "return": last_price / first_price - 1 if first_price else 0,
             "trade_count": len(markers),
         })
@@ -1193,7 +1089,7 @@ def apply_backtest_to_paper(
     config = run.config or {}
     universe = str(config.get("universe") or "large_cap")
     custom_symbols = list(dict.fromkeys(str(symbol).strip() for symbol in (config.get("custom_symbols") or []) if str(symbol).strip()))
-    data = MarketDataService(db)
+    data = data_service_for(db, source_strategy)
 
     watchlist = None
     if universe == "custom":
@@ -1214,32 +1110,28 @@ def apply_backtest_to_paper(
     else:
         strategy_universe = universe
 
-    source_config = _strategy_config(source_strategy)
+    saved_spec = (config.get("strategy_config") or {}).get("spec")
+    run_spec = (StrategySpec.model_validate(saved_spec) if saved_spec
+                else _spec_for_run(source_strategy, BacktestRequest.model_validate({**config, "strategy_id": source_strategy.id})))
     strategy_name = ("%s · 回测 #%s 模拟盘" % (source_strategy.name, run.id))[:120]
     paper_strategy = db.scalar(select(Strategy).where(Strategy.name == strategy_name).order_by(Strategy.id.desc()).limit(1))
     if paper_strategy is None:
         paper_strategy = Strategy(name=strategy_name)
         db.add(paper_strategy)
     paper_strategy.version = 1
-    paper_strategy.description = "从回测 #%s 应用；冻结候选池、Top N、风险控制与交易参数" % run.id
-    paper_strategy.weights = dict(source_config.weights)
-    paper_strategy.holdings_count = int(config.get("holdings_count") or source_config.holdings_count)
-    paper_strategy.max_weight = float(config.get("max_weight") or source_config.max_weight)
-    paper_strategy.rebalance_frequency = str(config.get("rebalance_frequency") or source_config.rebalance_frequency)
+    paper_strategy.kind = source_strategy.kind
+    paper_strategy.description = "从回测 #%s 应用；冻结股票池和这次回测实际执行的策略规格" % run.id
+    paper_strategy.spec = run_spec.model_dump(mode="json")
+    paper_strategy.weights = dict(getattr(run_spec.scorer, "weights", {}) or {})
+    paper_strategy.holdings_count = _engine_config(run_spec, len(custom_symbols) or 300).holdings_count
+    paper_strategy.max_weight = run_spec.weighting.max_weight
+    paper_strategy.rebalance_frequency = run_spec.rebalance.frequency
+    paper_strategy.turnover_band = run_spec.rebalance.turnover_band
+    paper_strategy.trend_filter = run_spec.timing.type != "none"
+    paper_strategy.risk_off_exposure = getattr(run_spec.timing, "risk_off_exposure", 1.0)
     paper_strategy.universe = strategy_universe
     paper_strategy.research_start_date = run.start_date
     paper_strategy.research_end_date = run.end_date
-    paper_strategy.cash_buffer = source_config.cash_buffer
-    paper_strategy.trend_filter = source_config.trend_filter
-    paper_strategy.risk_off_exposure = source_config.risk_off_exposure
-    paper_strategy.turnover_band = source_config.turnover_band
-    paper_strategy.stop_loss = source_config.stop_loss
-    paper_strategy.benchmark_enhancement = source_config.benchmark_enhancement
-    paper_strategy.dip_buy_strength = source_config.dip_buy_strength
-    paper_strategy.profit_take_strength = source_config.profit_take_strength
-    paper_strategy.target_volatility = source_config.target_volatility
-    paper_strategy.max_drawdown_budget = source_config.max_drawdown_budget
-    paper_strategy.drawdown_brake_exposure = source_config.drawdown_brake_exposure
     paper_strategy.is_default = False
     db.flush()
     if not db.scalar(select(StrategyFactor.id).where(StrategyFactor.strategy_id == paper_strategy.id).limit(1)):
@@ -1294,17 +1186,7 @@ def apply_backtest_to_paper(
                 "max_weight": paper_strategy.max_weight,
                 "rebalance_frequency": paper_strategy.rebalance_frequency,
                 "weights": paper_strategy.weights,
-                "cash_buffer": paper_strategy.cash_buffer,
-                "trend_filter": paper_strategy.trend_filter,
-                "risk_off_exposure": paper_strategy.risk_off_exposure,
-                "turnover_band": paper_strategy.turnover_band,
-                "stop_loss": paper_strategy.stop_loss,
-                "benchmark_enhancement": paper_strategy.benchmark_enhancement,
-                "dip_buy_strength": paper_strategy.dip_buy_strength,
-                "profit_take_strength": paper_strategy.profit_take_strength,
-                "target_volatility": paper_strategy.target_volatility,
-                "max_drawdown_budget": paper_strategy.max_drawdown_budget,
-                "drawdown_brake_exposure": paper_strategy.drawdown_brake_exposure,
+                "spec": paper_strategy.spec,
             },
             "watchlist": (
                 {"id": "custom:%s" % watchlist.id, "name": watchlist.name, "count": len(watchlist.symbols), "symbols": watchlist.symbols}
@@ -1430,7 +1312,7 @@ def paper_rebalance(payload: PaperRebalanceRequest, db: Session = Depends(get_db
     if not strategy:
         raise HTTPException(404, "策略不存在")
     try:
-        return _clean(PaperTradingService(db, MarketDataService(db)).rebalance(strategy, payload.as_of))
+        return _clean(PaperTradingService(db, data_service_for(db, strategy)).rebalance(strategy, payload.as_of))
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
@@ -1458,11 +1340,7 @@ def paper_automation_run(db: Session = Depends(get_db)) -> Dict[str, Any]:
 def signals(db: Session = Depends(get_db)) -> Dict[str, Any]:
     data = MarketDataService(db)
     catalog = data.stocks()
-    strategy = _default_multifactor_strategy(db)
-    ranking = MultiFactorStrategy(FactorEngine(data), _strategy_config(strategy)).generate_weights(
-        get_settings().demo_as_of,
-        data.analysis_symbols(catalog.symbol.tolist()),
-    ).ranking
+    ranking = _factor_ranking(db, data, data.analysis_symbols(catalog.symbol.tolist()), get_settings().demo_as_of).ranking
     return {"items": _records(ranking.head(30)), "as_of": get_settings().demo_as_of.isoformat(), "data_mode": data.mode}
 
 
@@ -1479,11 +1357,7 @@ def _analytics_from_ranking(ranking: pd.DataFrame, data_mode: str) -> Dict[str, 
 def universe_analytics(db: Session = Depends(get_db)) -> Dict[str, Any]:
     data = MarketDataService(db)
     catalog = data.stocks()
-    strategy = _default_multifactor_strategy(db)
-    ranking = MultiFactorStrategy(FactorEngine(data), _strategy_config(strategy)).generate_weights(
-        get_settings().demo_as_of,
-        data.analysis_symbols(catalog.symbol.tolist()),
-    ).ranking
+    ranking = _factor_ranking(db, data, data.analysis_symbols(catalog.symbol.tolist()), get_settings().demo_as_of).ranking
     return _analytics_from_ranking(ranking, data.mode)
 
 
@@ -1699,40 +1573,30 @@ def _dashboard_signals_and_analytics(db: Session, data: MarketDataService, accou
 
 def _compute_dashboard_signals_and_analytics(db: Session, data: MarketDataService, account_strategy: Optional[Strategy]) -> tuple:
     signals: List[Dict[str, Any]] = []
-    if account_strategy and (account_strategy.kind in CSI300_STRATEGY_BUILDERS or account_strategy.kind == "quant_v3_regression"):
-        if account_strategy.kind in CSI300_STRATEGY_BUILDERS:
-            as_of = latest_csi300_trading_day_on_or_before(date.today())
-            universe = csi300_stocks()
-            ranking = CSI300_STRATEGY_BUILDERS[account_strategy.kind]().generate_weights(as_of, [s["symbol"] for s in universe]).ranking
-        else:
-            as_of = latest_trading_day_on_or_before(date.today())
-            universe = BROAD_STOCKS
-            ranking = build_final_strategy().generate_weights(as_of, [s["symbol"] for s in universe]).ranking
-        # 我们自己策略的ranking只有symbol/score/target_weight这些，没有
-        # Demo通用多因子那套name/industry/return_12m/action字段——按我们
-        # 自己真实的股票元数据补上name，其余字段前端不需要就不硬凑一个
-        # 假的12M动量数字。
-        name_by_symbol = {s["symbol"]: s["name"] for s in universe}
-        total_ranked = len(ranking) or 1
-        top_ranking = ranking.sort_values("rank").head(8) if not ranking.empty else ranking
+    if account_strategy and is_model_strategy(account_strategy):
+        model_data = data_service_for(db, account_strategy)
+        as_of = latest_market_day(date.today())
+        symbols = _strategy_symbols(model_data, account_strategy)
+        pipeline = build_strategy(db, account_strategy, model_data)
+        pipeline.prepare(symbols, as_of, as_of)
+        ranking = pipeline.generate_weights(as_of, symbols).ranking
+        total_ranked = int(ranking["score"].notna().sum()) or 1
+        top_ranking = ranking.dropna(subset=["score"]).head(8)
         signals = [
             {
                 "symbol": row.symbol,
-                "name": name_by_symbol.get(row.symbol, row.symbol),
-                "industry": "沪深300" if account_strategy.kind in CSI300_STRATEGY_BUILDERS else "候选池",
-                # 模型原始预测分数是"未来90日收益率"这种量级很小的连续值
-                # (比如0.05)，直接当百分比宽度画进度条会看起来几乎是空的
-                # ——这里换算成"在真实排名中的百分位"用于展示条形长度，是
-                # 对真实排名的诚实换算，不是编一个假分数。
+                "name": _stock_name(db, row.symbol) or row.symbol,
+                "industry": FIXED_UNIVERSES.get(default_universe(account_strategy), ("模型选股",))[0],
+                # 模型原始分数是预测收益（量级很小，比如 0.05），画进度条时
+                # 换算成排名百分位，是对真实排名的换算，不是另编一个分数。
                 "score": round(100 * (1 - (row.rank - 1) / total_ranked), 1),
                 "return_12m": None,
                 "target_weight": float(row.target_weight),
-                "action": "BUY" if row.target_weight > 0 else "WATCH",
+                "action": row.action,
             }
             for row in top_ranking.itertuples()
         ]
-        analytics = None
-        return signals, analytics, []
+        return signals, None, []
     else:
         default_strategy_row = _default_multifactor_strategy(db)
         strategy_row = account_strategy or default_strategy_row
@@ -1743,9 +1607,10 @@ def _compute_dashboard_signals_and_analytics(db: Session, data: MarketDataServic
         # (/api/stocks、/api/research/coverage)一样，套上analysis_symbols
         # 的硬顶(30支)，回测本身(用户主动点"运行回测"、有进度反馈)的
         # universe口径不受影响。
-        strategy_result = MultiFactorStrategy(FactorEngine(data), _strategy_config(strategy_row)).generate_weights(
-            get_settings().demo_as_of, data.analysis_symbols(data.universe_symbols("large_cap"))
-        )
+        pipeline = build_strategy(db, strategy_row, data)
+        symbols = data.analysis_symbols(data.universe_symbols("large_cap"))
+        pipeline.prepare(symbols, get_settings().demo_as_of, get_settings().demo_as_of)
+        strategy_result = pipeline.generate_weights(get_settings().demo_as_of, symbols)
         signals = _records(strategy_result.ranking.head(8))
         # "系统状态"下面的行业分布/估值成长这些"analytics"面板，口径是
         # 平台默认策略(is_default)，跟上面"最新交易信号"的口径(账户实际

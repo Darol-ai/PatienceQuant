@@ -9,10 +9,9 @@ from app.backtest.engine import BacktestConfig, BacktestEngine
 from app.config import get_settings
 from app.data.service import MarketDataService
 from app.quant_v3.broad_universe import BROAD_STOCKS
-from app.quant_v3.csi300_strategies import ACTIVE_CSI300_STRATEGIES
+from app.pipeline.library import VALIDATED_KINDS
 from app.quant_v3.csi300_universe import csi300_stocks
 from app.db.models import BacktestEquity, BacktestMetric, BacktestRun, Portfolio, ResearchAnnotation, Strategy, StrategyFactor, Trade, Watchlist
-from app.strategies.base import StrategyConfig
 
 
 DEFAULT_WEIGHTS = {
@@ -126,6 +125,11 @@ def seed_database(db: Session) -> None:
         db.commit()
     _ensure_quant_v3_strategy(db)
     _ensure_csi300_strategies(db)
+    # 所有策略都按规格执行（ADR-0048）：给迁移前的策略补上规格
+    from app.pipeline.library import ensure_specs, migrate_paper_positions
+
+    ensure_specs(db)
+    migrate_paper_positions(db)
     # _ensure_demo_backtest对默认多因子策略的universe(large_cap)逐支调用
     # market_data.prices()——real模式下这会变成真的顺序调用tushare查
     # 2018-2025年8年日线，几十支股票可能要几分钟。这个默认多因子
@@ -141,7 +145,7 @@ def seed_database(db: Session) -> None:
 
 def _ensure_quant_v3_strategy(db: Session) -> None:
     """自由探索阶段最终确定的LightGBM量化策略（docs/adr/0013~0037），
-    走独立的parquet数据管道（见 app/quant_v3/final_strategy.py），不经过
+    按策略规格执行（app/pipeline，ADR-0048），不经过
     SQLite/MarketDataService通用股票目录。stop_loss/turnover_band/
     target_volatility/max_drawdown_budget 全部置0——ADR-0037已经证明
     BacktestEngine的引擎级风控叠加层对这个策略是净拖累，这里保持和策略
@@ -200,7 +204,7 @@ _CSI300_STRATEGY_LABELS = {
 def _ensure_csi300_strategies(db: Session) -> None:
     """对齐主流做法：universe换成沪深300全部真实成分股，3个逐年回测验证
     过真实有效的策略（docs/adr待补），走独立的parquet数据管道
-    （app/quant_v3/csi300_strategies.py），不经过SQLite/MarketDataService
+    （app/pipeline，ADR-0048），不经过SQLite/MarketDataService
     通用股票目录。同样不叠加引擎级风控叠加层（ADR-0037的结论延用）。
 
     `csi300_stocks()`要读`data/csi300_constituents.parquet`——这份文件
@@ -214,7 +218,7 @@ def _ensure_csi300_strategies(db: Session) -> None:
         holdings_count = max(1, round(len(csi300_stocks()) * 0.1))
     except FileNotFoundError:
         return
-    for kind in ACTIVE_CSI300_STRATEGIES:
+    for kind in VALIDATED_KINDS:
         if db.scalar(select(Strategy).where(Strategy.kind == kind).limit(1)):
             continue
         name, description = _CSI300_STRATEGY_LABELS[kind]
@@ -287,54 +291,30 @@ def _ensure_demo_backtest(db: Session, strategy: Strategy) -> None:
         .order_by(BacktestRun.id.desc())
         .limit(1)
     )
-    if latest and (latest.config or {}).get("risk_controls_version") == 5:
+    if latest and (latest.config or {}).get("risk_controls_version") == 6:
         return
     try:
-        config = StrategyConfig(
-            name=strategy.name,
-            weights=strategy.weights,
-            holdings_count=strategy.holdings_count,
-            max_weight=strategy.max_weight,
-            rebalance_frequency=strategy.rebalance_frequency,
-            cash_buffer=strategy.cash_buffer or .02,
-            trend_filter=True if strategy.trend_filter is None else strategy.trend_filter,
-            risk_off_exposure=strategy.risk_off_exposure or .75,
-            turnover_band=strategy.turnover_band or .03,
-            stop_loss=strategy.stop_loss or .18,
-            benchmark_enhancement=True if strategy.benchmark_enhancement is None else strategy.benchmark_enhancement,
-            dip_buy_strength=strategy.dip_buy_strength or .06,
-            profit_take_strength=strategy.profit_take_strength or .05,
-            target_volatility=strategy.target_volatility or .22,
-            max_drawdown_budget=strategy.max_drawdown_budget or .15,
-            drawdown_brake_exposure=strategy.drawdown_brake_exposure or .50,
-        )
+        from app.api.routes import _engine_config, _spec_summary
+        from app.pipeline.library import strategy_spec
+        from app.pipeline.strategy import build_pipeline_strategy
+
+        spec = strategy_spec(strategy)
         market_data = MarketDataService(db)
         symbols = market_data.universe_symbols(strategy.universe or "large_cap")
+        config = _engine_config(spec, len(symbols))
         result = BacktestEngine(market_data).run(
             BacktestConfig(start_date=date(2018, 1, 1), end_date=date(2025, 12, 31), initial_capital=1_000_000,
-                           rebalance_frequency=config.rebalance_frequency, holdings_count=config.holdings_count,
-                           max_weight=config.max_weight), config, symbols
+                           rebalance_frequency=spec.rebalance.frequency, holdings_count=config.holdings_count,
+                           max_weight=spec.weighting.max_weight), config, symbols,
+            strategy=build_pipeline_strategy(spec, market_data),
         )
         run = BacktestRun(strategy_id=strategy.id, status="completed", start_date=date(2018, 1, 1), end_date=date(2025, 12, 31),
                           initial_capital=1_000_000,
                           config={
                               "seeded": True,
-                              "risk_controls_version": 5,
+                              "risk_controls_version": 6,
                               "universe": strategy.universe or "large_cap",
-                              "holdings_count": strategy.holdings_count,
-                              "max_weight": strategy.max_weight,
-                              "rebalance_frequency": strategy.rebalance_frequency,
-                              "cash_buffer": config.cash_buffer,
-                              "trend_filter": config.trend_filter,
-                              "risk_off_exposure": config.risk_off_exposure,
-                              "turnover_band": config.turnover_band,
-                              "stop_loss": config.stop_loss,
-                              "benchmark_enhancement": config.benchmark_enhancement,
-                              "dip_buy_strength": config.dip_buy_strength,
-                              "profit_take_strength": config.profit_take_strength,
-                              "target_volatility": config.target_volatility,
-                              "max_drawdown_budget": config.max_drawdown_budget,
-                              "drawdown_brake_exposure": config.drawdown_brake_exposure,
+                              "strategy_config": _spec_summary(spec),
                               "risk_summary": result.risk_summary or {},
                           },
                           data_mode=result.data_mode)

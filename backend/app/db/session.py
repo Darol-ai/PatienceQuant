@@ -96,6 +96,7 @@ def migrate_lightweight_schema() -> None:
             "max_drawdown_budget": "ALTER TABLE strategies ADD COLUMN max_drawdown_budget FLOAT DEFAULT 0.15",
             "drawdown_brake_exposure": "ALTER TABLE strategies ADD COLUMN drawdown_brake_exposure FLOAT DEFAULT 0.50",
             "kind": "ALTER TABLE strategies ADD COLUMN kind VARCHAR(30) DEFAULT 'multifactor'",
+            "spec": "ALTER TABLE strategies ADD COLUMN spec JSON",
         }
         pending = [statement for name, statement in migrations.items() if name not in columns]
         if pending:

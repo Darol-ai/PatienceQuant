@@ -1,4 +1,4 @@
-from app.strategies.multifactor import MultiFactorStrategy
+from app.strategies.base import BaseStrategy, StrategyResult
 
-__all__ = ["MultiFactorStrategy"]
+__all__ = ["BaseStrategy", "StrategyResult"]
 
