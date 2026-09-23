@@ -176,6 +176,8 @@ class Portfolio(Base):
     # than the strategy's named universe.  Persist it so subsequent manual
     # and scheduled paper rebalances use the same selected symbols.
     execution_universe: Mapped[str] = mapped_column(String(50), default="csi300")
+    # 上次调仓时择时信号给的整体仓位（ADR-0052：择时每天生效，信号变了就在非调仓日也调整）
+    last_exposure: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     execution_symbols: Mapped[List[str]] = mapped_column(JSON, default=list)
     source_backtest_run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

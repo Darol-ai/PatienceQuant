@@ -33,6 +33,7 @@ def _run() -> None:
     try:
         report = store.backfill(on_progress=progress)
         store.refresh_index(BENCHMARK_INDEX)
+        store.refresh_index_members(BENCHMARK_INDEX)
         _state.update(
             filled_days=len(report.filled_days),
             empty_days=[d.isoformat() for d in report.empty_days],

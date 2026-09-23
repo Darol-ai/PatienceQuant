@@ -222,6 +222,12 @@ class BacktestEngine:
         drawdown_brake_rebalances = 0
         volatility_scaled_rebalances = 0
         realized_volatilities: List[float] = []
+        # 择时每天生效（ADR-0052）：记下最近一次调仓的择时前权重和当前在用的仓位
+        current_base: Optional[Dict[str, float]] = None
+        applied_exposure = 1.0
+        previous_day: Optional[date] = None
+        timing_adjustments = 0
+        exposure_days: List[float] = []
         benchmark_df = self.data.benchmark(config.start_date, config.end_date)
         benchmark_series = benchmark_df.set_index(pd.to_datetime(benchmark_df.trade_date)).adj_close.reindex(dates).ffill().bfill()
         initial_benchmark = float(benchmark_series.iloc[0]) if len(benchmark_series) else 1.0
@@ -264,6 +270,16 @@ class BacktestEngine:
                 }
                 notes.extend(result.data_quality_notes)
                 ranking_frames.append(result.ranking.assign(signal_date=signal_date))
+                current_base = result.base_weights
+                applied_exposure = result.target_exposure
+            elif current_base is not None and previous_day is not None:
+                # 非调仓日：前一天收盘的择时信号变了，就按"择时前权重 × 新仓位"调整，今天成交
+                daily = strategy.daily_exposure(previous_day)
+                if daily is not None and abs(daily[0] - applied_exposure) > 1e-9:
+                    target_by_execution[current_day] = {symbol: weight * daily[0] for symbol, weight in current_base.items()}
+                    execution_context[current_day] = {"regime": daily[1], "target_exposure": daily[0], "timing_only": True}
+                    applied_exposure = daily[0]
+                    timing_adjustments += 1
 
             if current_day in target_by_execution:
                 target = target_by_execution[current_day]
@@ -369,6 +385,7 @@ class BacktestEngine:
                     reason = (
                         "保护性止损 %.0f%% · %s" % (strategy_config.stop_loss * 100, regime)
                         if symbol in stop_out_symbols
+                        else "择时降仓至 %.0f%%" % (target_exposure * 100) if context.get("timing_only")
                         else "目标权重下降 · %s" % regime
                     )
                     trades.append({"trade_date": current_day, "symbol": symbol, "side": "SELL", "quantity": sell_qty, "price": price, "amount": amount, "fee": fee, "reason": reason})
@@ -401,12 +418,17 @@ class BacktestEngine:
                     if realized_vol > strategy_config.target_volatility > 0:
                         reason_suffix.append("波动率缩放")
                     reason_suffix_text = (" · " + " / ".join(reason_suffix)) if reason_suffix else ""
-                    trades.append({"trade_date": current_day, "symbol": symbol, "side": "BUY", "quantity": buy_qty, "price": price, "amount": amount, "fee": fee, "reason": "综合评分进入 Top %s · %s · 股票暴露 %.0f%%%s" % (strategy_config.holdings_count, regime, target_exposure * 100, reason_suffix_text)})
+                    buy_reason = ("择时加仓至 %.0f%%" % (target_exposure * 100) if context.get("timing_only")
+                                  else "分数进入前 %s · %s · 仓位 %.0f%%%s" % (strategy_config.holdings_count, regime, target_exposure * 100, reason_suffix_text))
+                    trades.append({"trade_date": current_day, "symbol": symbol, "side": "BUY", "quantity": buy_qty, "price": price, "amount": amount, "fee": fee, "reason": buy_reason})
                     strategy.notify_fill(symbol, "BUY", price, buy_qty, current_day)
                 # Always re-mark after the complete rebalance.  This matters
                 # when a rebalance only sells: fees and adverse slippage must
                 # reduce the compounded total assets as well.
                 portfolio_value = self._portfolio_value(cash, quantities, price_row)
+            previous_day = current_day
+            if current_base is not None:
+                exposure_days.append(applied_exposure)
             equity_values.append({"trade_date": current_day, "equity": portfolio_value, "benchmark": float(benchmark_series.loc[current_date] / initial_benchmark * config.initial_capital)})
             equity_history.append(float(portfolio_value))
             equity_peak = max(equity_peak, float(portfolio_value))
@@ -424,7 +446,8 @@ class BacktestEngine:
             data_mode=self.data.frame_data_mode(factor_prices),
             risk_summary={
                 "regime_counts": regime_counts,
-                "average_target_exposure": float(np.mean(target_exposures)) if target_exposures else 1.0,
+                # 按天平均的目标仓位（择时每天生效后，按调仓次数平均会失真）
+                "average_target_exposure": float(np.mean(exposure_days)) if exposure_days else (float(np.mean(target_exposures)) if target_exposures else 1.0),
                 "risk_gate_rebalances": int(sum(count for regime, count in regime_counts.items() if regime in {"risk_off", "caution"})),
                 "cash_buffer": strategy_config.cash_buffer,
                 "trend_filter": strategy_config.trend_filter,
@@ -435,5 +458,6 @@ class BacktestEngine:
                 "drawdown_brake_rebalances": drawdown_brake_rebalances,
                 "volatility_scaled_rebalances": volatility_scaled_rebalances,
                 "average_realized_volatility": float(np.mean(realized_volatilities)) if realized_volatilities else 0.0,
+                "timing_adjustments": timing_adjustments,
             },
         )

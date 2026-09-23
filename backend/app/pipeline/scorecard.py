@@ -30,9 +30,14 @@ CARD_METRICS = ("annual_return", "total_return", "max_drawdown", "sharpe", "vola
                 "benchmark_return", "excess_return", "avg_holding_days", "turnover", "trade_count")
 
 
+# 回测口径变化时加版本号，让旧成绩卡全部失效重算。
+# 2：沪深300 改用历史成分股、择时每天生效（ADR-0052）
+METHOD_VERSION = 2
+
+
 def card_key(row: Strategy) -> str:
     payload = {"spec": strategy_spec(row).model_dump(mode="json"), "universe": default_universe(row),
-               "standard": {k: str(v) for k, v in STANDARD.items()}}
+               "standard": {k: str(v) for k, v in STANDARD.items()}, "method": METHOD_VERSION}
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 
 

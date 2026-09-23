@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -39,6 +39,8 @@ class StrategyResult:
     data_quality_notes: List[str]
     market_regime: str = "unknown"
     target_exposure: float = 1.0
+    # 乘择时仓位之前的权重（ADR-0052：择时每天生效时，非调仓日按它 × 当天仓位重新缩放）
+    base_weights: Optional[Dict[str, float]] = None
 
 
 @dataclass
@@ -67,6 +69,11 @@ class BaseStrategy:
         判断和冷静期维护。默认策略没有逐日状态，不强制退出、不封锁任何股票。
         """
         return DailyRiskResult()
+
+    def daily_exposure(self, signal_date: date) -> Optional[Tuple[float, str]]:
+        """择时每天生效（ADR-0052）：返回 signal_date 收盘后择时信号给的整体仓位和状态；
+        没有择时的策略返回 None，非调仓日不做任何调整。"""
+        return None
 
     def notify_fill(self, symbol: str, side: str, price: float, quantity: int, trade_date: date) -> None:
         """引擎每次实际成交（买/卖，含强制退出）后回调一次，供策略更新自己的

@@ -231,6 +231,44 @@ class AShareMarketStore:
         data = pd.read_parquet(path)
         return data[(data["trade_date"] >= pd.Timestamp(start)) & (data["trade_date"] <= pd.Timestamp(end))].reset_index(drop=True)
 
+    # ---- 指数历史成分股（ADR-0052）----
+
+    def _members_path(self, index_code: str) -> Path:
+        return self.root / "index" / f"{index_code}_members.parquet"
+
+    def refresh_index_members(self, index_code: str, until: Optional[date] = None) -> int:
+        """历史成分股快照（tushare index_weight，每月一到两份）。按半年分批拉、只补缺的部分：
+        一次调用最多返回 7000 行，按整年拉时一年 24 份快照会超出，最早那份被截断（实测）。"""
+        until = until or self.latest_trading_day()
+        path = self._members_path(index_code)
+        existing = pd.read_parquet(path) if path.exists() else pd.DataFrame(columns=["con_code", "trade_date", "weight"])
+        begin = self.start if existing.empty else existing["trade_date"].max().date() + timedelta(days=1)
+        frames = []
+        while begin <= until:
+            end = min(date(begin.year, 6, 30) if begin.month <= 6 else date(begin.year, 12, 31), until)
+            part = self.runner(lambda pro, b=begin, e=end: pro.index_weight(index_code=index_code, start_date=_compact(b), end_date=_compact(e)))
+            if part is not None and not part.empty:
+                frames.append(part[["con_code", "trade_date", "weight"]])
+            begin = end + timedelta(days=1)
+        if not frames:
+            return 0
+        fetched = pd.concat(frames, ignore_index=True)
+        fetched["trade_date"] = pd.to_datetime(fetched["trade_date"], format="%Y%m%d")
+        merged = fetched if existing.empty else pd.concat([existing, fetched], ignore_index=True)
+        merged = merged.drop_duplicates(["con_code", "trade_date"], keep="last").sort_values(["trade_date", "con_code"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        merged.to_parquet(path, index=False, compression="zstd")
+        return len(fetched)
+
+    def load_index_members(self, index_code: str, full_size: int = 300) -> pd.DataFrame:
+        """只返回完整的快照（成员数达到指数规模），不完整的快照丢掉，不拿残缺名单当成分股。"""
+        path = self._members_path(index_code)
+        if not path.exists():
+            return pd.DataFrame(columns=["con_code", "trade_date", "weight"])
+        data = pd.read_parquet(path)
+        counts = data.groupby("trade_date")["con_code"].transform("nunique")
+        return data[counts >= full_size].reset_index(drop=True)
+
     # ---- 状态 ----
 
     def status(self, today: Optional[date] = None) -> dict:

@@ -6,8 +6,11 @@
 """
 from __future__ import annotations
 
+import bisect
+from dataclasses import dataclass
 from datetime import date
-from typing import Dict, List, Optional
+from functools import lru_cache
+from typing import Callable, Dict, List, Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -83,24 +86,24 @@ def ensure_specs(db: Session) -> int:
 
 _ENSEMBLE = {"type": "model", "models": ["legacy/csi300_lightgbm", "legacy/csi300_xgboost"]}
 _PLAYBOOK = "来源：QuantsPlaybook（hugo2046，经作者同意使用，见仓库 NOTICE）。"
-_WEEKLY_NOTE = "择时信号只在调仓日判断，研报是每天判断，所以这里每周调仓。"
+_WEEKLY_NOTE = "择时信号每天收盘判断、次日调整整体仓位（ADR-0052），选股每月更新。"
 
 BUILTIN_STRATEGIES: List[dict] = [
     {"kind": "pb_ens_rsrs", "name": "集成模型 + RSRS择时",
      "description": "沪深300集成模型选前10%等权，整体仓位由RSRS标准分择时决定（光大证券2017：18日最高价对最低价的斜率，"
                     "600日标准分高于0.7满仓、跌破−0.7空仓）。" + _WEEKLY_NOTE + _PLAYBOOK,
      "spec": {"scorer": _ENSEMBLE, "timing": {"type": "rsrs"}, "selection": {"type": "top_pct", "pct": 0.1},
-              "rebalance": {"frequency": "weekly"}}},
+              "rebalance": {"frequency": "monthly"}}},
     {"kind": "pb_ens_alligator", "name": "集成模型 + 鳄鱼线择时",
      "description": "沪深300集成模型选前10%等权，整体仓位由鳄鱼线组合择时决定（招商证券2024：鳄鱼线+AO+分形+MACD，"
                     "不含研报里的北向资金信号）。" + _WEEKLY_NOTE + _PLAYBOOK,
      "spec": {"scorer": _ENSEMBLE, "timing": {"type": "alligator"}, "selection": {"type": "top_pct", "pct": 0.1},
-              "rebalance": {"frequency": "weekly"}}},
+              "rebalance": {"frequency": "monthly"}}},
     {"kind": "pb_ens_icu_ma", "name": "集成模型 + ICU均线择时",
      "description": "沪深300集成模型选前10%等权，整体仓位由ICU均线择时决定（中泰证券2023：5日重复中位数稳健回归均线，"
                     "收盘价在均线之上满仓、之下空仓）。" + _WEEKLY_NOTE + _PLAYBOOK,
      "spec": {"scorer": _ENSEMBLE, "timing": {"type": "icu_ma"}, "selection": {"type": "top_pct", "pct": 0.1},
-              "rebalance": {"frequency": "weekly"}}},
+              "rebalance": {"frequency": "monthly"}}},
     {"kind": "pb_ubl", "name": "上下影线因子选股",
      "description": "按上下影线综合因子UBL从低到高选前30名等权，每月调仓（东吴证券2020：蜡烛上影线波动+威廉下影线均值；"
                     "研报先做市值中性化，市值数据还没接入，这里省略）。" + _PLAYBOOK,
@@ -118,8 +121,14 @@ _LEGACY_DESCRIPTIONS = {
     "csi300_xgboost": "沪深300成分股，用 XGBoost 旧模型（与 LightGBM 旧模型同一套特征和训练规则）打分，选前 10% 等权，每月调仓，不择时。",
     "csi300_ensemble": "沪深300成分股，LightGBM 和 XGBoost 两个旧模型的预测分数取平均，选前 10% 等权，每月调仓，不择时。",
     "quant_v3_regression": "30 支跨行业候选池，用 LightGBM 旧模型打分，选前 40% 等权，每月调仓，不择时。迁移时去掉了原来的动量兜底和流动性资格两层（见 ADR-0048）。",
-    "multifactor": "因子权重策略：基本面/估值/盈利质量/动量/风险五组因子按权重合成综合分，选前 10 名按分数加权（单股 ≤15%），沪深300 均线趋势择时，每月调仓。真实行情下只有动量、风险两组有真实数据。",
+    "multifactor": "因子权重策略：动量组（3/6/12 个月收益）和风险组（波动率、最大回撤、Beta，越低越好）按 2:1 合成综合分，"
+                   "选前 10 名按分数加权（单股 ≤15%），沪深300 均线趋势择时，每月调仓。由原\"沪深300增强趋势价值成长策略 V3\"改名："
+                   "它的基本面、估值、盈利质量三组因子没有真实财务数据、实际从未起作用，规格改成真实在用的样子（ADR-0052）。",
 }
+
+
+OLD_V3_NAME = "沪深300增强趋势价值成长策略 V3"
+NEW_V3_NAME = "动量低波动因子策略（沪深300）"
 
 
 def ensure_builtin_library(db: Session) -> None:
@@ -141,7 +150,21 @@ def ensure_builtin_library(db: Session) -> None:
         ))
     builtin_kinds = set(_MODEL_SPECS) | {item["kind"] for item in BUILTIN_STRATEGIES}
     rows = db.scalars(select(Strategy).order_by(Strategy.id)).all()
-    first_v3 = next((r for r in rows if r.kind == "multifactor" and r.name == "沪深300增强趋势价值成长策略 V3"), None)
+    first_v3 = (next((r for r in rows if r.kind == "multifactor" and r.origin == "builtin"), None)
+                or next((r for r in rows if r.kind == "multifactor" and r.name == OLD_V3_NAME), None))
+    if first_v3 is not None and first_v3.name == OLD_V3_NAME:
+        # ADR-0052：改成真实在用的规格和名字（真实模式下结果不变）
+        first_v3.name = NEW_V3_NAME
+        first_v3.weights = {"momentum": round(2 / 3, 4), "risk": round(1 / 3, 4)}
+        first_v3.spec = spec_from_legacy_row(first_v3).model_dump(mode="json")
+    # ADR-0052：择时改成每天生效后，带择时的内置策略回到每月调仓
+    for row in rows:
+        if row.kind in {item["kind"] for item in BUILTIN_STRATEGIES} and row.spec:
+            wanted = next(item for item in BUILTIN_STRATEGIES if item["kind"] == row.kind)
+            if row.spec.get("rebalance", {}).get("frequency") != wanted["spec"].get("rebalance", {}).get("frequency", "monthly"):
+                row.spec = StrategySpec.model_validate(wanted["spec"]).model_dump(mode="json")
+                row.rebalance_frequency = row.spec["rebalance"]["frequency"]
+                row.description = wanted["description"]
     for row in rows:
         row.universe = normalize_universe(row.universe)
         if row is first_v3:
@@ -195,9 +218,51 @@ def is_valid_universe(name: str) -> bool:
     return name in ("a_share", "custom") or name in FIXED_UNIVERSES or name.startswith("custom:")
 
 
+class IndexMembership:
+    """指数的历史成分股（ADR-0052）：某一天用"不晚于这一天的最近一份完整快照"。"""
+
+    def __init__(self, frame):
+        self.dates: List[date] = []
+        self.sets: List[set] = []
+        for day, group in frame.groupby("trade_date"):
+            self.dates.append(day.date())
+            self.sets.append({code.split(".")[0] for code in group["con_code"]})
+
+    def at(self, day: date) -> set:
+        # 快照从 2016-01-29 开始；更早的日子只能用第一份（最多早一个月），不外推
+        index = max(0, bisect.bisect_right(self.dates, day) - 1)
+        return self.sets[index]
+
+    def union(self, start: date, end: date) -> List[str]:
+        first = max(0, bisect.bisect_right(self.dates, start) - 1)
+        last = max(first, bisect.bisect_right(self.dates, end) - 1)
+        return sorted(set().union(*self.sets[first:last + 1]))
+
+    def latest(self) -> List[str]:
+        return sorted(self.sets[-1])
+
+
+@lru_cache(maxsize=1)
+def _csi300_membership_cached(mtime: float) -> Optional[IndexMembership]:
+    from app.data.market_refresh import get_market_store
+
+    frame = get_market_store().load_index_members("000300.SH")
+    return IndexMembership(frame) if not frame.empty else None
+
+
+def csi300_membership() -> Optional[IndexMembership]:
+    """行情库里没有历史成分股时返回 None（调用方退回最新名单并注明）。文件更新后自动重读。"""
+    from app.data.market_refresh import get_market_store
+
+    path = get_market_store()._members_path("000300.SH")
+    return _csi300_membership_cached(path.stat().st_mtime if path.exists() else 0.0)
+
+
 def csi300_symbols() -> List[str]:
-    """沪深300 成分股（离线准备时的最新名单，不是每个历史时点的名单——
-    回测早年会有幸存者偏差，这一点和迁移前一致）。"""
+    """沪深300 当前成分股（最近一份快照）；行情库没有历史成分股时退回离线准备的最新名单。"""
+    membership = csi300_membership()
+    if membership is not None:
+        return membership.latest()
     from app.quant_v3.csi300_universe import csi300_stocks
 
     return [stock["symbol"].split(".")[0] for stock in csi300_stocks()]
@@ -211,10 +276,29 @@ def broad30_symbols() -> List[str]:
 
 FIXED_UNIVERSES = {
     "csi300": ("沪深300成分股", csi300_symbols,
-               "沪深300 真实成分股名单（最新一期，早年回测有幸存者偏差）"),
+               "每个调仓日只用当时真实在指数里的成分股（历史成分股，2016 年起）"),
     "broad30": ("30支跨行业候选池", broad30_symbols,
-                "研究阶段手工挑选的 30 支跨行业股票"),
+                "研究阶段手工挑选的 30 支跨行业股票；名单是事后挑的，早年回测同样可能偏乐观"),
 }
+
+
+@dataclass
+class Pool:
+    """一次回测/调仓用的股票池：symbols 是整个区间可能用到的全部股票（用来取数据），
+    members_at 给出某一天真正可以入选的股票；None 表示名单不随时间变化。"""
+
+    symbols: List[str]
+    members_at: Optional[Callable[[date], set]] = None
+    note: Optional[str] = None
+
+
+def fixed_pool(name: str, start: date, end: date) -> Pool:
+    if name == "csi300":
+        membership = csi300_membership()
+        if membership is not None:
+            return Pool(membership.union(start, end), membership.at)
+        return Pool(csi300_symbols(), None, "本地行情库没有沪深300历史成分股，用的是最新名单，早年结果有幸存者偏差")
+    return Pool(FIXED_UNIVERSES[name][1]())
 
 
 def latest_market_day(today: date) -> date:

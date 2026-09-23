@@ -10,7 +10,7 @@ DEFAULT_WEIGHTS = {"fundamental": .12, "valuation": .12, "quality": .16, "moment
 
 
 class StrategyPayload(BaseModel):
-    name: str = "沪深300增强趋势价值成长策略 V3"
+    name: str = "我的因子策略"
     description: str = "以跑赢或贴近沪深300为目标，并用目标波动率与回撤预算控制组合暴露"
     weights: Dict[str, float] = Field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
     holdings_count: int = Field(10, ge=10, le=100)

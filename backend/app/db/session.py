@@ -58,6 +58,7 @@ def migrate_lightweight_schema() -> None:
             "execution_universe": "ALTER TABLE portfolio ADD COLUMN execution_universe VARCHAR(50) DEFAULT 'large_cap'",
             "execution_symbols": "ALTER TABLE portfolio ADD COLUMN execution_symbols JSON DEFAULT '[]'",
             "source_backtest_run_id": "ALTER TABLE portfolio ADD COLUMN source_backtest_run_id INTEGER",
+            "last_exposure": "ALTER TABLE portfolio ADD COLUMN last_exposure FLOAT",
         }
         pending = [statement for name, statement in migrations.items() if name not in columns]
         if pending:

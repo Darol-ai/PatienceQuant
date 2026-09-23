@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -21,6 +21,8 @@ class PipelineStrategy(BaseStrategy):
         self.spec = spec
         self.scorer = scorer
         self.timing = timing
+        # 股票池成员随时间变化时（如沪深300 历史成分股），给出某一天可以入选的股票；None 表示不变
+        self.members_at: Optional[Callable[[date], set]] = None
 
     def earliest_start(self) -> Optional[date]:
         return self.scorer.earliest_start()
@@ -33,10 +35,19 @@ class PipelineStrategy(BaseStrategy):
         self.timing.prepare(start, end)
 
     def generate_weights(self, as_of: date, symbols: List[str]) -> StrategyResult:
-        scored = self.scorer.score(as_of, symbols)
+        # 股票池成员随时间变化时只给当天的成员打分：因子分是池内百分位，混进非成员会改变排序；
+        # 不在指数里的股票没有分数、不能入选（已持有的会在这次调仓被卖出）
+        candidates = symbols
+        if self.members_at is not None:
+            members = self.members_at(as_of)
+            candidates = [symbol for symbol in symbols if symbol in members]
+        scored = self.scorer.score(as_of, candidates)
         scores = scored.scores.reindex(symbols)
-        selected = select(scores, self.spec.selection, len(symbols))
-        weights = weigh(selected, scores, self.spec.weighting)
+        if self.members_at is not None:
+            scores = scores.where(scores.index.isin(candidates))
+        selected = select(scores, self.spec.selection, len(candidates))
+        base_weights = weigh(selected, scores, self.spec.weighting)
+        weights = base_weights
         timing = self.timing.exposure(as_of)
         weights = {symbol: w * timing.exposure for symbol, w in weights.items()}
 
@@ -65,7 +76,14 @@ class PipelineStrategy(BaseStrategy):
             data_quality_notes=notes,
             market_regime=timing.label,
             target_exposure=timing.exposure,
+            base_weights=base_weights,
         )
+
+    def daily_exposure(self, signal_date: date):
+        if self.spec.timing.type == "none":
+            return None
+        timing = self.timing.exposure(signal_date)
+        return timing.exposure, timing.label
 
 
 def build_pipeline_strategy(spec: StrategySpec, data: MarketDataService) -> PipelineStrategy:

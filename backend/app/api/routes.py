@@ -28,7 +28,7 @@ from app.db.session import get_db
 from app.portfolio.service import PaperTradingService
 from app.schemas import AIDecisionRequest, AISettingsRequest, ApplyBacktestPaperRequest, BacktestRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyPayload, StrategySpecPayload, RecommendRequest, ScorecardRefreshRequest, AgentTurnRequest
 from app.db.seed import DEFAULT_WEIGHTS
-from app.pipeline.library import FIXED_UNIVERSES, normalize_universe, VALIDATED_KINDS, build_strategy, spec_from_legacy_row, data_service_for, default_universe, is_model_strategy, latest_market_day, strategy_spec, validate_date_range
+from app.pipeline.library import FIXED_UNIVERSES, Pool, fixed_pool, normalize_universe, VALIDATED_KINDS, build_strategy, spec_from_legacy_row, data_service_for, default_universe, is_model_strategy, latest_market_day, strategy_spec, validate_date_range
 from app.pipeline.model_library import MODEL_LIBRARY, model_years
 from app.pipeline.price_factors import PRICE_FACTORS
 from app.pipeline.scorers import FUNDAMENTAL_FACTOR_GROUPS
@@ -185,14 +185,15 @@ def _strategy_symbols(data: MarketDataService, strategy: Strategy) -> List[str]:
     return _universe_symbols(data, universe)
 
 
-def _backtest_symbols(data: MarketDataService, payload: BacktestRequest) -> List[str]:
+def _backtest_pool(data: MarketDataService, payload: BacktestRequest) -> Pool:
+    """这次回测的股票池。沪深300 按历史成分股逐日变化（ADR-0052），其余股票池名单固定。"""
     if payload.universe in FIXED_UNIVERSES:
-        return FIXED_UNIVERSES[payload.universe][1]()
+        return fixed_pool(payload.universe, payload.start_date, payload.end_date)
     if payload.universe == "custom":
         catalog_sync = data.ensure_symbols(payload.custom_symbols)
         if catalog_sync.get("missing"):
             raise HTTPException(422, "以下股票代码无法从本地目录或真实数据源解析: %s" % ", ".join(catalog_sync["missing"]))
-    return _universe_symbols(data, payload.universe, payload.custom_symbols)
+    return Pool(_universe_symbols(data, payload.universe, payload.custom_symbols))
 
 
 def _universe_symbols(data: MarketDataService, universe: str, custom_symbols: Optional[List[str]] = None) -> List[str]:
@@ -607,13 +608,16 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
     try:
         market_data = data_service_for(db, strategy)
         run.data_mode = market_data.mode
-        symbols = _backtest_symbols(market_data, payload)
+        pool = _backtest_pool(market_data, payload)
+        symbols = pool.symbols
+        universe_size = len(pool.members_at(payload.end_date)) if pool.members_at else len(symbols)
         try:
             pipeline = build_pipeline_strategy(spec, market_data)
+            pipeline.members_at = pool.members_at
             validate_date_range(pipeline, payload.start_date, payload.end_date)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
-        sc = _engine_config(spec, len(symbols))
+        sc = _engine_config(spec, universe_size)
         result = BacktestEngine(market_data).run(
             BacktestConfig(
                 start_date=payload.start_date,
@@ -629,6 +633,10 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
             symbols,
             strategy=pipeline,
         )
+        if pool.note:
+            result.notes.insert(0, pool.note)
+        if pool.members_at:
+            result.notes.insert(0, "股票池按历史成分股逐日变化：区间内先后有 %d 支股票在指数里，每次调仓只从当时的成分股里选" % len(symbols))
         if market_data.last_price_fetch_failures:
             result.notes.insert(0, "本地行情库中缺少 %d 支股票在该区间的行情，已从回测中排除：%s"
                                 % (len(market_data.last_price_fetch_failures), "、".join(market_data.last_price_fetch_failures[:10])))
@@ -645,7 +653,7 @@ def run_backtest(payload: BacktestRequest, db: Session = Depends(get_db)) -> Dic
             "risk_summary": result.risk_summary or {},
             "strategy_config": _spec_summary(spec),
             "notes": result.notes,
-            "universe_size": len(symbols),
+            "universe_size": universe_size,
             "strategy_name": strategy.name,
         }
         db.add_all([BacktestMetric(backtest_run_id=run.id, name=name, value=value) for name, value in result.metrics.items()])
@@ -996,9 +1004,11 @@ def get_backtest_stocks(run_id: int, db: Session = Depends(get_db)) -> List[Dict
     strategy = db.get(Strategy, run.strategy_id)
     data = data_service_for(db, strategy)
     request = BacktestRequest.model_validate({**(run.config or {}), "strategy_id": strategy.id})
-    symbols = _backtest_symbols(data, request)
+    pool = _backtest_pool(data, request)
+    symbols = pool.symbols
     spec = _spec_for_run(strategy, request)
     pipeline = build_pipeline_strategy(spec, data)
+    pipeline.members_at = pool.members_at
     pipeline.prepare(symbols, run.end_date, run.end_date)
     ranking = pipeline.generate_weights(run.end_date, symbols).ranking
     return _latest_selection(ranking.assign(signal_date=run.end_date), _engine_config(spec, len(symbols)).holdings_count)
@@ -1038,9 +1048,8 @@ def get_backtest_stock_chart(run_id: int, symbol: str, db: Session = Depends(get
     if not run:
         raise HTTPException(404, "回测不存在")
     strategy = db.get(Strategy, run.strategy_id)
-    name = _stock_name(db, symbol)
-    if name is None:
-        raise HTTPException(404, "股票不存在")
+    # 已经调出指数或退市的股票可能不在当前目录里，没有名称就显示代码，不当作"股票不存在"
+    name = _stock_name(db, symbol) or symbol.split(".")[0]
     data = data_service_for(db, strategy) if strategy else MarketDataService(db)
     prices = _backtest_chart_prices(data, symbol, run.start_date, run.end_date)
     price_data_mode = data.frame_data_mode(prices)
@@ -1075,9 +1084,7 @@ def get_backtest_stock_charts(run_id: int, db: Session = Depends(get_db)) -> Dic
     data = data_service_for(db, strategy) if strategy else MarketDataService(db)
     result: List[Dict[str, Any]] = []
     for symbol in symbols[:100]:
-        name = _stock_name(db, symbol)
-        if name is None:
-            continue
+        name = _stock_name(db, symbol) or symbol.split(".")[0]
         prices = _backtest_chart_prices(data, symbol, run.start_date, run.end_date)
         if prices.empty:
             result.append({
@@ -1464,10 +1471,12 @@ def explain_backtest_trade(run_id: int, payload: ExplainTradeRef, db: Session = 
     saved_spec = (config.get("strategy_config") or {}).get("spec")
     spec = StrategySpec.model_validate(saved_spec) if saved_spec else strategy_spec(strategy)
     data = data_service_for(db, strategy)
-    symbols = _backtest_symbols(data, BacktestRequest.model_validate({**config, "strategy_id": strategy.id}))
+    pool = _backtest_pool(data, BacktestRequest.model_validate({**config, "strategy_id": strategy.id}))
     signal_date = previous_trading_day(data, trade.trade_date)
     if signal_date is None:
         raise HTTPException(422, "找不到这笔成交的信号日")
+    # 和回测时一样，只给信号日当天的成分股打分
+    symbols = [sym for sym in pool.symbols if sym in pool.members_at(signal_date)] if pool.members_at else pool.symbols
     record = {"symbol": trade.symbol, "side": trade.side, "quantity": trade.quantity, "price": trade.price,
               "amount": trade.amount, "trade_date": trade.trade_date.isoformat(), "reason": trade.reason}
     out = explain_trade(db, strategy, symbols, signal_date, record, _stock_name(db, trade.symbol) or trade.symbol, spec)

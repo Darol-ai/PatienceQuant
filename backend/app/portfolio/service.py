@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.data.service import MarketDataService
 from app.db.models import DailyAccount, DailyProfit, Order, Portfolio, Position, Signal, Strategy, Trade
-from app.pipeline.library import FIXED_UNIVERSES, default_universe, is_model_strategy, latest_market_day, strategy_spec, validate_date_range
+from app.pipeline.library import FIXED_UNIVERSES, fixed_pool, default_universe, is_model_strategy, latest_market_day, strategy_spec, validate_date_range
 from app.pipeline.strategy import build_pipeline_strategy
 
 
@@ -92,6 +92,10 @@ class PaperTradingService:
     def run_due_automation(self, as_of: Optional[date] = None) -> Dict[str, object]:
         as_of = as_of or self.data.demo.as_of
         portfolio = self.get_or_create_portfolio()
+        if portfolio.auto_rebalance_enabled and portfolio.strategy_id and portfolio.next_rebalance_date and portfolio.next_rebalance_date > as_of:
+            timing_result = self._timing_adjustment(portfolio, as_of)
+            if timing_result is not None:
+                return timing_result
         if not portfolio.auto_rebalance_enabled or not portfolio.strategy_id or not portfolio.next_rebalance_date or portfolio.next_rebalance_date > as_of:
             return {"executed": False, "reason": "not_due", "status": self.automation_status()}
         strategy = self.db.get(Strategy, portfolio.strategy_id)
@@ -104,6 +108,25 @@ class PaperTradingService:
         self.db.commit()
         result["executed"] = True
         result["automation"] = self.automation_status()
+        return result
+
+    def _timing_adjustment(self, portfolio: Portfolio, as_of: date) -> Optional[Dict[str, object]]:
+        """不是调仓日，但择时信号给的仓位和上次调仓时不同：按当前策略重新调仓一次
+        （ADR-0052：择时每天生效）。下次定期调仓日不变。"""
+        strategy = self.db.get(Strategy, portfolio.strategy_id)
+        if strategy is None or strategy_spec(strategy).timing.type == "none":
+            return None
+        data = self._resolve_paper_data(strategy)
+        day = latest_market_day(as_of) if data is not self.data else as_of
+        exposure = build_pipeline_strategy(strategy_spec(strategy), data).daily_exposure(day)
+        if exposure is None or portfolio.last_exposure is None or abs(exposure[0] - portfolio.last_exposure) <= 1e-9:
+            return None
+        next_date = portfolio.next_rebalance_date
+        result = self.rebalance(strategy, as_of)
+        portfolio = self.get_or_create_portfolio()
+        portfolio.next_rebalance_date = next_date
+        self.db.commit()
+        result.update(executed=True, reason="timing_changed", automation=self.automation_status())
         return result
 
     def _resolve_paper_data(self, strategy: Optional[Strategy]) -> MarketDataService:
@@ -207,7 +230,8 @@ class PaperTradingService:
         else:
             # 换策略又没指定股票池时，不能沿用上一个回测的股票池
             universe_name = universe or default_universe(strategy)
-            symbols = (FIXED_UNIVERSES[universe_name][1]() if universe_name in FIXED_UNIVERSES
+            # 沪深300 用调仓当天的成分股（历史成分股，ADR-0052）
+            symbols = (fixed_pool(universe_name, as_of, as_of).symbols if universe_name in FIXED_UNIVERSES
                        else data.universe_symbols(universe_name))
             portfolio.execution_symbols = []
             portfolio.source_backtest_run_id = None
@@ -314,6 +338,7 @@ class PaperTradingService:
             orders.append({"symbol": symbol, "side": "BUY", "quantity": quantity, "price": price, "amount": amount, "reason": reason})
         portfolio.strategy_id = strategy.id
         portfolio.last_rebalance_at = datetime.utcnow()
+        portfolio.last_exposure = float(strategy_result.target_exposure)
         if portfolio.auto_rebalance_enabled:
             portfolio.auto_rebalance_frequency = spec.rebalance.frequency
             portfolio.next_rebalance_date = self.next_rebalance_date(as_of, portfolio.auto_rebalance_frequency)
