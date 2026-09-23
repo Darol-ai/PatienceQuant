@@ -151,12 +151,6 @@ class AIDecisionRequest(BaseModel):
     rolled_back: Optional[bool] = None
 
 
-class SyncRequest(BaseModel):
-    symbols: List[str] = Field(default_factory=list)
-    start_date: date = date(2025, 1, 1)
-    end_date: date = Field(default_factory=date.today)
-
-
 class AISettingsRequest(BaseModel):
     """留空(None)的字段不修改，只更新显式传入的字段。"""
     api_key: Optional[str] = Field(None, min_length=1, max_length=300)

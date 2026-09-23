@@ -223,21 +223,14 @@ export function BacktestCenter() {
   })
 
   const pricesSyncMutation = useMutation({
-    mutationFn: async () =>
-      (
-        await api.post('/data/sync', {
-          symbols: selectedSymbols,
-          start_date: form.start_date,
-          end_date: form.end_date,
-        })
-      ).data,
+    mutationFn: async () => (await api.post('/data/market/refresh')).data,
     onSuccess: data =>
       setSyncMessage(
-        data.data_mode === 'real'
-          ? `已同步 ${data.real_rows || 0} 条真实行情记录`
-          : '真实行情暂不可用，系统将继续使用 Demo/缓存数据运行',
+        data.started
+          ? '已开始把本地行情库补齐到最近交易日，后台进行，进度见页面右上角'
+          : '行情库补齐已经在进行中，进度见页面右上角',
       ),
-    onError: () => setSyncMessage('行情同步失败，回测仍可使用 Demo/fallback 数据运行'),
+    onError: () => setSyncMessage('行情库补齐启动失败，请稍后重试'),
   })
 
   const [backtestError, setBacktestError] = useState('')
@@ -563,10 +556,10 @@ export function BacktestCenter() {
                     <button
                       className="secondary-button"
                       onClick={() => pricesSyncMutation.mutate()}
-                      disabled={pricesSyncMutation.isPending || selectedSymbols.length === 0}
+                      disabled={pricesSyncMutation.isPending}
                     >
                       <Download size={13} />
-                      {pricesSyncMutation.isPending ? '同步中…' : '同步所选行情'}
+                      {pricesSyncMutation.isPending ? '启动中…' : '补齐行情库'}
                     </button>
                     <button className="secondary-button" onClick={selectVisibleStocks} disabled={stocksLoading}>
                       选当前前 {Math.max(10, form.holdings_count)} 只

@@ -1,5 +1,5 @@
 import { ReactNode, useEffect, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { NavLink, useLocation } from 'react-router-dom'
 import { Activity, BarChart3, Bot, BrainCircuit, BriefcaseBusiness, ChevronRight, Database, FlaskConical, LayoutDashboard, Menu, Moon, Search, Settings2, ShieldCheck, Sun, X } from 'lucide-react'
 import { api } from '../api'
@@ -42,6 +42,28 @@ export function Layout({ children }: { children: ReactNode }) {
   // 真实策略(csi300_*/quant_v3_regression)时才说"真实策略数据"。
   const { data: account } = useQuery({ queryKey: ['paper-account'], queryFn: async () => (await api.get('/paper/account')).data })
   const isRealStrategy = account?.strategy_kind?.startsWith('csi300_') || account?.strategy_kind === 'quant_v3_regression'
+  // 本地行情库状态（ADR-0047）：补齐进行中每3秒刷新一次进度，平时每分钟查一次。
+  const queryClient = useQueryClient()
+  const { data: market } = useQuery({
+    queryKey: ['market-status'],
+    queryFn: async () => (await api.get('/data/market/status')).data,
+    refetchInterval: query => (query.state.data?.refresh?.running ? 3000 : 60000),
+  })
+  const marketRefresh = useMutation({
+    mutationFn: async () => (await api.post('/data/market/refresh')).data,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['market-status'] }),
+  })
+  const refreshing = market?.refresh?.running || marketRefresh.isPending
+  const marketLabel = market?.error
+    ? '行情库状态不可用'
+    : refreshing
+      ? `行情补齐中 ${market?.refresh?.done ?? 0}/${market?.refresh?.total ?? '…'}`
+      : market?.latest_stored
+        ? `A 股行情截至 ${market.latest_stored}${market.missing_days ? ` · 缺 ${market.missing_days} 个交易日` : ''}`
+        : 'A 股行情库为空'
+  const marketTitle = market?.refresh?.stopped_reason
+    ? `上次补齐中途停止：${market.refresh.stopped_reason}`
+    : '当天行情通常在收盘后才发布，发布前会显示缺 1 个交易日'
   return (
     <div className="app-shell">
       <aside className={`sidebar ${open ? 'open' : ''}`}>
@@ -57,7 +79,7 @@ export function Layout({ children }: { children: ReactNode }) {
         <header className="topbar">
           <button className="icon-button menu-button" onClick={() => setOpen(!open)}>{open ? <X/> : <Menu/>}</button>
           <div className="topbar-title"><span>Investment Intelligence</span><b>长期主义，从数据开始</b></div>
-          <div className="topbar-actions"><div className="market-status"><i/>A 股数据已更新</div><button className="icon-button" onClick={() => setLight(!light)}>{light ? <Moon size={18}/> : <Sun size={18}/>}</button></div>
+          <div className="topbar-actions"><div className="market-status" title={marketTitle}><i/>{marketLabel}{!refreshing && market?.missing_days ? <button className="text-link" style={{ background: 'none', border: 0, padding: 0, marginLeft: 6 }} onClick={() => marketRefresh.mutate()}>补齐</button> : null}</div><button className="icon-button" onClick={() => setLight(!light)}>{light ? <Moon size={18}/> : <Sun size={18}/>}</button></div>
         </header>
         <div className="page-content">{children}</div>
       </main>

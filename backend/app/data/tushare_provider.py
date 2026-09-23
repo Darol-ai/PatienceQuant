@@ -2,15 +2,14 @@
 数据源）。目录(代码/名称/行业)用一次stock_basic()批量调用
 拿到全市场真实数据（比baostock时代省一次调用——industry字段就在同一张
 表里，不用像query_all_stock+query_stock_industry那样分两次查再merge）。
-价格/基本面仍然按需懒加载，走现有SQLite缓存架构，不做一次性全量预抓取。
+行情（日线、指数）不在这里取，统一走本地行情库（app/data/market_store.py，ADR-0047）。
 
 连接层（限速/超时/失败重试）统一在 app.data.tushare_client 里实现，见
 docs/adr/0046——本模块只管"问tushare要哪些字段、股票代码怎么转换成
-xxxxxx.SH/.SZ后缀格式、前复权价怎么算"这些业务逻辑。
+xxxxxx.SH/.SZ后缀格式"这些业务逻辑。
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
 from typing import List, Optional
 
 import pandas as pd
@@ -53,18 +52,13 @@ def _infer_group(industry_text: str) -> tuple[str, str]:
 
 
 class TushareDataProvider:
-    """真实数据适配器，通过tushare获取全市场目录+按需价格/基准指数。"""
+    """真实数据适配器，通过tushare获取全市场股票目录（代码、名称、行业）。"""
 
     mode = "real"
 
     def __init__(self, fallback: DemoDataProvider):
         self.fallback = fallback
         self._catalog_cache: Optional[pd.DataFrame] = None
-        # 最近一次fetch_prices()里，重试3次后仍拿不到真实数据的股票代码——
-        # ADR-0045/0046规定这种情况不能悄悄退回demo数据顶替，调用方(最终
-        # 是app/data/service.py::MarketDataService)需要能读到这个列表，
-        # 把"部分行情获取失败"如实透出给用户，而不是装作一切正常。
-        self.last_failed_symbols: List[str] = []
 
     @property
     def catalog_cached(self) -> bool:
@@ -177,89 +171,3 @@ class TushareDataProvider:
             return self.fallback.bootstrap()
         _, prices, fundamentals, benchmark = self.fallback.bootstrap()
         return catalog, prices, fundamentals, benchmark
-
-    def _fetch_one_qfq(self, pro, ts_code: str, start: date, end: date) -> pd.DataFrame:
-        """单支股票的前复权日线。tushare原始daily()是不复权价格，前复权
-        要另外拿adj_factor()自己算：前复权价 = 原始价 × 当日复权因子 /
-        区间内最新一天的复权因子（锚定在这次查询自己的最后一个交易日，
-        不是锚定"今天"——同一次查询内部相对收益/动量计算不受锚点选择
-        影响，只影响绝对价格水平）。"""
-        daily = pro.daily(ts_code=ts_code, start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"))
-        if daily is None or daily.empty:
-            return pd.DataFrame()
-        factor = pro.adj_factor(ts_code=ts_code, start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"))
-        if factor is None or factor.empty:
-            raise RuntimeError(f"{ts_code} adj_factor返回空表，无法计算前复权价")
-        merged = daily.merge(factor[["trade_date", "adj_factor"]], on="trade_date", how="inner")
-        if merged.empty:
-            raise RuntimeError(f"{ts_code} daily/adj_factor日期对不上，无法计算前复权价")
-        merged = merged.sort_values("trade_date")
-        latest_factor = merged["adj_factor"].iloc[-1]
-        for column in ("open", "high", "low", "close"):
-            merged[column] = merged[column] * merged["adj_factor"] / latest_factor
-        return merged[["trade_date", "open", "high", "low", "close", "vol"]].rename(columns={"vol": "volume"})
-
-    def fetch_prices(self, symbols: List[str], start: date, end: date) -> pd.DataFrame:
-        """按symbol逐个走独立的重试序列(而不是整批共用一次重试)——这样
-        一支股票卡住重试，不会连累同一批里已经成功的其它股票要跟着
-        重跑。3次重试后仍失败的symbol记在self.last_failed_symbols里，
-        不在这里也不在调用方悄悄补demo数据(ADR-0045/0046)。
-        """
-        normalised_symbols = [_normalise_symbol(symbol) for symbol in symbols]
-        frames = []
-        failed: List[str] = []
-        for symbol in normalised_symbols:
-            ts_code = _to_ts_code(symbol)
-
-            def _fetch(pro, ts_code=ts_code):
-                return self._fetch_one_qfq(pro, ts_code, start, end)
-
-            try:
-                raw = run_tushare(_fetch)
-            except TushareQueryFailed:
-                failed.append(symbol)
-                continue
-            if raw.empty:
-                # 查询本身成功，只是这个区间没有数据(比如还没上市)——不算
-                # "拿不到真实数据"的失败，是真实的"没有"。
-                continue
-            for column in ("open", "high", "low", "close", "volume"):
-                raw[column] = pd.to_numeric(raw[column], errors="coerce")
-            raw = raw.dropna()
-            if raw.empty:
-                continue
-            raw["symbol"] = symbol
-            raw["adj_close"] = raw["close"]
-            raw["data_mode"] = "real"
-            frames.append(raw[["symbol", "trade_date", "open", "high", "low", "close", "adj_close", "volume", "data_mode"]])
-
-        self.last_failed_symbols = failed
-        if not frames:
-            return pd.DataFrame(columns=["symbol", "trade_date", "open", "high", "low", "close", "adj_close", "volume", "data_mode"])
-        result = pd.concat(frames, ignore_index=True)
-        result["trade_date"] = pd.to_datetime(result["trade_date"], format="%Y%m%d").dt.date
-        return result.sort_values(["trade_date", "symbol"])
-
-    def fetch_benchmark(self, start: date, end: date) -> pd.DataFrame:
-        def _fetch(pro):
-            frame = pro.index_daily(ts_code="000300.SH", start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"))
-            if frame is None or frame.empty:
-                raise RuntimeError("tushare index_daily(沪深300)返回空表")
-            return frame
-
-        try:
-            frame = run_tushare(_fetch)
-        except TushareQueryFailed:
-            # ADR-0045/0046：基准指数直接参与超额收益计算，不退回demo曲线
-            # 冒充真实指数——返回空表，调用方(app/quant_v3/real_benchmark.py
-            # 风格的"没有真实对照就诚实返回None"同一个原则)自己决定怎么
-            # 处理"这次没有真实基准"。
-            return pd.DataFrame(columns=["trade_date", "close", "adj_close", "data_mode"])
-
-        frame = frame[["trade_date", "close"]].copy()
-        frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
-        frame = frame.dropna()
-        frame["trade_date"] = pd.to_datetime(frame["trade_date"], format="%Y%m%d").dt.date
-        frame["adj_close"] = frame["close"]
-        frame["data_mode"] = "real"
-        return frame.sort_values("trade_date").reset_index(drop=True)

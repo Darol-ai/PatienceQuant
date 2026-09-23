@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date
 from functools import lru_cache
 from typing import Dict, List, Optional
 
@@ -10,9 +10,10 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.data.akshare_provider import _normalise_query
-from app.data.tushare_provider import TushareDataProvider
+from app.data.tushare_provider import TushareDataProvider, _to_ts_code
 from app.data.demo import DemoDataProvider
-from app.db.models import BenchmarkPrice, Fundamental, Industry, ResearchGroup, Stock, StockPrice, Watchlist
+from app.data.market_refresh import BENCHMARK_INDEX, get_market_store
+from app.db.models import Fundamental, Industry, ResearchGroup, Stock, Watchlist
 
 
 @lru_cache
@@ -298,12 +299,7 @@ class MarketDataService:
         """
         requested = list(dict.fromkeys(str(symbol) for symbol in symbols))
         demo_symbols = set(self.demo.stock_catalog().symbol.tolist())
-        # Avoid a giant SQLite ``IN (...)`` clause when a tushare catalog
-        # contains several thousand symbols. The distinct cache key set is
-        # tiny compared with the price table and can be intersected in
-        # memory safely.
-        cached_symbols = set(self.db.scalars(select(StockPrice.symbol).distinct()).all())
-        filtered = [symbol for symbol in requested if symbol in demo_symbols or symbol in cached_symbols]
+        filtered = [symbol for symbol in requested if symbol in demo_symbols]
         candidates = filtered or requested
         if len(candidates) <= self.ANALYSIS_SYMBOL_CAP:
             return candidates or requested[:1]
@@ -356,110 +352,31 @@ class MarketDataService:
         end: date,
         allow_network: bool = False,
     ) -> pd.DataFrame:
+        """日线（前复权，锚定在区间最后一个交易日）。
+
+        real 模式只读本地行情库（ADR-0047），不再按股票临时去数据源拉：库
+        里没有的股票如实记进 last_price_fetch_failures，不拿 demo 数据顶替。
+        allow_network 参数保留只是为了兼容旧调用方，已不起作用——补数据
+        统一走 app.data.market_refresh。demo 模式用本地确定性模拟数据。
+        """
+        self.last_price_fetch_failures = []
         if not symbols:
             return pd.DataFrame()
-        if get_settings().data_mode.lower() == "real":
-            # tushare是日频快照，"今天"甚至最近1-2天的数据经常还没发布。
-            # 如果覆盖度检查死磕到调用方传入的end(通常是"今天")，缓存
-            # 永远够不到这个end，每次请求都会被判定为"没缓存全"，重新
-            # 触发一遍对每支股票的顺序真实请求——等于write-through缓存
-            # 形同虚设。这里把end钳到几天前，缓存写一次之后同一区间的
-            # 后续请求才能真正命中，不再碰网络。
-            end = min(end, date.today() - timedelta(days=4))
-        cached = self.db.scalars(
-            select(StockPrice).where(StockPrice.symbol.in_(symbols), StockPrice.trade_date >= start, StockPrice.trade_date <= end)
-        ).all()
-        cached_df = pd.DataFrame([
-            {"symbol": p.symbol, "trade_date": p.trade_date, "open": p.open, "high": p.high, "low": p.low,
-             "close": p.close, "adj_close": p.adj_close, "volume": p.volume, "data_mode": p.data_mode}
-            for p in cached
-        ])
-        # A symbol with only a partial cached range is not covered.  This is
-        # important after a user syncs (say) 2024-2025 and then runs a
-        # 2018-2025 backtest: silently accepting the partial cache would
-        # change the requested research period and distort all factor windows.
-        #
-        # 边界要留容差(ADR-0045/0046补充发现)：tushare只返回真实交易日的行情，
-        # 请求的start/end落在非交易日(元旦、春节、国庆等假期)时，缓存里
-        # 永远不可能出现"恰好等于start/end"的那一行——比如2018-01-01是
-        # 元旦，A股第一个交易日是2018-01-02，coverage[symbol][0]永远是
-        # 2018-01-02 > start(2018-01-01)。不留容差的话，每支股票每次都会
-        # 被判定"没覆盖全"，写透缓存形同虚设，每次请求都要重新顺序打一遍
-        # tushare/baostock——这正是Dashboard"一直转圈"的真正根因之一(容量上限只是
-        # 让这个重复代价从"上千支"降到"30支"，本身没有让缓存生效)。
-        # 10天的容差足够盖过任意一个法定假期(春节最长约10天)，同时远小于
-        # 上面注释担心的"2024-2025缓存冒充2018-2025"这种年级别的时间跨度，
-        # 不会放宽那个约束。
-        _COVERAGE_TOLERANCE = timedelta(days=10)
-        coverage = {}
-        if not cached_df.empty:
-            for symbol, group in cached_df.groupby("symbol"):
-                coverage[symbol] = (group.trade_date.min(), group.trade_date.max())
-        missing = [
-            symbol
-            for symbol in symbols
-            if symbol not in coverage
-            or coverage[symbol][0] > start + _COVERAGE_TOLERANCE
-            or coverage[symbol][1] < end - _COVERAGE_TOLERANCE
-        ]
-        frames = [cached_df] if not cached_df.empty else []
-        if missing:
-            # A user may have searched tushare while the rest of the app is
-            # still in offline Demo mode. Network access is opt-in for
-            # explicit user actions (custom backtest, stock detail, sync) or
-            # DATA_MODE=real. Ordinary full-universe pages stay offline and
-            # therefore cannot accidentally issue thousands of serial
-            # tushare requests after a catalog refresh.
-            demo_symbols = set(self.demo.stock_catalog().symbol.tolist())
-            network_enabled = allow_network or get_settings().data_mode.lower() == "real"
-            real_missing = (
-                missing
-                if get_settings().data_mode.lower() == "real"
-                else [symbol for symbol in missing if symbol not in demo_symbols and str(symbol).isdigit()]
-            )
-            real_mode = get_settings().data_mode.lower() == "real"
-            if network_enabled and real_missing:
-                real_prices = self.real.fetch_prices(real_missing, start, end)
-                if not real_prices.empty:
-                    frames.append(real_prices)
-                    # 写透缓存：不落盘的话，每次请求同一批symbol都要重新
-                    # 顺序调用一遍tushare——real模式下Dashboard/股票池这类
-                    # 页面每次打开都会命中"未缓存"，等于永远在付一次性冷
-                    # 启动的代价。落盘后同一日期区间下次直接命中上面的
-                    # cached查询，不再碰网络。
-                    self._persist_real_prices(real_prices)
-                if real_mode:
-                    # ADR-0045：real模式下重试3次仍失败的symbol，如实记录
-                    # 下来供调用方透出给用户，不能靠下面的demo兜底悄悄
-                    # 顶替——那样看起来"成功"了，实际是假数据在冒充真实
-                    # 结果。
-                    self.last_price_fetch_failures = list(getattr(self.real, "last_failed_symbols", []))
-            fetched_symbols = set()
-            for frame in frames[1:]:
-                if not frame.empty:
-                    fetched_symbols.update(frame.symbol.unique())
-            demo_missing = [symbol for symbol in missing if symbol not in fetched_symbols]
-            if real_mode:
-                # real模式下"没拿到真实数据"到这里为止——不再用demo数据
-                # 顶替这些symbol，宁可这次结果里少几支股票，也不要让假
-                # 数字掺进真实策略计算里(ADR-0045)。
-                demo_missing = []
-            if demo_missing:
-                frames.append(self.demo.fetch_prices(demo_missing, start, end))
-        if not frames:
+        if get_settings().data_mode.lower() != "real":
+            return self.demo.fetch_prices(symbols, start, end)
+        code_by_symbol = {symbol: _to_ts_code(symbol) for symbol in symbols}
+        symbol_by_code = {code: symbol for symbol, code in code_by_symbol.items()}
+        frame = get_market_store().load_daily(start, end, code_by_symbol.values(), adjust="qfq")
+        found = set(frame["ts_code"].unique()) if not frame.empty else set()
+        self.last_price_fetch_failures = [symbol for symbol, code in code_by_symbol.items() if code not in found]
+        if frame.empty:
             return pd.DataFrame()
-        result = pd.concat(frames, ignore_index=True)
-        if result.empty:
-            return result
-        # Prefer Real rows when a refreshed range overlaps an older Demo
-        # fallback/cache row.  The unique key matches the SQLite constraint.
-        priority = {"demo_fallback": 0, "demo": 1, "real": 2}
-        result["_mode_priority"] = result["data_mode"].map(priority).fillna(0)
-        result = (
-            result.sort_values(["symbol", "trade_date", "_mode_priority"])
-            .drop_duplicates(["symbol", "trade_date"], keep="last")
-            .drop(columns="_mode_priority")
-        )
+        result = pd.DataFrame({
+            "symbol": frame["ts_code"].map(symbol_by_code),
+            "trade_date": frame["trade_date"].dt.date,
+            "open": frame["open"], "high": frame["high"], "low": frame["low"], "close": frame["close"],
+            "adj_close": frame["close"], "volume": frame["vol"], "data_mode": "real",
+        })
         return result.sort_values(["trade_date", "symbol"]).reset_index(drop=True)
 
     def fundamentals(self, symbols: List[str], as_of: date) -> pd.DataFrame:
@@ -491,74 +408,13 @@ class MarketDataService:
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     def benchmark(self, start: date, end: date) -> pd.DataFrame:
-        """沪深300基准指数——real模式下走写透缓存(ADR-0045补充)，逻辑跟
-        prices()对齐：同样10天边界容差(tushare只在真实交易日有数据，
-        请求的start/end撞上假期时不能死磕"恰好等于")，同样"拿不到就
-        如实返回能给的部分/空表"，不拿demo序列悄悄顶替真实指数。demo
-        模式下不缓存——本地生成毫秒级，缓存没有意义。"""
-        real_mode = get_settings().data_mode.lower() == "real"
-        if not real_mode:
+        """沪深300指数。real 模式只读本地行情库，没有就返回空表，不拿 demo 曲线顶替。"""
+        if get_settings().data_mode.lower() != "real":
             return self.provider.fetch_benchmark(start, end)
-        end = min(end, date.today() - timedelta(days=4))
-        tolerance = timedelta(days=10)
-        cached = self.db.scalars(
-            select(BenchmarkPrice).where(BenchmarkPrice.trade_date >= start, BenchmarkPrice.trade_date <= end)
-        ).all()
-        cached_df = pd.DataFrame([
-            {"trade_date": p.trade_date, "close": p.close, "adj_close": p.adj_close, "data_mode": p.data_mode}
-            for p in cached
-        ])
-        covered = (
-            not cached_df.empty
-            and cached_df.trade_date.min() <= start + tolerance
-            and cached_df.trade_date.max() >= end - tolerance
-        )
-        if covered:
-            return cached_df.sort_values("trade_date").reset_index(drop=True)
-        fetched = self.real.fetch_benchmark(start, end)
-        if not fetched.empty:
-            self._persist_benchmark_prices(fetched)
-            return fetched.sort_values("trade_date").reset_index(drop=True)
-        # ADR-0045：拿不到新数据也不能拿demo指数顶替真实基准；已缓存的
-        # 旧数据比空表更有用，原样返回给调用方自己判断够不够用。
-        return cached_df.sort_values("trade_date").reset_index(drop=True) if not cached_df.empty else fetched
-
-    def _persist_benchmark_prices(self, fetched: pd.DataFrame) -> int:
-        real = fetched[fetched.data_mode == "real"] if not fetched.empty else fetched
-        inserted = 0
-        for row in real.to_dict(orient="records"):
-            exists = self.db.scalar(select(BenchmarkPrice).where(BenchmarkPrice.trade_date == row["trade_date"]))
-            if exists:
-                exists.close = float(row["close"])
-                exists.adj_close = float(row["adj_close"])
-                exists.data_mode = row["data_mode"]
-            else:
-                self.db.add(BenchmarkPrice(
-                    trade_date=row["trade_date"], close=float(row["close"]),
-                    adj_close=float(row["adj_close"]), data_mode=row["data_mode"],
-                ))
-            inserted += 1
-        self.db.commit()
-        return inserted
-
-    def _persist_real_prices(self, fetched: pd.DataFrame) -> int:
-        """把fetch_prices()拿到的真实行情落盘到StockPrice缓存表——只落
-        data_mode=="real"的行，fallback/demo行不缓存(它们本来就是随时能
-        重新生成的本地模拟数据，缓存没有意义)。"""
-        real = fetched[fetched.data_mode == "real"] if not fetched.empty else fetched
-        inserted = 0
-        for row in real.to_dict(orient="records"):
-            exists = self.db.scalar(select(StockPrice).where(StockPrice.symbol == row["symbol"], StockPrice.trade_date == row["trade_date"]))
-            if exists:
-                for key in ["open", "high", "low", "close", "adj_close", "volume", "data_mode"]:
-                    setattr(exists, key, float(row[key]) if key != "data_mode" else row[key])
-            else:
-                self.db.add(StockPrice(**row))
-            inserted += 1
-        self.db.commit()
-        return inserted
-
-    def sync_real_prices(self, symbols: List[str], start: date, end: date) -> Dict[str, object]:
-        fetched = self.real.fetch_prices(symbols, start, end)
-        inserted = self._persist_real_prices(fetched)
-        return {"requested_symbols": symbols, "real_rows": inserted, "data_mode": "real" if inserted else "demo_fallback"}
+        frame = get_market_store().load_index(BENCHMARK_INDEX, start, end)
+        if frame.empty:
+            return pd.DataFrame(columns=["trade_date", "close", "adj_close", "data_mode"])
+        return pd.DataFrame({
+            "trade_date": frame["trade_date"].dt.date,
+            "close": frame["close"], "adj_close": frame["close"], "data_mode": "real",
+        })

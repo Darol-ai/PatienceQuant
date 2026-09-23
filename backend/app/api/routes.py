@@ -22,6 +22,7 @@ from app.ai.service import AIResearchService
 from app.ai.strategy_assistant import StrategyAssistantService
 from app.backtest.engine import BacktestConfig, BacktestEngine
 from app.config import get_settings
+from app.data.market_refresh import market_status, start_refresh
 from app.data.service import MarketDataService
 from app.quant_v3.a_phase_data_service import APhaseDataService
 from app.quant_v3.broad_universe import BROAD_STOCKS
@@ -36,7 +37,7 @@ from app.db.models import AIExplanation, BacktestEquity, BacktestMetric, Backtes
 from app.db.session import get_db
 from app.factors.engine import FactorEngine
 from app.portfolio.service import PaperTradingService
-from app.schemas import AIDecisionRequest, AISettingsRequest, ApplyBacktestPaperRequest, BacktestRequest, ExplainRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyAssistRequest, StrategyPayload, SyncRequest
+from app.schemas import AIDecisionRequest, AISettingsRequest, ApplyBacktestPaperRequest, BacktestRequest, ExplainRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyAssistRequest, StrategyPayload
 from app.strategies.base import StrategyConfig
 from app.strategies.multifactor import MultiFactorStrategy
 
@@ -1652,11 +1653,17 @@ async def generate_factor_from_report(
     }
 
 
-@router.post("/data/sync")
-def sync_data(payload: SyncRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    data = MarketDataService(db)
-    symbols = payload.symbols or data.stocks().symbol.head(10).tolist()
-    return data.sync_real_prices(symbols, payload.start_date, payload.end_date)
+@router.get("/data/market/status")
+def market_data_status() -> Dict[str, Any]:
+    """本地行情库最新日期、最近交易日、缺多少天，以及补齐任务的进度。"""
+    return market_status()
+
+
+@router.post("/data/market/refresh")
+def market_data_refresh() -> Dict[str, Any]:
+    """手动补齐本地行情库到最近交易日。在后台跑，立即返回；已有补齐在跑时不重复开始。"""
+    started = start_refresh()
+    return {"started": started, **market_status()}
 
 
 @router.post("/data/catalog/sync")
@@ -1801,7 +1808,7 @@ def dashboard(db: Session = Depends(get_db)) -> Dict[str, Any]:
         # （60秒内命中缓存的请求根本没有再调用一次data.prices()）。
         "data_warnings": (
             {"failed_symbols": failed_symbols,
-             "message": f"{len(failed_symbols)}支股票行情本次获取失败（已重试3次），信号列表可能不完整"}
+             "message": f"本地行情库中缺少{len(failed_symbols)}支股票在该区间的行情，信号列表可能不完整"}
             if failed_symbols else None
         ),
     }

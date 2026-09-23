@@ -40,6 +40,14 @@ class TushareQueryFailed(Exception):
     不能捕获这个异常之后悄悄换成demo/虚构数据（ADR-0045/ADR-0046）。"""
 
 
+class TushareQuotaExceeded(TushareQueryFailed):
+    """额度用完、权限不足或token失效——重试不会有用，只会多消耗调用次数，
+    所以不重试，直接让调用方停下来(比如本地行情库补齐时停在当前进度)。"""
+
+
+_NON_RETRYABLE_MARKERS = ("超限", "权限", "过期", "积分")
+
+
 def _get_pro():
     global _pro
     if _pro is None:
@@ -92,7 +100,9 @@ def run(fn: Callable[[object], T]) -> T:
         _pace()
         try:
             return fn(pro)
-        except Exception as exc:  # noqa: BLE001 - 任何失败都要重试，不区分异常类型
+        except Exception as exc:  # noqa: BLE001 - 除额度/权限类错误外，任何失败都重试
+            if any(marker in str(exc) for marker in _NON_RETRYABLE_MARKERS):
+                raise TushareQuotaExceeded(str(exc)) from exc
             last_error = exc
             if attempt < _MAX_ATTEMPTS - 1:
                 time.sleep(0.5 * (2 ** attempt))
