@@ -16,14 +16,6 @@ def test_health_and_seeded_stocks():
     with TestClient(app) as client:
         health = client.get("/api/health")
         assert health.status_code == 200
-        stocks = client.get("/api/stocks")
-        assert stocks.status_code == 200
-        # /api/stocks跑因子引擎打分，analysis_symbols()把分析规模封顶在
-        # ANALYSIS_SYMBOL_CAP(30)——real模式下tushare没有批量接口，每支
-        # 股票单独发一次网络请求，不封顶的话全市场几千支会顺序请求到
-        # 挂起。这个上限不区分demo/real统一生效，所以这里即使是demo的
-        # 50支小目录，也会看到30这个数字。
-        assert stocks.json()["total"] == 30
         search = client.get("/api/stocks/search", params={"q": "招商银行", "source": "local"})
         assert search.status_code == 200
         assert any(row["symbol"] == "600036" and row["name"] == "招商银行" for row in search.json()["items"])
@@ -34,14 +26,11 @@ def test_health_and_seeded_stocks():
         assert full_search.status_code == 200
         assert full_search.json()["total"] == 50
         assert len(full_search.json()["items"]) == full_search.json()["total"]
-        universes = client.get("/api/universes")
-        assert universes.status_code == 200
-        ids = {item["id"] for item in universes.json()}
+        pools = {item["id"]: item for item in client.get("/api/pools").json()}
         # ADR-0051：按代码顺序取前 N 支的代理股票池已删除，只剩真实的股票池
-        assert {"a_share", "csi300", "broad30"} <= ids
-        assert not ids & {"large_cap", "hs300", "csi_a500"}
-        universe_counts = {item["id"]: item["count"] for item in universes.json()}
-        assert universe_counts["a_share"] == 50 and universe_counts["csi300"] == 300
+        assert {"a_share", "csi300", "broad30"} <= set(pools)
+        assert not set(pools) & {"large_cap", "hs300", "csi_a500"}
+        assert pools["a_share"]["count"] == 50 and pools["csi300"]["count"] == 300
 
         strategies = client.get("/api/strategies")
         assert strategies.status_code == 200
@@ -55,20 +44,6 @@ def test_health_and_seeded_stocks():
         assert summary["max_drawdown_budget"] > 0
         assert summary["drawdown_brake_exposure"] > 0
 
-        coverage = client.get("/api/research/coverage")
-        assert coverage.status_code == 200
-        assert coverage.json()["total"] >= 10
-        assert coverage.json()["large_cap_count"] >= 10
-        group_counts = {}
-        for item in coverage.json()["items"]:
-            group_counts[item["group"]] = group_counts.get(item["group"], 0) + 1
-        assert set(group_counts) == {"消费", "科技", "新能源", "金融", "红利/央国企"}
-        # analysis_symbols()按ANALYSIS_SYMBOL_CAP(30)在5个组之间轮询取，
-        # 30/5=6——这里断言的是"每个组都不被漏掉"这个更重要的不变量，不是
-        # 具体数量；具体数量随ANALYSIS_SYMBOL_CAP调整会变，但每组至少有
-        # 代表这一点不应该变。
-        assert min(group_counts.values()) >= 5
-
         too_small = client.post("/api/pools", json={"name": "测试小池不应保存", "symbols": ["600519", "000333"]})
         assert too_small.status_code == 422
 
@@ -79,11 +54,6 @@ def test_health_and_seeded_stocks():
         assert len(history.json()["prices"]) == history.json()["chart"]["points"]
 
 
-def test_ai_explainer_without_external_key():
-    with TestClient(app) as client:
-        response = client.post("/api/ai/explain/trade", json={"symbol": "600036", "action": "BUY", "score": 80, "rank": 2})
-        assert response.status_code == 200
-        assert response.json()["provider"] == "rules"
 
 
 def test_paper_automation_and_equity_markers():
@@ -182,9 +152,9 @@ def test_backtest_exposes_risk_controls_and_all_stock_chart_bundle():
 
 def test_custom_backtest_requires_ten_stocks_and_exports_complete_csv():
     with TestClient(app) as client:
-        stock_response = client.get("/api/stocks", params={"universe": "a_share", "sort": "symbol", "order": "asc"})
+        stock_response = client.get("/api/stocks/search", params={"source": "local"})
         assert stock_response.status_code == 200
-        symbols = [row["symbol"] for row in stock_response.json()["items"][:10]]
+        symbols = sorted(row["symbol"] for row in stock_response.json()["items"])[:10]
         assert len(symbols) == 10
 
         too_small = client.post(
@@ -496,23 +466,6 @@ def test_csi300_strategies_run_through_the_shared_backtest_endpoint(kind):
         assert out_of_range.status_code == 422
 
 
-def test_csi300_research_universe_endpoint_shows_real_data_not_demo():
-    """股票池对齐沪深300：这个端点返回全部300支真实成分股的真实名字/
-    真实收盘价/LightGBM真实打分排名，不是脚手架自带的Demo通用目录。"""
-    with TestClient(app) as client:
-        response = client.get("/api/research/csi300-universe")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["total"] == 300
-        assert len(data["items"]) == 300
-        ranks = [item["lightgbm_rank"] for item in data["items"] if item["lightgbm_rank"] is not None]
-        # 停牌到最新交易日的股票当天没有行情、不打分（也买不了），其余名次连续
-        assert len(ranks) >= 290
-        assert sorted(ranks) == list(range(1, len(ranks) + 1))
-        for item in data["items"]:
-            assert item["name"]
-            if item["lightgbm_rank"] is not None:
-                assert item["latest_price"] and item["latest_price"] > 0
 
 
 def test_csi300_strategy_drives_paper_trading_rebalance():
@@ -535,18 +488,6 @@ def test_csi300_strategy_drives_paper_trading_rebalance():
         assert snapshot.status_code == 200
         account = snapshot.json()
         assert account["positions"], "调仓下单成功后持仓不能是空的"
-
-        # Dashboard的"最新交易信号"必须跟着账户当前真正绑定的策略走，不能
-        # 一直写死用默认的通用多因子策略打分——那样会出现"持仓是真实策略
-        # 选出来的，但信号列表却是另一个策略且是Demo数据"这种自相矛盾的
-        # 展示。
-        dashboard = client.get("/api/dashboard")
-        assert dashboard.status_code == 200
-        dashboard_data = dashboard.json()
-        assert dashboard_data["signals"], "绑定了真实策略后信号列表不能是空的"
-        for signal in dashboard_data["signals"]:
-            assert signal["symbol"] in result["execution_scope"]["symbols"]
-            assert signal["name"] != signal["symbol"], "必须查到真实股票名字，不能退化成显示代码本身"
 
         client.post("/api/paper/reset", json={"initial_capital": 1_000_000})
 
@@ -614,15 +555,6 @@ def test_define_strategy_then_practice_and_reload_history():
             assert reloaded[key] == result[key], key
 
 
-def test_universe_analytics_without_fundamentals_returns_empty_valuation_chart():
-    """真实模式下财务因子被去掉后，"估值×成长"图不能报 500，也不能拿程序生成的数字凑。"""
-    from app.api.routes import _analytics_from_ranking
-
-    ranking = pd.DataFrame({"symbol": ["1", "2"], "name": ["a", "b"], "industry": ["x", "y"], "score": [60.0, 40.0],
-                            "return_12m": [0.1, -0.1], "target_weight": [0.5, 0.0]})
-    result = _analytics_from_ranking(ranking, "real")
-    assert result["valuation_growth"] == [] and "财务数据" in result["valuation_growth_note"]
-    assert len(result["portfolio_weights"]) == 1
 
 
 def test_pool_management_lifecycle():

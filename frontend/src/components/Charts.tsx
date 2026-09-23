@@ -55,7 +55,7 @@ export function ScatterChart({ data }: { data: any[] }) {
   return <ReactECharts option={option} style={{ height: 310 }} />
 }
 
-export function BarChart({ data, category = 'year', value = 'strategy', percent = true }: { data: any[]; category?: string; value?: string; percent?: boolean }) {
-  const option = { tooltip: { trigger: 'axis' }, grid: { left: 15, right: 12, top: 20, bottom: 22, containLabel: true }, xAxis: { type: 'category', data: data.map(i => i[category]), ...axis }, yAxis: { type: 'value', axisLabel: { formatter: (v: number) => percent ? `${(v*100).toFixed(0)}%` : v, color: '#7890a8' }, splitLine: axis.splitLine }, series: [{ type: 'bar', barMaxWidth: 30, data: data.map(i => ({ value: i[value], itemStyle: { color: i[value] >= 0 ? '#31d0aa' : '#fb7185', borderRadius: i[value] >= 0 ? [4,4,0,0] : [0,0,4,4] } })) }] }
+export function BarChart({ data, category = 'year', value = 'strategy', percent = true, compare }: { data: any[]; category?: string; value?: string; percent?: boolean; compare?: { key: string; label: string } }) {
+  const option = { tooltip: { trigger: 'axis' }, grid: { left: 15, right: 12, top: 20, bottom: 22, containLabel: true }, xAxis: { type: 'category', data: data.map(i => i[category]), ...axis }, yAxis: { type: 'value', axisLabel: { formatter: (v: number) => percent ? `${(v*100).toFixed(0)}%` : v, color: '#7890a8' }, splitLine: axis.splitLine }, series: [{ type: 'bar', barMaxWidth: 30, name: '策略', color: '#31d0aa', data: data.map(i => ({ value: i[value], itemStyle: { color: i[value] >= 0 ? '#31d0aa' : '#fb7185', borderRadius: i[value] >= 0 ? [4,4,0,0] : [0,0,4,4] } })) }, ...(compare ? [{ type: 'bar', barMaxWidth: 30, name: compare.label, data: data.map(i => i[compare.key]), itemStyle: { color: '#94a3b8' } }] : [])], ...(compare ? { legend: { top: 0, textStyle: { color: '#7890a8' } } } : {}) }
   return <ReactECharts option={option} style={{ height: 260 }} />
 }

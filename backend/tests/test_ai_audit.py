@@ -3,20 +3,11 @@ from fastapi.testclient import TestClient
 from app.main import app
 
 
-def test_explain_trade_persists_and_returns_an_audit_id():
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/ai/explain/trade",
-            json={"symbol": "600036", "action": "BUY", "score": 82, "rank": 3, "industry": "银行", "use_llm": False},
-        )
-        assert response.status_code == 200
-        body = response.json()
-        assert body["provider"] == "rules"
-        assert body["model_version"] == "rules"
-        assert isinstance(body["audit_id"], int)
-
-        audit = client.get("/api/ai/audit").json()
-        assert any(row["id"] == body["audit_id"] for row in audit)
+def _create_audit(client) -> int:
+    """用研报总结造一条审计记录（没有配置大模型时走规则回退）。"""
+    response = client.post("/api/ai/report/analyze", files={"file": ("r.txt", "一份关于动量因子的研报。".encode(), "text/plain")})
+    assert response.status_code == 200
+    return response.json()["audit_id"]
 
 
 def test_ai_settings_can_be_configured_from_the_api_without_leaking_the_key():
@@ -44,11 +35,7 @@ def test_ai_settings_can_be_configured_from_the_api_without_leaking_the_key():
 
 def test_ai_decision_records_adoption_and_rollback():
     with TestClient(app) as client:
-        created = client.post(
-            "/api/ai/explain/trade",
-            json={"symbol": "600036", "action": "HOLD", "use_llm": False},
-        ).json()
-        audit_id = created["audit_id"]
+        audit_id = _create_audit(client)
 
         adopted = client.post(f"/api/ai/audit/{audit_id}/decision", json={"adopted": True})
         assert adopted.status_code == 200

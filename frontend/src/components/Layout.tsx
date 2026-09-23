@@ -1,17 +1,18 @@
 import { ReactNode, useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { NavLink, useLocation } from 'react-router-dom'
-import { Activity, BarChart3, Bot, BrainCircuit, BriefcaseBusiness, ChevronRight, Database, FlaskConical, LayoutDashboard, Menu, Moon, Search, Settings2, ShieldCheck, Sun, X } from 'lucide-react'
+import { Activity, BarChart3, Bot, BrainCircuit, BriefcaseBusiness, Database, Layers, ListChecks, Menu, Moon, Sun, X } from 'lucide-react'
 import { api } from '../api'
 
+// 导航结构见 docs/adr/0051
 const navigation = [
-  { to: '/', label: 'Dashboard', icon: LayoutDashboard },
-  { to: '/stocks', label: '股票池', icon: Search },
-  { to: '/strategy', label: '策略制定', icon: FlaskConical },
+  { to: '/', label: '首页', icon: Bot },
+  { to: '/library', label: '策略库', icon: Layers },
   { to: '/backtest', label: '策略实践', icon: BarChart3 },
   { to: '/paper', label: '模拟盘', icon: BriefcaseBusiness },
-  { to: '/trading', label: '自动交易', icon: Bot },
-  { to: '/ai', label: 'AI 投研', icon: BrainCircuit },
+  { to: '/pools', label: '股票池', icon: ListChecks },
+  { to: '/data', label: '数据与模型', icon: Database },
+  { to: '/ai', label: 'AI 工具', icon: BrainCircuit },
 ]
 
 export function Layout({ children }: { children: ReactNode }) {
@@ -37,11 +38,7 @@ export function Layout({ children }: { children: ReactNode }) {
       // 回到默认浅色，不是值得中断操作的错误。
     }
   }, [light])
-  // 之前这里是写死的"Demo 数据就绪"文字，不管模拟盘实际绑定的是什么
-  // 策略都不会变——现在跟着账户真正绑定的策略走，绑定我们验证过的
-  // 真实策略(csi300_*/quant_v3_regression)时才说"真实策略数据"。
   const { data: account } = useQuery({ queryKey: ['paper-account'], queryFn: async () => (await api.get('/paper/account')).data })
-  const isRealStrategy = account?.strategy_kind?.startsWith('csi300_') || account?.strategy_kind === 'quant_v3_regression'
   // 本地行情库状态（ADR-0047）：补齐进行中每3秒刷新一次进度，平时每分钟查一次。
   const queryClient = useQueryClient()
   const { data: market } = useQuery({
@@ -67,18 +64,17 @@ export function Layout({ children }: { children: ReactNode }) {
   return (
     <div className="app-shell">
       <aside className={`sidebar ${open ? 'open' : ''}`}>
-        <div className="brand"><div className="brand-mark"><Activity size={21} /></div><div><b>PatienceQuant</b><span>低频智能量化</span></div></div>
-        <div className="workspace-card"><div className="dot-live"/><div><span>当前工作区</span><strong>A股低频多因子</strong></div><ChevronRight size={16}/></div>
-        <nav>{navigation.map(({ to, label, icon: Icon }) => <NavLink key={to} to={to} end={to === '/'} className={({isActive}) => isActive ? 'nav-item active' : 'nav-item'}><Icon size={19}/><span>{label}</span></NavLink>)}</nav>
+        <div className="brand"><div className="brand-mark"><Activity size={21} /></div><div><b>PatienceQuant</b><span>策略库 · 回测 · 模拟盘</span></div></div>
+        <nav>{navigation.map(({ to, label, icon: Icon }) => <NavLink key={to} to={to} end={to === '/'} className={({isActive}) => isActive || (to === '/library' && location.pathname.startsWith('/strategy/')) || (to === '/backtest' && location.pathname.startsWith('/backtests/')) ? 'nav-item active' : 'nav-item'}><Icon size={19}/><span>{label}</span></NavLink>)}</nav>
         <div className="sidebar-spacer" />
-        <div className="system-state"><div><Database size={15}/><span>{isRealStrategy ? '真实策略数据' : 'Demo 数据就绪'}</span></div><div><ShieldCheck size={15}/><span>Paper Trading</span></div></div>
-        <div className="user-card"><div className="avatar">PQ</div><div><strong>Quant Research</strong><span>MVP Workspace</span></div><Settings2 size={17}/></div>
+        <div className="system-state"><div><Database size={15}/><span>{market?.latest_stored ? `行情截至 ${market.latest_stored}` : '行情库状态未知'}</span></div><div><BriefcaseBusiness size={15}/><span>{account?.strategy_name ? `模拟盘：${account.strategy_name}` : '模拟盘未绑定策略'}</span></div></div>
+        <div className="sidebar-foot">课程演示 · 不连接券商、不用真钱</div>
       </aside>
       {open && <button className="sidebar-mask" onClick={() => setOpen(false)} aria-label="关闭菜单"/>}
       <main className="main-area">
         <header className="topbar">
           <button className="icon-button menu-button" onClick={() => setOpen(!open)}>{open ? <X/> : <Menu/>}</button>
-          <div className="topbar-title"><span>Investment Intelligence</span><b>长期主义，从数据开始</b></div>
+          <div className="topbar-title"><span>A 股低频量化</span><b>按成绩卡选策略，先回测再上模拟盘</b></div>
           <div className="topbar-actions"><div className="market-status" title={marketTitle}><i/>{marketLabel}{!refreshing && market?.missing_days ? <button className="text-link" style={{ background: 'none', border: 0, padding: 0, marginLeft: 6 }} onClick={() => marketRefresh.mutate()}>补齐</button> : null}</div><button className="icon-button" onClick={() => setLight(!light)}>{light ? <Moon size={18}/> : <Sun size={18}/>}</button></div>
         </header>
         <div className="page-content">{children}</div>

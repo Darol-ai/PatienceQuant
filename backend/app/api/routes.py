@@ -18,16 +18,15 @@ from sqlalchemy.orm import Session
 from app.ai.credentials import clear_ai_credentials, get_ai_credentials, set_ai_credentials
 from app.ai.report_analysis import ReportAnalysisService
 from app.ai.report_extraction import extract_text
-from app.ai.service import AIResearchService
 from app.backtest.engine import BacktestConfig, BacktestEngine
 from app.config import get_settings
 from app.data.market_refresh import market_status, start_refresh
 from app.data.service import MarketDataService
 from app.quant_v3.research_notes import quant_v3_research_universe
-from app.db.models import AIExplanation, BacktestEquity, BacktestMetric, BacktestRun, DailyAccount, Order, Portfolio, Position, ResearchAnnotation, ResearchGroup, Stock, Strategy, StrategyFactor, Trade, Watchlist
+from app.db.models import AIExplanation, Industry, BacktestEquity, BacktestMetric, BacktestRun, DailyAccount, Order, Portfolio, Position, ResearchAnnotation, ResearchGroup, Stock, Strategy, StrategyFactor, Trade, Watchlist
 from app.db.session import get_db
 from app.portfolio.service import PaperTradingService
-from app.schemas import AIDecisionRequest, AISettingsRequest, ApplyBacktestPaperRequest, BacktestRequest, ExplainRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyPayload, StrategySpecPayload, RecommendRequest, ScorecardRefreshRequest, AgentTurnRequest
+from app.schemas import AIDecisionRequest, AISettingsRequest, ApplyBacktestPaperRequest, BacktestRequest, PaperAutomationPayload, PaperRebalanceRequest, PaperResetRequest, StrategyPayload, StrategySpecPayload, RecommendRequest, ScorecardRefreshRequest, AgentTurnRequest
 from app.db.seed import DEFAULT_WEIGHTS
 from app.pipeline.library import FIXED_UNIVERSES, normalize_universe, VALIDATED_KINDS, build_strategy, spec_from_legacy_row, data_service_for, default_universe, is_model_strategy, latest_market_day, strategy_spec, validate_date_range
 from app.pipeline.model_library import MODEL_LIBRARY, model_years
@@ -100,10 +99,6 @@ def _latest_selection(ranking: pd.DataFrame, limit: int) -> List[Dict[str, Any]]
             "signal_date",
             "market_regime",
             "target_exposure",
-            "p_up",
-            "p_down",
-            "p_neutral",
-            "model_signal",
         ]
         if column in frame.columns
     ]
@@ -232,28 +227,6 @@ def health() -> Dict[str, Any]:
     return {"status": "ok", "app": settings.app_name, "data_mode": settings.data_mode, "as_of": settings.demo_as_of.isoformat(), "python": ">=3.9"}
 
 
-@router.get("/research-groups")
-def research_groups(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
-    groups = db.scalars(select(ResearchGroup).order_by(ResearchGroup.id)).all()
-    result = []
-    for group in groups:
-        count = db.scalar(select(func.count()).select_from(Stock).where(Stock.research_group_id == group.id))
-        result.append({"id": group.id, "name": group.name, "description": group.description, "color": group.color, "count": count})
-    return result
-
-
-@router.get("/universes")
-def universes(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
-    data = MarketDataService(db)
-    catalog = data.stocks()
-    a_share = data.universe_symbols("a_share")
-    watchlists = db.scalars(select(Watchlist).order_by(Watchlist.id)).all()
-    return [
-        {"id": "a_share", "name": "A股全市场", "count": len(a_share), "description": "通用目录里的全部 A 股"},
-    ] + [{"id": key, "name": name, "count": len(symbols_fn()), "description": description}
-         for key, (name, symbols_fn, description) in FIXED_UNIVERSES.items()] + [{"id": "custom:%s" % row.id, "name": row.name, "count": len(row.symbols), "description": "自定义研究股票池"} for row in watchlists]
-
-
 @router.get("/research/quant-v3-universe")
 def quant_v3_research_coverage() -> Dict[str, Any]:
     """本组自由探索阶段最终确定的LightGBM策略实际使用的30支候选池研究
@@ -272,91 +245,6 @@ def quant_v3_research_coverage() -> Dict[str, Any]:
         "research_window": {"start": "2019-01-01", "end": "2025-12-31"},
         "strategy_summary": "LightGBM回归预测(90日窗口，5模型集成) + Top-K相对排序 + 动量兜底 + 流动性资格判断，2019-2025历史回测6/7年跑赢等权重买入持有基准，详见 docs/adr/0013~0039",
     }
-
-
-@router.get("/research/csi300-universe")
-def csi300_research_universe(db: Session = Depends(get_db)) -> Dict[str, Any]:
-    """对齐主流做法后universe换成沪深300全部300支真实成分股——这个端点
-    直接返回真实的股票名字/最新真实收盘价/LightGBM策略最近一次真实打分
-    排名，不是脚手架自带的Demo通用目录也不是编出来的研究文案。300支
-    没法像30支候选池那样每支手写研究依据，这里给的是可验证的真实数据
-    （价格、模型分数），不用编内容凑数。
-    """
-    data = MarketDataService(db, real_market_data=True)
-    symbols = FIXED_UNIVERSES["csi300"][1]()
-    latest_day = latest_market_day(date.today())
-    spec = StrategySpec.model_validate({"scorer": {"type": "model", "models": ["legacy/csi300_lightgbm"]},
-                                        "selection": {"type": "top_pct", "pct": 0.1}})
-    pipeline = build_pipeline_strategy(spec, data)
-    pipeline.prepare(symbols, latest_day, latest_day)
-    ranking = pipeline.generate_weights(latest_day, symbols).ranking
-    prices = data.prices(symbols, latest_day, latest_day)
-    latest_prices = prices.set_index("symbol")["close"].to_dict() if not prices.empty else {}
-    scored = ranking.dropna(subset=["score"]).set_index("symbol")
-    score_by_symbol = scored["score"].to_dict()
-    rank_by_symbol = scored["rank"].astype(int).to_dict()
-    names = _fixed_universe_names()
-    items = [
-        {
-            "symbol": symbol,
-            "name": names.get(symbol, symbol),
-            "latest_price": latest_prices.get(symbol),
-            "lightgbm_score": score_by_symbol.get(symbol),
-            "lightgbm_rank": rank_by_symbol.get(symbol),
-        }
-        for symbol in symbols
-    ]
-    items.sort(key=lambda row: (row["lightgbm_rank"] is None, row["lightgbm_rank"] or 0))
-    return {
-        "items": items,
-        "total": len(items),
-        "as_of": latest_day.isoformat(),
-        "strategy_summary": "沪深300全部300支真实成分股 + LightGBM回归预测(90日窗口，5模型集成) + Top-30相对排序，"
-        "2019-2025历史回测6/7年跑赢真实沪深300指数，7年复合+646.9% vs 指数+58.9%",
-    }
-
-
-@router.get("/research/coverage")
-def research_coverage(db: Session = Depends(get_db)) -> Dict[str, Any]:
-    """Return the user's clearly annotated, cross-market low-frequency research list."""
-    data = MarketDataService(db)
-    catalog = data.stocks()
-    ranking_symbols = data.analysis_symbols(catalog.symbol.tolist())
-    ranking = _factor_ranking(db, data, ranking_symbols, get_settings().demo_as_of).ranking
-    annotations = db.scalars(select(ResearchAnnotation).order_by(ResearchAnnotation.id)).all()
-    annotation_by_symbol = {item.symbol: item for item in annotations}
-    rows = ranking[ranking.symbol.isin(annotation_by_symbol)].copy()
-    for field in ("bucket", "thesis", "risk"):
-        rows[field] = rows.symbol.map(lambda symbol: getattr(annotation_by_symbol[str(symbol)], field))
-    order = {item.symbol: index for index, item in enumerate(annotations)}
-    rows["research_order"] = rows.symbol.map(order)
-    rows = rows.sort_values("research_order")
-    sectors = [
-        {"name": name, "count": int(len(group)), "symbols": group.symbol.tolist()}
-        for name, group in rows.groupby("sector", sort=False)
-    ]
-    return {
-        "items": _records(rows),
-        "sectors": sectors,
-        "total": len(rows),
-        "large_cap_count": int((rows.bucket == "大盘核心").sum()),
-        "as_of": get_settings().demo_as_of.isoformat(),
-        "data_mode": data.mode,
-    }
-
-
-@router.put("/research/coverage/{symbol}")
-def update_research_annotation(symbol: str, payload: Dict[str, Any], db: Session = Depends(get_db)) -> Dict[str, Any]:
-    annotation = db.scalar(select(ResearchAnnotation).where(ResearchAnnotation.symbol == symbol))
-    if not annotation:
-        raise HTTPException(404, "研究标注不存在")
-    annotation.bucket = str(payload.get("bucket", annotation.bucket)).strip()[:40]
-    annotation.thesis = str(payload.get("thesis", annotation.thesis)).strip()[:500]
-    annotation.risk = str(payload.get("risk", annotation.risk)).strip()[:500]
-    if not annotation.thesis:
-        raise HTTPException(422, "研究逻辑不能为空")
-    db.commit()
-    return {"symbol": annotation.symbol, "bucket": annotation.bucket, "thesis": annotation.thesis, "risk": annotation.risk}
 
 
 class PoolPayload(BaseModel):
@@ -499,32 +387,6 @@ def search_stocks(
         "real_directory_enabled": bool(data.real.catalog_cached or resolved_source == "tushare"),
         "as_of": get_settings().demo_as_of.isoformat(),
     }
-
-
-@router.get("/stocks")
-def stocks(search: str = "", group: str = "", industry: str = "", exchange: str = "", universe: str = "all_assets", signal: str = "", sort: str = "score", order: str = "desc", db: Session = Depends(get_db)) -> Dict[str, Any]:
-    data = MarketDataService(db)
-    catalog = data.stocks()
-    ranking = _factor_ranking(db, data, data.analysis_symbols(catalog.symbol.tolist()), get_settings().demo_as_of).ranking
-    held = {position.symbol for position in db.scalars(select(Position).where(Position.portfolio_id == db.scalar(select(Portfolio.id).limit(1)))).all()}
-    ranking["action"] = ranking.apply(lambda row: "HOLD" if row.symbol in held and row.target_weight > 0 else ("SELL" if row.symbol in held else row.action), axis=1)
-    frame = ranking
-    if universe == "a_share":
-        frame = frame[frame.symbol.isin(data.universe_symbols(universe))]
-    if search:
-        needle = search.lower()
-        frame = frame[frame.symbol.str.lower().str.contains(needle) | frame.name.str.lower().str.contains(needle)]
-    if group:
-        frame = frame[frame.group == group]
-    if industry:
-        frame = frame[frame.industry == industry]
-    if exchange:
-        frame = frame[frame.exchange == exchange]
-    if signal:
-        frame = frame[frame.action == signal]
-    sort_column = sort if sort in frame.columns else "score"
-    frame = frame.sort_values(sort_column, ascending=order == "asc")
-    return {"items": _records(frame), "total": len(frame), "data_mode": data.mode, "as_of": get_settings().demo_as_of.isoformat()}
 
 
 @router.get("/stocks/{symbol}")
@@ -852,6 +714,19 @@ def _chart_trade_markers(equity: pd.DataFrame, trades: pd.DataFrame) -> List[Dic
     return markers
 
 
+def _with_names(db: Session, stocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """模型策略的打分结果里没有目录字段（名称、行业），展示时补上。"""
+    symbols = [str(stock.get("symbol", "")).split(".")[0] for stock in stocks]
+    industry = dict(db.execute(select(Stock.symbol, Industry.name).join(Industry, Stock.industry_id == Industry.id)
+                               .where(Stock.symbol.in_(symbols))).all()) if symbols else {}
+    out = []
+    for stock in stocks:
+        symbol = str(stock.get("symbol", ""))
+        out.append({**stock, "name": stock.get("name") or _stock_name(db, symbol) or symbol,
+                    "industry": stock.get("industry") or industry.get(symbol.split(".")[0])})
+    return out
+
+
 def _backtest_result_payload(run: BacktestRun, db: Session) -> Dict[str, Any]:
     """一次回测的完整结果，全部从数据库读——刚跑完返回的和之后从回测历史里
     调出来的是同一份内容（ADR-0047 第 3 条：每次回测结果都保存、可随时调出）。"""
@@ -884,7 +759,7 @@ def _backtest_result_payload(run: BacktestRun, db: Session) -> Dict[str, Any]:
         "trades": _records(trades),
         "trade_markers": _chart_trade_markers(equity, trades),
         "annual_returns": _annual_returns(equity) if not equity.empty else [],
-        "selected_stocks": config.get("selected_stocks", []),
+        "selected_stocks": _with_names(db, config.get("selected_stocks", [])),
         "universe_size": config.get("universe_size") or len(config.get("custom_symbols") or []),
         "custom_symbols": config.get("custom_symbols") or [],
         "notes": config.get("notes", []),
@@ -1536,33 +1411,6 @@ def paper_automation_run(db: Session = Depends(get_db)) -> Dict[str, Any]:
     return _clean(PaperTradingService(db, MarketDataService(db)).run_due_automation())
 
 
-@router.get("/signals")
-def signals(db: Session = Depends(get_db)) -> Dict[str, Any]:
-    data = MarketDataService(db)
-    catalog = data.stocks()
-    ranking = _factor_ranking(db, data, data.analysis_symbols(catalog.symbol.tolist()), get_settings().demo_as_of).ranking
-    return {"items": _records(ranking.head(30)), "as_of": get_settings().demo_as_of.isoformat(), "data_mode": data.mode}
-
-
-def _analytics_from_ranking(ranking: pd.DataFrame, data_mode: str) -> Dict[str, Any]:
-    industry = ranking.groupby("industry").agg(count=("symbol", "count"), avg_score=("score", "mean"), avg_return=("return_12m", "mean")).reset_index().sort_values("count", ascending=False)
-    if len(industry) > 12:
-        remainder = industry.iloc[12:]["count"].sum()
-        industry = pd.concat([industry.iloc[:12], pd.DataFrame([{"industry": "其他", "count": int(remainder), "avg_score": float(ranking.score.mean()), "avg_return": float(ranking.return_12m.mean())}])], ignore_index=True)
-    bins = pd.cut(ranking.score, bins=[0, 40, 50, 60, 70, 80, 100], include_lowest=True).value_counts(sort=False)
-    return {"industry_distribution": _records(industry), "score_distribution": [{"range": str(key), "count": int(value)} for key, value in bins.items()], "valuation_growth": _records(ranking[["symbol", "name", "industry", "pe", "revenue_growth", "score"]]) if {"pe", "revenue_growth"} <= set(ranking.columns) else [],
-            # 真实模式下还没有财务数据，估值/成长不给数（不用程序生成的数字凑）
-            "valuation_growth_note": None if {"pe", "revenue_growth"} <= set(ranking.columns) else "需要财务数据（市盈率、营收增长），本地行情库还没有", "stock_returns": _records(ranking.sort_values("return_12m", ascending=False)[["symbol", "name", "return_12m"]].head(15)), "portfolio_weights": _records(ranking[ranking.target_weight > 0][["symbol", "name", "industry", "target_weight"]])}
-
-
-@router.get("/analytics/universe")
-def universe_analytics(db: Session = Depends(get_db)) -> Dict[str, Any]:
-    data = MarketDataService(db)
-    catalog = data.stocks()
-    ranking = _factor_ranking(db, data, data.analysis_symbols(catalog.symbol.tolist()), get_settings().demo_as_of).ranking
-    return _analytics_from_ranking(ranking, data.mode)
-
-
 @router.get("/settings/ai")
 def get_ai_settings(db: Session = Depends(get_db)) -> Dict[str, Any]:
     """不回传真实key——前端只需要知道"有没有配置过"和base_url/model是什么，
@@ -1587,20 +1435,6 @@ def reset_ai_settings(db: Session = Depends(get_db)) -> Dict[str, Any]:
     """清掉数据库里保存的覆盖配置，回退到.env/环境变量里的默认值。"""
     clear_ai_credentials(db)
     return get_ai_settings(db)
-
-
-@router.post("/ai/explain/trade")
-def explain_trade(payload: ExplainRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    result = AIResearchService().explain(payload.model_dump(), db, payload.use_llm)
-    record = AIExplanation(
-        symbol=payload.symbol, explanation_type="trade", content=result["content"],
-        provider=result["provider"], model_version=result.get("model_version", "rules"),
-        confidence=result.get("confidence"), context=payload.model_dump(),
-    )
-    db.add(record)
-    db.commit()
-    db.refresh(record)
-    return {**result, "audit_id": record.id}
 
 
 class ExplainTradeRef(BaseModel):
@@ -1836,136 +1670,3 @@ def market_data_refresh() -> Dict[str, Any]:
 def sync_catalog(db: Session = Depends(get_db)) -> Dict[str, Any]:
     """Explicitly refresh the local stock directory from tushare."""
     return MarketDataService(db).sync_akshare_catalog()
-
-
-# Dashboard信号栏/analytics面板的计算本身很贵(real模式下即使价格全部
-# 命中缓存，30支股票8年历史的多因子打分实测也要8~18秒，是SQLite读取+
-# pandas计算的真实开销，不是网络也不是缓存没命中——这不是"再多缓存一层
-# 原始数据"能解决的)。前端每30秒自动刷新一次、用户手动刷新浏览器又会
-# 把React Query的内存缓存清空重新付一次这个代价，两者叠加就是"每次都要
-# 重新加载量化数据"这个观感的根因。这里在算好之后短暂缓存60秒——同一个
-# 策略配置60秒内再来请求直接命中，不用重新跑一遍因子引擎；60秒后自然
-# 过期，不会让数据长期显得"卡在过去"（对比每天调仓一次的低频策略，
-# 60秒的陈旧度可以忽略不计）。
-_DASHBOARD_SIGNALS_CACHE: Dict[str, tuple] = {}
-_DASHBOARD_SIGNALS_CACHE_TTL_SECONDS = 60
-
-
-def _dashboard_signals_and_analytics(db: Session, data: MarketDataService, account_strategy: Optional[Strategy]) -> tuple:
-    cache_key = f"{account_strategy.id if account_strategy else 'default'}:{data.mode}"
-    cached = _DASHBOARD_SIGNALS_CACHE.get(cache_key)
-    now = time.monotonic()
-    if cached and cached[0] > now:
-        return cached[1], cached[2], cached[3]
-
-    signals, analytics, failed_symbols = _compute_dashboard_signals_and_analytics(db, data, account_strategy)
-    _DASHBOARD_SIGNALS_CACHE[cache_key] = (now + _DASHBOARD_SIGNALS_CACHE_TTL_SECONDS, signals, analytics, failed_symbols)
-    return signals, analytics, failed_symbols
-
-
-def _compute_dashboard_signals_and_analytics(db: Session, data: MarketDataService, account_strategy: Optional[Strategy]) -> tuple:
-    signals: List[Dict[str, Any]] = []
-    if account_strategy and is_model_strategy(account_strategy):
-        model_data = data_service_for(db, account_strategy)
-        as_of = latest_market_day(date.today())
-        symbols = _strategy_symbols(model_data, account_strategy)
-        pipeline = build_strategy(db, account_strategy, model_data)
-        pipeline.prepare(symbols, as_of, as_of)
-        ranking = pipeline.generate_weights(as_of, symbols).ranking
-        total_ranked = int(ranking["score"].notna().sum()) or 1
-        top_ranking = ranking.dropna(subset=["score"]).head(8)
-        signals = [
-            {
-                "symbol": row.symbol,
-                "name": _stock_name(db, row.symbol) or row.symbol,
-                "industry": FIXED_UNIVERSES.get(default_universe(account_strategy), ("模型选股",))[0],
-                # 模型原始分数是预测收益（量级很小，比如 0.05），画进度条时
-                # 换算成排名百分位，是对真实排名的换算，不是另编一个分数。
-                "score": round(100 * (1 - (row.rank - 1) / total_ranked), 1),
-                "return_12m": None,
-                "target_weight": float(row.target_weight),
-                "action": row.action,
-            }
-            for row in top_ranking.itertuples()
-        ]
-        return signals, None, []
-    else:
-        default_strategy_row = _default_multifactor_strategy(db)
-        strategy_row = account_strategy or default_strategy_row
-        # Dashboard信号栏只是个"预览"小部件，不是回测——不能像/api/backtests
-        # 那样老老实实对完整声明的universe(large_cap最多300支)打分，
-        # 那是这次真正的bug根源：real模式下每支都要顺序真实查tushare，
-        # 每次刷新Dashboard都要付一次这个代价。这里和其它展示型端点
-        # (/api/stocks、/api/research/coverage)一样，套上analysis_symbols
-        # 的硬顶(30支)，回测本身(用户主动点"运行回测"、有进度反馈)的
-        # universe口径不受影响。
-        pipeline = build_strategy(db, strategy_row, data)
-        symbols = data.analysis_symbols(data.universe_symbols("csi300"))
-        pipeline.prepare(symbols, get_settings().demo_as_of, get_settings().demo_as_of)
-        strategy_result = pipeline.generate_weights(get_settings().demo_as_of, symbols)
-        signals = _records(strategy_result.ranking.head(8))
-        # "系统状态"下面的行业分布/估值成长这些"analytics"面板，口径是
-        # 平台默认策略(is_default)，跟上面"最新交易信号"的口径(账户实际
-        # 绑定的策略)概念上是两件事——只有账户刚好绑定的就是默认策略时，
-        # 两边其实是同一次计算(同一个strategy_row + analysis_symbols的
-        # 选股集合在这个前提下必然收敛到同一批30支，见service.py里
-        # analysis_symbols的说明)，这时候复用上面已经算好的ranking，不用
-        # 再对同一批股票重新算一遍因子——这曾经是real模式下Dashboard单次
-        # 请求里最大的一块耗时(实测能占到近一半)。账户绑定了别的
-        # multifactor配置时，两边口径确实不同，老老实实分开算，不能为了
-        # 省这点耗时把"账户信号"和"平台参考基准"这两个不同的东西混成一个。
-        analytics = (
-            _analytics_from_ranking(strategy_result.ranking, data.mode)
-            if default_strategy_row and strategy_row.id == default_strategy_row.id
-            else None
-        )
-        return signals, analytics if analytics is not None else universe_analytics(db), list(data.last_price_fetch_failures)
-
-
-@router.get("/dashboard")
-def dashboard(db: Session = Depends(get_db)) -> Dict[str, Any]:
-    data = MarketDataService(db)
-    paper = PaperTradingService(db, data)
-    account = paper.snapshot()
-    catalog = data.stocks()
-    # "最新交易信号"应该跟着模拟盘账户当前真正绑定的策略走——之前这里
-    # 一直写死用默认的通用多因子策略打分，如果账户实际绑定的是我们自己
-    # 验证过的真实策略(quant_v3_regression/csi300_*)，会出现"账户持仓是
-    # 真实策略选出来的，但信号列表却是另一个策略(且是Demo数据)算出来的"
-    # 这种自相矛盾的真假数据混杂展示。
-    account_strategy = db.get(Strategy, account.get("strategy_id")) if account.get("strategy_id") else None
-    signals, analytics, failed_symbols = _dashboard_signals_and_analytics(db, data, account_strategy)
-    orders = paper_orders(db)
-    latest_run = db.scalar(select(BacktestRun).where(BacktestRun.status == "completed").order_by(BacktestRun.id.desc()).limit(1))
-    metrics = {}
-    equity = []
-    trade_markers = []
-    latest_run_period = None
-    if latest_run:
-        metric_rows = db.scalars(select(BacktestMetric).where(BacktestMetric.backtest_run_id == latest_run.id)).all()
-        metrics = {row.name: row.value for row in metric_rows}
-        equity = get_backtest_equity(latest_run.id, db)
-        trade_markers = _trade_markers(latest_run.id, db)
-        # "策略年化收益"这张卡片展示的是数据库里最近一次跑完的回测的结果
-        # 快照——不是"现在"重新算一遍，也不是"当前信号"对应的区间。用户
-        # 在回测中心换个日期区间/参数再跑一次，两边数字对不上是正常的，
-        # 只是之前前端没有标出这个数字到底是哪个区间跑出来的，看起来像是
-        # "无缘无故不一致"。把区间原样透出，前端标注清楚，不用再靠猜。
-        latest_run_period = {"start_date": latest_run.start_date, "end_date": latest_run.end_date}
-    return {
-        "account": _clean(account), "backtest_metrics": metrics, "equity": equity, "trade_markers": trade_markers,
-        "latest_run_period": _clean(latest_run_period),
-        "positions": _clean(account["positions"]), "recent_orders": orders[:8], "signals": signals,
-        "analytics": analytics, "data_mode": data.mode, "as_of": get_settings().demo_as_of.isoformat(),
-        "study_period": {"research": ["2018-01-01", "2024-12-31"], "validation": ["2025-01-01", "2025-12-31"], "paper": ["2026-01-01", get_settings().demo_as_of.isoformat()]},
-        # ADR-0045：real模式下重试3次仍拿不到真实数据的股票——如实透出，
-        # 不能装作这份信号列表和往常一样完整可信。为空时前端不展示提示。
-        # failed_symbols是_dashboard_signals_and_analytics()计算那一刻
-        # 记录下来的、跟着60秒缓存一起存的快照，不是这次请求自己触发的
-        # （60秒内命中缓存的请求根本没有再调用一次data.prices()）。
-        "data_warnings": (
-            {"failed_symbols": failed_symbols,
-             "message": f"本地行情库中缺少{len(failed_symbols)}支股票在该区间的行情，信号列表可能不完整"}
-            if failed_symbols else None
-        ),
-    }

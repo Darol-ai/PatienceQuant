@@ -1,26 +1,15 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowRight, Layers, Save, SlidersHorizontal, Sparkles } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
-import { Link } from 'react-router-dom'
-import { api, formatPercent } from '../api'
+import { ArrowLeft, Save, SlidersHorizontal, Sparkles } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
+import { api } from '../api'
 import { Card, ErrorState, LoadingState, PageHeader, PanelHeader, Toast } from '../components/UI'
+import { describeSpec, originLabel, Spec } from '../strategy'
 
-// 策略制定（ADR-0047 第 3 条）：策略 = 打分 → ① 选股 → ② 权重 → ③ × 择时 → ④ 调仓。
-// 策略保存后不再修改，改任何一项都另存为新策略；回测放在"策略实践"页。
-
-type Spec = {
-  market: string
-  scorer: { type: 'factor_weights'; weights: Record<string, number> } | { type: 'model'; models: string[] }
-  timing: { type: string; [key: string]: any }
-  selection: { type: 'top_n' | 'top_pct'; n?: number | null; pct?: number | null }
-  weighting: { type: 'equal' | 'score'; max_weight: number }
-  rebalance: { frequency: string; turnover_band: number }
-}
+// 策略制定（ADR-0047 第 3 条、ADR-0051）：从策略库的「基于它新建」或「新建策略」进入的编辑器。
+// 策略 = 打分 → ① 选股 → ② 权重 → ③ × 择时 → ④ 调仓；保存一律另存为新策略，存完进入它的详情页。
 
 type Draft = { name: string; description: string; default_universe: string; spec: Spec }
-
-const originLabel: Record<string, string> = { builtin: '内置', user: '我的' }
-const frequencyLabel: Record<string, string> = { weekly: '每周', monthly: '每月', quarterly: '每季度' }
 
 function blankDraft(): Draft {
   return {
@@ -38,53 +27,36 @@ function blankDraft(): Draft {
   }
 }
 
-export function describeSpec(spec: Spec | undefined, options?: any): string {
-  if (!spec) return ''
-  const modelName = (id: string) => options?.models?.find((m: any) => m.id === id)?.name || id
-  const factorName = (key: string) => options?.factors?.find((f: any) => f.key === key)?.label || key
-  const scorer = spec.scorer.type === 'model'
-    ? `模型打分（${spec.scorer.models.map(modelName).join(' + ')}）`
-    : `因子打分（${Object.entries(spec.scorer.weights).filter(([, w]) => Number(w) > 0).map(([k, w]) => `${factorName(k)} ${Math.round(Number(w) * 100)}%`).join('、')}）`
-  const selection = spec.selection.type === 'top_n' ? `前 ${spec.selection.n} 名` : `前 ${formatPercent(spec.selection.pct || 0)}`
-  const weighting = `${spec.weighting.type === 'equal' ? '等权' : '按分数加权'}，单股 ≤ ${formatPercent(spec.weighting.max_weight)}`
-  const timing = options?.timings?.find((t: any) => t.type === spec.timing.type)?.label || spec.timing.type
-  return `${scorer} → ${selection} → ${weighting} → × ${timing} → ${frequencyLabel[spec.rebalance.frequency] || spec.rebalance.frequency}调仓`
-}
-
-export function StrategyCenter() {
+export function StrategyEditor() {
   const queryClient = useQueryClient()
   const { data: strategies, isLoading, isError } = useQuery({ queryKey: ['strategies'], queryFn: async () => (await api.get('/strategies')).data })
   const { data: options } = useQuery({ queryKey: ['pipeline-options'], queryFn: async () => (await api.get('/pipeline/options')).data })
-  const [selectedId, setSelectedId] = useState<number | null>(null)
+  const [params] = useSearchParams()
+  const navigate = useNavigate()
+  const fromId = Number(params.get('from')) || null
   const [draft, setDraft] = useState<Draft>(blankDraft())
+  const [loadedFrom, setLoadedFrom] = useState<number | null>(null)
   const [message, setMessage] = useState('')
-  const [savedId, setSavedId] = useState<number | null>(null)
-  const library = useMemo(() => (strategies || []).filter((s: any) => s.origin !== 'paper_snapshot'), [strategies])
-  const selected = library.find((s: any) => s.id === selectedId)
+  const source = fromId ? (strategies || []).find((s: any) => s.id === fromId) : null
 
   useEffect(() => {
-    if (selectedId === null && library.length) loadStrategy(library.find((s: any) => s.is_default) || library[0])
-  }, [library])
-
-  function loadStrategy(row: any) {
-    setSelectedId(row.id)
-    setSavedId(null)
+    if (!source || loadedFrom === source.id) return
+    setLoadedFrom(source.id)
     setDraft({
-      name: row.origin === 'builtin' ? `${row.name}（我的版本）` : row.name,
-      description: row.description || '',
-      default_universe: row.default_universe || 'csi300',
-      spec: JSON.parse(JSON.stringify(row.spec)),
+      name: `${source.name}（我的版本）`,
+      description: source.description || '',
+      default_universe: source.default_universe || 'csi300',
+      spec: JSON.parse(JSON.stringify(source.spec)),
     })
-  }
+  }, [source, loadedFrom])
 
   const setSpec = (patch: Partial<Spec>) => setDraft(d => ({ ...d, spec: { ...d.spec, ...patch } }))
   const save = useMutation({
     mutationFn: async () => (await api.post('/strategies/spec', draft)).data,
     onSuccess: data => {
-      setMessage(`已另存为「${data.name}」V${data.version}`)
-      setSavedId(data.id)
-      setSelectedId(data.id)
       queryClient.invalidateQueries({ queryKey: ['strategies'] })
+      queryClient.invalidateQueries({ queryKey: ['scorecards'] })
+      navigate(`/library/${data.id}`)
     },
     onError: (error: any) => setMessage(error?.response?.data?.detail || '保存失败，请检查参数'),
   })
@@ -102,7 +74,8 @@ export function StrategyCenter() {
   const canSave = draft.name.trim() && (spec.scorer.type === 'model' ? spec.scorer.models.length > 0 : weightTotal > 0)
 
   return <>
-    <PageHeader eyebrow="RESEARCH / 03" title="策略制定" description="从策略库挑一个作为起点，按 打分 → 选股 → 权重 → 择时 → 调仓 五步配置，另存为自己的策略；回测在「策略实践」里做。"
+    <PageHeader eyebrow="策略库 · 新建" title={<span className="title-with-back"><Link to={fromId ? `/library/${fromId}` : '/library'} className="icon-button"><ArrowLeft size={16}/></Link>策略制定</span>}
+      description={source ? `以「${source.name}」（${originLabel[source.origin] || source.origin}）为起点。按 打分 → 选股 → 权重 → 择时 → 调仓 五步配置，保存后是一个新策略，原策略不变。` : '从空白开始。按 打分 → 选股 → 权重 → 择时 → 调仓 五步配置，保存后进入策略库。'}
       actions={<button className="primary-button" onClick={() => save.mutate()} disabled={!canSave || save.isPending}><Save size={16}/>{save.isPending ? '保存中…' : '另存为新策略'}</button>} />
     <div className="strategy-layout">
       <div>
@@ -189,29 +162,7 @@ export function StrategyCenter() {
         <Card className="sticky-card">
           <PanelHeader title="这个策略会怎么做" subtitle="保存前确认一遍" />
           <div className="strategy-note"><Sparkles size={17}/><div><b>{draft.name || '未命名策略'}</b><p>{describeSpec(spec, options)}</p></div></div>
-          {savedId
-            ? <Link className="primary-button full-button" to={`/backtest?strategy_id=${savedId}`}><ArrowRight size={15}/>去策略实践回测这个策略</Link>
-            : <p className="muted-note">另存后可以直接去「策略实践」回测。</p>}
-        </Card>
-        <Card>
-          <PanelHeader title="策略库" subtitle="点一个作为起点；内置策略不能改，改完会另存为你的版本" action={<Layers size={16}/>} />
-          <div className="library-list">
-            {['builtin', 'user'].map(origin => {
-              const rows = library.filter((s: any) => (s.origin || 'user') === origin)
-              if (!rows.length) return null
-              return <div key={origin}>
-                <div className="library-group">{originLabel[origin]} · {rows.length}</div>
-                {rows.map((row: any) => <button key={row.id} className={`library-item ${row.id === selectedId ? 'active' : ''}`} onClick={() => loadStrategy(row)}>
-                  <b>{row.name}{row.version > 1 ? ` · V${row.version}` : ''}{row.is_default ? ' · 默认' : ''}</b>
-                  <span>{describeSpec(row.spec, options)}</span>
-                  <small>{row.backtest_metrics?.annual_return != null
-                    ? `最近一次回测 ${row.study_period?.start} ~ ${row.study_period?.end}：年化 ${formatPercent(row.backtest_metrics.annual_return)}，最大回撤 ${formatPercent(row.backtest_metrics.max_drawdown)}`
-                    : '还没有回测'}</small>
-                </button>)}
-              </div>
-            })}
-          </div>
-          {selected && <p className="muted-note">当前起点：{selected.name}（{originLabel[selected.origin] || selected.origin}）</p>}
+          <p className="muted-note">保存后会进入这个策略的详情页，在那里计算成绩卡或回测。</p>
         </Card>
       </div>
     </div>

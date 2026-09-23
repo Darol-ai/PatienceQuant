@@ -152,18 +152,6 @@ class PaperResetRequest(BaseModel):
     initial_capital: float = Field(1_000_000, gt=0)
 
 
-class ExplainRequest(BaseModel):
-    symbol: str
-    action: str = "HOLD"
-    score: float = 0
-    rank: Optional[int] = None
-    industry: str = ""
-    volatility: float = 0
-    max_drawdown: float = 0
-    target_weight: float = 0
-    use_llm: bool = False
-
-
 class RecommendRequest(BaseModel):
     """智能体推荐的偏好：市场、能接受的最大回撤（0.25 表示 −25%，不填表示不限）、持仓周期。"""
 
