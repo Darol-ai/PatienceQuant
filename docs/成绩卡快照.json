@@ -1,0 +1,222 @@
+{
+  "说明": "成绩卡快照：标准条件（2019-01-01 ~ 2025-12-31、初始 100 万、手续费 0.1%、滑点 0.05%、默认股票池）。按 kind 对齐。",
+  "导出时间": "2026-09-24T18:50:05",
+  "环境": {
+    "python": "3.13.15",
+    "lightgbm": "4.7.0",
+    "xgboost": "3.4.1",
+    "行情截至": "2026-09-23",
+    "torch": "2.11.0+cu128",
+    "gpu": "NVIDIA GeForce RTX 4090"
+  },
+  "strategies": {
+    "multifactor": {
+      "name": "动量低波动因子策略（沪深300）",
+      "total_return": 0.8347672405512694,
+      "annual_return": 0.09419569245969206,
+      "max_drawdown": -0.40225214076036053,
+      "sharpe": 0.5163131910244267,
+      "benchmark_return": 0.5591461398017394
+    },
+    "quant_v3_regression": {
+      "name": "LightGBM动量增强策略(30支候选池)",
+      "total_return": 3.059891599032583,
+      "annual_return": 0.23099533940092165,
+      "max_drawdown": -0.19461119377847647,
+      "sharpe": 1.2195623731405145,
+      "benchmark_return": 0.5591461398017394
+    },
+    "csi300_lightgbm": {
+      "name": "LightGBM沪深300策略",
+      "total_return": 0.7771884472811066,
+      "annual_return": 0.08903316289189389,
+      "max_drawdown": -0.3369402039861795,
+      "sharpe": 0.536380677124649,
+      "benchmark_return": 0.5591461398017394
+    },
+    "csi300_xgboost": {
+      "name": "XGBoost沪深300策略",
+      "total_return": 0.759958454209607,
+      "annual_return": 0.08746062919641795,
+      "max_drawdown": -0.2830466873852333,
+      "sharpe": 0.5298976669374063,
+      "benchmark_return": 0.5591461398017394
+    },
+    "csi300_ensemble": {
+      "name": "LightGBM+XGBoost集成沪深300策略",
+      "total_return": 0.7414926396130812,
+      "annual_return": 0.08576068188544927,
+      "max_drawdown": -0.30604747166950674,
+      "sharpe": 0.5234989587001936,
+      "benchmark_return": 0.5591461398017394
+    },
+    "pb_ens_rsrs": {
+      "name": "集成模型 + RSRS择时",
+      "total_return": 0.06967132639244733,
+      "annual_return": 0.010039799279864425,
+      "max_drawdown": -0.32902120199444285,
+      "sharpe": 0.14106760394042978,
+      "benchmark_return": 0.5591461398017394
+    },
+    "pb_ens_alligator": {
+      "name": "集成模型 + 鳄鱼线择时",
+      "total_return": -0.1236742111437581,
+      "annual_return": -0.01939068383904674,
+      "max_drawdown": -0.22676150382719495,
+      "sharpe": -0.19957548831532376,
+      "benchmark_return": 0.5591461398017394
+    },
+    "pb_ens_icu_ma": {
+      "name": "集成模型 + ICU均线择时",
+      "total_return": -0.4637419050035976,
+      "annual_return": -0.08828302063631233,
+      "max_drawdown": -0.4901184741996132,
+      "sharpe": -0.7335763352507327,
+      "benchmark_return": 0.5591461398017394
+    },
+    "pb_ubl": {
+      "name": "上下影线因子选股",
+      "total_return": 0.6970958700550756,
+      "annual_return": 0.08160985049086689,
+      "max_drawdown": -0.33117874975287587,
+      "sharpe": 0.5057303361841985,
+      "benchmark_return": 0.5591461398017394
+    },
+    "pb_ideal_amplitude": {
+      "name": "理想振幅因子选股",
+      "total_return": 0.5469917094327292,
+      "annual_return": 0.06685485991917295,
+      "max_drawdown": -0.21459605100662815,
+      "sharpe": 0.5323457204676878,
+      "benchmark_return": 0.5591461398017394
+    },
+    "pb_ens_llt": {
+      "name": "集成模型 + LLT趋势线择时",
+      "total_return": 0.048698783213472874,
+      "annual_return": 0.0070776871723361445,
+      "max_drawdown": -0.3419805169607476,
+      "sharpe": 0.11923536136329323,
+      "benchmark_return": 0.5591461398017394
+    },
+    "pb_ens_ma_channel": {
+      "name": "集成模型 + 均线交叉通道突破择时",
+      "total_return": -0.024130650864762515,
+      "annual_return": -0.0036164550646837768,
+      "max_drawdown": -0.2824062553184856,
+      "sharpe": 0.037400584450504294,
+      "benchmark_return": 0.5591461398017394
+    },
+    "pb_ens_one_way_vol": {
+      "name": "集成模型 + 单向波动差择时",
+      "total_return": 0.8088127887744674,
+      "annual_return": 0.09188594621566648,
+      "max_drawdown": -0.22646788327827627,
+      "sharpe": 0.6560769721616884,
+      "benchmark_return": 0.5591461398017394
+    },
+    "pb_ens_rps_vol": {
+      "name": "集成模型 + RPS单向波动差择时",
+      "total_return": 0.10768933159974448,
+      "annual_return": 0.015285506829884277,
+      "max_drawdown": -0.32827956137886793,
+      "sharpe": 0.17841528046199537,
+      "benchmark_return": 0.5591461398017394
+    },
+    "pb_ens_high_moment": {
+      "name": "集成模型 + 高阶矩择时",
+      "total_return": 0.5466949409471422,
+      "annual_return": 0.06682450159620967,
+      "max_drawdown": -0.25731736668801564,
+      "sharpe": 0.5111478585972101,
+      "benchmark_return": 0.5591461398017394
+    },
+    "pb_ens_volume_resonance": {
+      "name": "集成模型 + 价量共振择时",
+      "total_return": 0.28418597322702976,
+      "annual_return": 0.03779594536378861,
+      "max_drawdown": -0.1785110535211103,
+      "sharpe": 0.3817258878619079,
+      "benchmark_return": 0.5591461398017394
+    },
+    "pb_ens_qrs": {
+      "name": "集成模型 + QRS择时",
+      "total_return": 0.1679786737816611,
+      "annual_return": 0.023297982212678425,
+      "max_drawdown": -0.3432236790341858,
+      "sharpe": 0.2390392336581013,
+      "benchmark_return": 0.5591461398017394
+    },
+    "pb_salience_str": {
+      "name": "凸显理论STR因子选股",
+      "total_return": 0.5193554512951803,
+      "annual_return": 0.06400625824130768,
+      "max_drawdown": -0.4749046218717612,
+      "sharpe": 0.3935453974635521,
+      "benchmark_return": 0.5591461398017394
+    },
+    "pb_terrified_score": {
+      "name": "惊恐度因子选股",
+      "total_return": 0.22093153083766448,
+      "annual_return": 0.03004992652863825,
+      "max_drawdown": -0.24100540189941655,
+      "sharpe": 0.26828364697608353,
+      "benchmark_return": 0.5591461398017394
+    },
+    "pb_apb_20d": {
+      "name": "买卖压力APB因子选股",
+      "total_return": 0.5165958530139678,
+      "annual_return": 0.06371939561300288,
+      "max_drawdown": -0.5410568739159053,
+      "sharpe": 0.3978680365377478,
+      "benchmark_return": 0.5591461398017394
+    },
+    "trained_csi300_lightgbm": {
+      "name": "LightGBM沪深300策略（系统内训练）",
+      "total_return": 0.8217007190612715,
+      "annual_return": 0.09303637587295421,
+      "max_drawdown": -0.24197661611679955,
+      "sharpe": 0.5760072217864427,
+      "benchmark_return": 0.5591461398017394
+    },
+    "trained_csi300_xgboost": {
+      "name": "XGBoost沪深300策略（系统内训练）",
+      "total_return": 1.0227110488637687,
+      "annual_return": 0.11013778845641631,
+      "max_drawdown": -0.24920723012664792,
+      "sharpe": 0.6605552472514392,
+      "benchmark_return": 0.5591461398017394
+    },
+    "trained_csi300_all_daily_lightgbm": {
+      "name": "全部日线因子LightGBM（沪深300）",
+      "total_return": 0.52136172507859,
+      "annual_return": 0.06421453368872321,
+      "max_drawdown": -0.3178790925599433,
+      "sharpe": 0.4244803614042486,
+      "benchmark_return": 0.5591461398017394
+    },
+    "pb_ubl_neutral": {
+      "name": "上下影线因子选股（市值中性）",
+      "total_return": 0.6813446979528521,
+      "annual_return": 0.08011496735923762,
+      "max_drawdown": -0.32083469406991816,
+      "sharpe": 0.4954195330444765,
+      "benchmark_return": 0.5591461398017394
+    },
+    "valuation_value": {
+      "name": "估值因子选股（沪深300）",
+      "total_return": 0.7616343901833382,
+      "annual_return": 0.08761416146577328,
+      "max_drawdown": -0.2271906247093497,
+      "sharpe": 0.5633350878438371,
+      "benchmark_return": 0.5591461398017394
+    },
+    "trained_csi300_lstm": {
+      "name": "LSTM沪深300策略（系统内训练）",
+      "total_return": 1.0923431323812358,
+      "annual_return": 0.1157248041198462,
+      "max_drawdown": -0.18523856728621368,
+      "sharpe": 0.8330148119462867,
+      "benchmark_return": 0.5591461398017394
+    }
+  }
+}

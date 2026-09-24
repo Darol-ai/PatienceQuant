@@ -27,3 +27,8 @@ backend/data/models/
 
 # 每日指标（daily_basic）约 500MB，不随仓库分发：部署后服务启动时从 tushare 补齐（ADR-0053）
 backend/data/market/a_share/daily_basic/
+
+# 数据不进仓库（ADR-0054）：本地行情库、每日指标、旧模型文件打包在 GitHub Release 附件里，
+# 用 make data（scripts/fetch_data.py）下载；系统内训练的模型和数据库是运行时产物
+backend/data/*
+.data-cache/

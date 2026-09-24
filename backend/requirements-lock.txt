@@ -1,0 +1,22 @@
+# 生成成绩卡快照（docs/成绩卡快照.json）时的环境：Python 3.13.15，Linux x86_64，NVIDIA GPU（CUDA 12.8）。
+# 用它安装可以最大程度复现同样的数字：pip install -r requirements-lock.txt -e .
+akshare==1.18.94
+fastapi==0.141.1
+httpx==0.28.1
+lightgbm==4.7.0
+numpy==2.5.3
+openai==1.109.1
+pandas==2.3.3
+pyarrow==25.0.1
+pydantic==2.13.5
+pydantic-settings==2.15.0
+pypdf==6.18.1
+pytest==8.4.2
+python-multipart==0.0.32
+scikit-learn==1.9.1
+scipy==1.18.1
+SQLAlchemy==2.0.52
+torch==2.11.0
+tushare==1.4.24
+uvicorn==0.52.4
+xgboost==3.4.1

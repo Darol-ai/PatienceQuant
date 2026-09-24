@@ -1,5 +1,9 @@
 """演示轨迹：在隔离的演示环境（前端 5174 → 后端 8001 → 副本数据库）里模拟一个用户正常使用系统。
-每一步截图，并把系统返回的关键结果写进 results.json。"""
+每一步截图，并把系统返回的关键结果写进 results_*.json。需要 playwright（pip install playwright && playwright install chromium）。
+
+演示环境的启动方式：复制数据库和 backend/data/models 到临时目录，后端用
+DATABASE_URL=sqlite:///<副本> PATIENCEQUANT_MODELS_DIR=<副本> PATIENCEQUANT_WARM_CSI300=0 PATIENCEQUANT_AUTO_TRAIN=0 起在 8001，
+前端用 VITE_API_TARGET=http://localhost:8001 npx vite --config vite.config.ts --port 5174。"""
 import json
 import time
 from pathlib import Path
@@ -7,7 +11,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 BASE = "http://127.0.0.1:5174"
-OUT = Path("/home/drp/stock_project/PatienceQuant/docs/演示轨迹/img")
+OUT = Path(__file__).resolve().parent / "img"
 OUT.mkdir(parents=True, exist_ok=True)
 results = {}
 errors = []
